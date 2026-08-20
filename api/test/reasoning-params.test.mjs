@@ -77,3 +77,40 @@ test('effort is configurable but only travels with adaptive thinking', () => {
   assert.equal(reasoningParams('claude-haiku-4-5').effort, undefined);
   clearEnv();
 });
+
+test('the direct-API default is Opus 5, with adaptive thinking', async () => {
+  // Pins a deliberate choice rather than an accident. Opus was chosen over
+  // Haiku knowing the cost difference (~$0.70 per punch list): this is careful
+  // reading of degraded scans feeding subcontractor dispatch, where a wrong row
+  // costs a site trip. Change this only as a decision, not as a cleanup.
+  const { modelId, reasoningParams } = await import('../dist/lib/model.js');
+
+  const saved = { ...process.env };
+  delete process.env.PUNCH_EXTRACT_MODEL;
+  delete process.env.ANTHROPIC_FOUNDRY_RESOURCE;
+  delete process.env.ANTHROPIC_FOUNDRY_BASE_URL;
+  delete process.env.PUNCH_AI_PROVIDER;
+  clearEnv();
+  process.env.ANTHROPIC_API_KEY = 'sk-test-not-real';
+
+  try {
+    assert.equal(modelId(), 'claude-opus-5');
+    assert.deepEqual(reasoningParams(), { thinking: { type: 'adaptive' }, effort: 'medium' });
+  } finally {
+    process.env = saved;
+  }
+});
+
+test('Foundry has no default model — a guessed deployment name would 404', async () => {
+  const { modelId } = await import('../dist/lib/model.js');
+
+  const saved = { ...process.env };
+  delete process.env.PUNCH_EXTRACT_MODEL;
+  process.env.ANTHROPIC_FOUNDRY_RESOURCE = 'example-resource';
+
+  try {
+    assert.equal(modelId(), '', 'must stay empty so the probe can say what is missing');
+  } finally {
+    process.env = saved;
+  }
+});

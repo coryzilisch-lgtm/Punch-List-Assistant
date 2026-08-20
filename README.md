@@ -52,9 +52,18 @@ person did not look at.
 
 ## Setup
 
+**Setting this up for the first time? Follow [`docs/SETUP.md`](docs/SETUP.md)** — an
+ordered runbook from a local test through to the first real punch item in
+Procore. The sections below are the reference for each piece.
+
+
 ### 1. Azure resources
 
-Create a Static Web App (Standard tier is not required). Point it at this repo:
+Create a Static Web App on the **Standard** plan. Standard is required: this app
+brings its own Entra registration (`clientIdSettingName` in
+`staticwebapp.config.json`), and custom authentication is a Standard-plan
+feature — the Free plan only offers the preconfigured providers. Point it at this
+repo:
 
 - **app_location:** `dashboard`
 - **api_location:** `api`
