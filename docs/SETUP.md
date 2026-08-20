@@ -23,10 +23,19 @@ cd api && npm install && npm run build && npm test
 cd ../tools/extract-cli && npm install
 ```
 
+Find the PDF and check the path printed is the right file. (Do not paste a
+placeholder path — let the shell find it, or drag the file from Finder into the
+terminal after `node run.mjs ` to paste its real path.)
+
+```bash
+PDF=$(ls ~/Downloads/*[Pp]unch*.pdf | head -1); echo "$PDF"
+```
+
 Free run first — rendering and photo detection only, no API calls:
 
 ```bash
-node run.mjs ~/Downloads/LH_5728_Durham_NC_Ops_Punchlist.pdf --no-ai --out /tmp/crops
+node run.mjs "$PDF" --no-ai --out /tmp/crops
+open /tmp/crops
 ```
 
 Open `/tmp/crops` and look at the cropped photos. They should be the jobsite
@@ -36,13 +45,13 @@ photos, cleanly cropped. Expected on the Darden document: 70 image regions acros
 Then one page for real:
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-... node run.mjs ~/Downloads/LH_5728...pdf --pages 2
+ANTHROPIC_API_KEY=sk-ant-... node run.mjs "$PDF" --pages 2
 ```
 
 Then the whole document:
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-... node run.mjs ~/Downloads/LH_5728...pdf --json /tmp/result.json
+ANTHROPIC_API_KEY=sk-ant-... node run.mjs "$PDF" --json /tmp/result.json
 ```
 
 **What good looks like** on the Darden list: 59 items, `source numbering 1-59,
