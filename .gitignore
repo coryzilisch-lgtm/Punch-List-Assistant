@@ -9,3 +9,6 @@ api/dist/
 # purpose — they carry client project details and jobsite photos. Drop them in
 # docs/ locally; see docs/README.md for what to test with.
 docs/*.pdf
+
+# CLI harness deps (local only, never deployed)
+tools/extract-cli/node_modules/

@@ -185,6 +185,22 @@ The dashboard has no build step — it is static files plus a vendored pdf.js (s
 node --check dashboard/app.js       # copy to .mjs first; they are ES modules
 ```
 
+### Testing extraction without deploying
+
+`tools/extract-cli` runs the extractor against a PDF from the command line,
+using the same detector and the same prompt as the deployed app. Use it to judge
+quality on a real document before standing up Azure, and whenever a new owner's
+format turns up:
+
+```bash
+cd tools/extract-cli && npm install
+node run.mjs ~/Downloads/punchlist.pdf --no-ai --out /tmp/crops   # free
+ANTHROPIC_API_KEY=sk-ant-... node run.mjs ~/Downloads/punchlist.pdf
+```
+
+See `tools/extract-cli/README.md`. It lives outside `api/` so its PDF and canvas
+dependencies never ride along into the Static Web App deployment.
+
 ### Endpoints
 
 | Endpoint | Purpose |
@@ -211,10 +227,11 @@ and the ids we write against must be current.
   every page of the reference document. Genuinely novel layouts may need the
   thresholds in `dashboard/pdf-pipeline.js` revisited. Wrong photos can be removed
   per item in the review step.
-- **Extraction quality is unverified against a live model.** The photo-pairing
-  logic is unit-tested and the detector is verified against the real document, but
-  no page has been through a live model yet. Run the Darden list as the first
-  test once Foundry is wired — see `docs/README.md`.
+- **Extraction quality is unverified against a live model.** The photo detector
+  is verified end to end against every page of the real reference document, and
+  detection and photo-pairing are unit-tested — but no page has been through a
+  live model yet. `tools/extract-cli` is the fastest way to close that gap: it
+  needs only an API key, no deployment.
 - **Structured outputs and adaptive thinking are beta on Foundry**, and GA only on
   the first-party API. The extractor depends on both. If a Foundry deployment
   rejects them, the Connection check says so explicitly rather than failing
