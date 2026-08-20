@@ -93,30 +93,55 @@ Azure portal → **Create a resource** → **Static Web App**.
 | Name | `punchlist-swa` (anything) |
 | Plan type | **Standard** |
 | Region | Same region as your other apps |
-| Deployment source | **Other** |
+| Deployment source | **GitHub** → this repo → branch `main` |
 
 **Standard, not Free.** This app brings its own Entra registration, and custom
 authentication is a Standard-plan feature — on Free you only get the
 preconfigured providers and sign-in will not work.
 
-**Deployment source "Other", not GitHub.** If you pick GitHub, Azure writes a
-*second* workflow file into the repo with its own randomly-named token secret,
-alongside the one already committed. Two workflows both deploying is the exact
-mess the Herd Intranet notes warn about. Pick Other and wire the token yourself
-in the next step.
+**Azure writes its own workflow, and its defaults are wrong for this repo.**
+On creation Azure commits `.github/workflows/azure-static-web-apps-<name>.yml`
+to `main` and adds a matching `AZURE_STATIC_WEB_APPS_API_TOKEN_<NAME>` secret.
+Its generated build configuration defaults to:
+
+```yaml
+app_location: "./dashboard"
+api_location: ""        # <- deploys NO API
+output_location: "."    # <- wrong for a no-build static app
+```
+
+`api_location: ""` means the Functions are never deployed, so every `/api/*`
+route 404s and the app loads as a shell with nothing behind it — a failure that
+looks like a bug in the app rather than a deployment setting. Fix the file to:
+
+```yaml
+app_location: "./dashboard"
+api_location: "api"
+output_location: ""
+```
+
+Azure also omits the deployment token from the generated `close_pull_request_job`,
+so that job fails on every PR close until you add
+`azure_static_web_apps_api_token` to it. Both corrections are already applied to
+the workflow in this repo.
+
+**Keep exactly one workflow.** If a second workflow file is present, both deploy
+on every push. This repo keeps Azure's generated file, because its token secret
+already exists and is bound to the real resource; the hand-written one was
+removed.
 
 After it is created, note the **URL** (`https://<something>.azurestaticapps.net`).
 You need it in step 3.
 
-### Wire up deployment
+### Deployment token
 
-1. In the Static Web App → **Overview** → **Manage deployment token** → copy it.
-2. In GitHub → the repo → **Settings** → **Secrets and variables** → **Actions** →
-   **New repository secret**.
-3. Name it exactly `AZURE_STATIC_WEB_APPS_API_TOKEN`. Paste the token.
+Azure created the secret for you when it connected the repo — check
+GitHub → **Settings** → **Secrets and variables** → **Actions** for
+`AZURE_STATIC_WEB_APPS_API_TOKEN_<NAME>`, and confirm the name matches the one
+referenced in the workflow file. Nothing to copy by hand.
 
-The committed workflow (`.github/workflows/azure-static-web-apps.yml`) reads that
-name.
+If you ever recreate the Static Web App, the token changes: get the new one from
+**Overview** → **Manage deployment token** and update that secret.
 
 ---
 

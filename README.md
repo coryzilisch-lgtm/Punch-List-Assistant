@@ -69,7 +69,9 @@ repo:
 - **api_location:** `api`
 - **output_location:** *(empty)*
 
-Add the deploy token to the repo as the secret `AZURE_STATIC_WEB_APPS_API_TOKEN`.
+Azure creates the deploy token secret itself when it connects the repo. See
+[`docs/SETUP.md`](docs/SETUP.md) — its generated workflow defaults to
+`api_location: ""`, which deploys no API at all.
 
 ### 2. Entra sign-in
 
