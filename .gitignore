@@ -1,0 +1,11 @@
+node_modules/
+api/dist/
+.env
+.env.local
+*.log
+.DS_Store
+
+# Client punch list PDFs used as test fixtures are kept out of git history on
+# purpose — they carry client project details and jobsite photos. Drop them in
+# docs/ locally; see docs/README.md for what to test with.
+docs/*.pdf

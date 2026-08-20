@@ -1,0 +1,25 @@
+{
+  "name": "punch-list-assistant-api",
+  "version": "1.0.0",
+  "description": "Azure Functions (SWA managed) backend for the Buffalo Construction Punch List Assistant.",
+  "private": true,
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "func start",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.110.0",
+    "@azure/functions": "^4.5.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.41",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
