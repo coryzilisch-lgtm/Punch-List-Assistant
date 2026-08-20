@@ -1,0 +1,15 @@
+{
+  "name": "punch-list-extract-cli",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local harness: run the punch list extractor against a PDF without deploying.",
+  "scripts": {
+    "start": "node run.mjs"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^0.1.60",
+    "pdfjs-dist": "4.10.38"
+  },
+  "engines": { "node": ">=20.0.0" }
+}

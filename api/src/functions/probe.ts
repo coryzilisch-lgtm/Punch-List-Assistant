@@ -8,7 +8,7 @@ import {
   procoreConfigured,
   procoreRequest,
 } from '../lib/procore';
-import { extractionConfigured, extractionModel } from '../lib/extract';
+import { checkModelAccess, modelConfig } from '../lib/model';
 
 /**
  * GET /api/probe?project_id=123 — what can this deployment actually do?
@@ -36,12 +36,14 @@ export async function probeHandler(
   const checks: Check[] = [];
   const projectId = Number(request.query.get('project_id') || 0);
 
+  // A real (tiny) call, not a "is the setting present" check. On Foundry a wrong
+  // resource name, a key from a different resource, and an undeployed model id
+  // are indistinguishable until something is actually sent.
+  const ai = await checkModelAccess();
   checks.push({
-    name: 'Document reading (Anthropic)',
-    ok: extractionConfigured(),
-    detail: extractionConfigured()
-      ? `Configured, using ${extractionModel()}.`
-      : 'ANTHROPIC_API_KEY is missing from the app settings. Uploads will not be readable.',
+    name: `Document reading (${modelConfig()?.provider === 'foundry' ? 'Claude on Microsoft Foundry' : 'Anthropic API'})`,
+    ok: ai.ok,
+    detail: ai.detail,
   });
 
   if (!procoreConfigured()) {
