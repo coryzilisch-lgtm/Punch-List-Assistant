@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Punch List Assistant — Buffalo Construction</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700;800&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+
+<header>
+  <!-- Buffalo mark, drawn in brand orange. Inline so it renders before any
+       network asset resolves — supers open this on jobsite LTE. -->
+  <svg class="mark" viewBox="0 0 48 48" aria-hidden="true">
+    <path fill="#FF5F00" d="M6 18c0-4 3-7 7-7h4l3-4h8l3 4h4c4 0 7 3 7 7v3l-3 2v6l3 3-2 4-5-3-2 5h-6l-1-4h-6l-1 4h-6l-2-5-5 3-2-4 3-3v-6l-3-2z"/>
+  </svg>
+  <div>
+    <div class="sub">Buffalo Construction</div>
+    <h1>Punch List Assistant</h1>
+  </div>
+  <div class="spacer"></div>
+  <div class="who" id="who"></div>
+</header>
+
+<nav class="steps" aria-label="Progress">
+  <div class="step active" data-step="project"><span class="n">1</span>Project</div>
+  <div class="step" data-step="upload"><span class="n">2</span>Upload &amp; read</div>
+  <div class="step" data-step="review"><span class="n">3</span>Review</div>
+  <div class="step" data-step="send"><span class="n">4</span>Send to Procore</div>
+</nav>
+
+<main>
+
+  <!-- ── Step 1: project ────────────────────────────────────────────────── -->
+  <section class="panel active" id="panel-project">
+    <div class="card">
+      <h2>Which project is this punch list for?</h2>
+      <p class="hint">Items are created on this project's punch list in Procore.</p>
+      <div id="project-load" class="muted">Loading projects from Procore…</div>
+      <div id="project-pick" style="display:none">
+        <div class="row">
+          <div>
+            <label class="fl" for="project-search">Search</label>
+            <input type="search" id="project-search" placeholder="Project name or number" autocomplete="off" />
+          </div>
+          <div>
+            <label class="fl" for="project-select">Project</label>
+            <select id="project-select"></select>
+          </div>
+        </div>
+      </div>
+      <div id="project-error"></div>
+    </div>
+
+    <div class="card" id="readiness-card" style="display:none">
+      <h2>Connection check</h2>
+      <p class="hint">Confirms this project's punch list is reachable before you do the review work.</p>
+      <div id="readiness"></div>
+    </div>
+  </section>
+
+  <!-- ── Step 2: upload ─────────────────────────────────────────────────── -->
+  <section class="panel" id="panel-upload">
+    <div class="card">
+      <h2>Upload the owner's punch list</h2>
+      <p class="hint">
+        A PDF from the owner, architect, or a punch list app. Scanned and photographed
+        documents are fine — the pages are read as images either way.
+      </p>
+      <div class="dropzone" id="dropzone" tabindex="0" role="button">
+        <strong>Drop the PDF here</strong>
+        <span class="muted">or tap to choose a file</span>
+        <input type="file" id="file-input" accept="application/pdf,.pdf" hidden />
+      </div>
+      <div id="upload-status"></div>
+    </div>
+
+    <div class="card" id="reading-card" style="display:none">
+      <h2>Reading the document</h2>
+      <div class="progress-track"><div class="progress-fill" id="read-progress"></div></div>
+      <div class="muted" id="read-label"></div>
+      <div class="page-chips" id="page-chips"></div>
+      <div id="read-notes" style="margin-top:14px"></div>
+    </div>
+  </section>
+
+  <!-- ── Step 3: review ─────────────────────────────────────────────────── -->
+  <section class="panel" id="panel-review">
+    <div class="card">
+      <h2>Apply to every selected item</h2>
+      <p class="hint">
+        Owner punch lists rarely name a Procore user, a type, or a due date. Set the
+        common values once here, then override individual rows below.
+      </p>
+      <div id="defaults"></div>
+    </div>
+
+    <div class="toolbar">
+      <span class="count-pill" id="review-count">0 items</span>
+      <button class="btn-ghost btn-sm" id="select-all">Select all</button>
+      <button class="btn-ghost btn-sm" id="select-none">Clear</button>
+      <button class="btn-ghost btn-sm" id="select-flagged">Select flagged only</button>
+      <div class="spacer" style="flex:1"></div>
+      <input type="search" id="item-filter" placeholder="Filter items…" style="max-width:240px" />
+    </div>
+
+    <div id="items"></div>
+  </section>
+
+  <!-- ── Step 4: send ───────────────────────────────────────────────────── -->
+  <section class="panel" id="panel-send">
+    <div class="card">
+      <h2>Send to Procore</h2>
+      <div id="send-summary"></div>
+      <div id="send-progress"></div>
+    </div>
+    <div class="card" id="results-card" style="display:none">
+      <h2>Results</h2>
+      <div id="results"></div>
+    </div>
+    <div class="card" id="dryrun-card" style="display:none">
+      <h2>Payload preview</h2>
+      <p class="hint">Exactly what would be sent to Procore. Nothing has been created.</p>
+      <pre class="payload" id="dryrun"></pre>
+    </div>
+  </section>
+
+</main>
+
+<div class="actionbar" id="actionbar">
+  <button class="btn-ghost" id="back-btn" style="color:#fff;border-color:#fff">Back</button>
+  <div class="spacer"></div>
+  <div class="summary" id="bar-summary"></div>
+  <button class="btn-secondary" id="dryrun-btn" style="display:none">Preview payloads</button>
+  <button class="btn-primary" id="next-btn">Continue</button>
+</div>
+
+<div class="lightbox" id="lightbox"><img id="lightbox-img" alt="Punch item photo" /></div>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>
