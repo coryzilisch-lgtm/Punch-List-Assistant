@@ -1,6 +1,7 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
 import * as z from 'zod/v4';
+
+import { aiConfigured, messagesApi, modelId } from './model';
 
 /**
  * Punch list extraction.
@@ -18,9 +19,11 @@ import * as z from 'zod/v4';
  * Rendering client-side keeps pdf.js and its native canvas dependency out of the
  * Function, which matters: SWA managed Functions cap a deployment at ~15,000
  * files and cannot install system packages.
+ *
+ * Which Claude endpoint this runs against — Buffalo's Azure AI Foundry resource
+ * in production, the direct API in local development — is decided in `model.ts`.
+ * Both expose the same `messages` resource, so nothing here changes with it.
  */
-
-const MODEL = process.env.PUNCH_EXTRACT_MODEL || 'claude-opus-5';
 
 /**
  * Reasoning effort. This is a LATENCY control, not a cost decision: SWA managed
@@ -140,17 +143,6 @@ Rules:
 
 7. WATCH THE PAGE BOUNDARY. If an item is cut off at the top or bottom of the page, still return what is visible and say so in notes.`;
 
-let client: Anthropic | null = null;
-function anthropic(): Anthropic {
-  if (!client) {
-    if (!process.env.ANTHROPIC_API_KEY) {
-      throw new Error('ANTHROPIC_API_KEY is not set');
-    }
-    client = new Anthropic();
-  }
-  return client;
-}
-
 export interface ExtractPageArgs {
   /** Base64 page image, no data: prefix. */
   imageBase64: string;
@@ -192,8 +184,8 @@ List any region that is page furniture rather than a defect photo in page_furnit
 
 Return every punch list item on this page.`;
 
-  const response = await anthropic().messages.parse({
-    model: MODEL,
+  const response = await messagesApi().parse({
+    model: modelId(),
     max_tokens: 16000,
     system: SYSTEM,
     thinking: { type: 'adaptive' },
@@ -221,7 +213,7 @@ Return every punch list item on this page.`;
     ...parsed,
     items: assignOrphanPhotos(parsed.items, photos, parsed.page_furniture_photo_indexes || []),
     pageNumber,
-    model: MODEL,
+    model: modelId(),
     usage: {
       inputTokens: response.usage?.input_tokens ?? 0,
       outputTokens: response.usage?.output_tokens ?? 0,
@@ -309,9 +301,9 @@ export function assignOrphanPhotos(
 }
 
 export function extractionConfigured(): boolean {
-  return Boolean(process.env.ANTHROPIC_API_KEY);
+  return aiConfigured();
 }
 
 export function extractionModel(): string {
-  return MODEL;
+  return modelId();
 }
