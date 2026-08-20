@@ -61,6 +61,46 @@ export function modelId(): string {
   return resolveProvider() === 'foundry' ? '' : 'claude-opus-5';
 }
 
+/**
+ * Reasoning parameters, gated on what the chosen model actually accepts.
+ *
+ * `thinking: {type:'adaptive'}` and `output_config.effort` are not universal.
+ * They arrived with the 4.6 generation; on Haiku 4.5 and Sonnet 4.5 both are
+ * REJECTED with a 400, not ignored. So a bare `PUNCH_EXTRACT_MODEL=claude-haiku-4-5`
+ * would fail on every page — the setting would look like a model switch and
+ * behave like an outage.
+ *
+ * Effort itself is a LATENCY control here, not a cost dial: SWA managed Functions
+ * hard-stop a request at 45 seconds and a dense page at full effort can run past
+ * that, which a superintendent sees as a failed page rather than a slow one.
+ *
+ * On Foundry the model id is a DEPLOYMENT NAME chosen by whoever deployed it, so
+ * it may say nothing about the underlying model ("punch-list-prod"). An
+ * unrecognized id therefore falls back to the plain request, which every model
+ * accepts — degrading quality slightly beats 400-ing every page. Set
+ * PUNCH_EXTRACT_REASONING=adaptive to force it back on for a custom-named
+ * deployment of a modern model.
+ */
+const ADAPTIVE_CAPABLE =
+  /claude-(fable-5|mythos-5|opus-5|opus-4-[678]|sonnet-5|sonnet-4-6)/i;
+
+export interface ReasoningParams {
+  thinking?: { type: 'adaptive' };
+  effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+}
+
+export function reasoningParams(model = modelId()): ReasoningParams {
+  const mode = (process.env.PUNCH_EXTRACT_REASONING || 'auto').toLowerCase();
+
+  const adaptive =
+    mode === 'adaptive' ? true : mode === 'basic' ? false : ADAPTIVE_CAPABLE.test(model);
+
+  if (!adaptive) return {};
+
+  const effort = (process.env.PUNCH_EXTRACT_EFFORT || 'medium') as ReasoningParams['effort'];
+  return { thinking: { type: 'adaptive' }, effort };
+}
+
 export function modelConfig(): ModelConfig | null {
   const provider = resolveProvider();
   if (!provider) return null;
@@ -165,14 +205,16 @@ export async function checkModelAccess(): Promise<{ ok: boolean; detail: string 
     // deployment can answer a plain message and still reject the request this
     // app actually sends. That difference has to surface here, during setup,
     // rather than on page one of a real punch list.
+    const reasoning = reasoningParams(cfg.model);
     const response = await messagesApi().parse({
       model: cfg.model,
       max_tokens: 64,
-      thinking: { type: 'adaptive' },
+      ...(reasoning.thinking ? { thinking: reasoning.thinking } : {}),
       messages: [{ role: 'user', content: 'Reply with ok set to true.' }],
       output_config: {
         format: zodOutputFormat(z.object({ ok: z.boolean() })),
-        effort: 'low',
+        // Mirror extraction: only send effort where the model accepts it.
+        ...(reasoning.effort ? { effort: 'low' as const } : {}),
       },
     });
 
@@ -188,7 +230,9 @@ export async function checkModelAccess(): Promise<{ ok: boolean; detail: string 
 
     return {
       ok: true,
-      detail: `Reachable, with structured output and thinking — ${where}, model ${cfg.model}, via ${cfg.endpointLabel}`,
+      detail:
+        `Reachable, with structured output${reasoningParams(cfg.model).thinking ? ' and adaptive thinking' : ''} — ` +
+        `${where}, model ${cfg.model}, via ${cfg.endpointLabel}`,
     };
   } catch (err) {
     return { ok: false, detail: `${describeAiError(err)} (${cfg.endpointLabel}, model ${cfg.model})` };

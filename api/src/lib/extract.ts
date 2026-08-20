@@ -1,7 +1,7 @@
 import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
 import * as z from 'zod/v4';
 
-import { aiConfigured, messagesApi, modelId } from './model';
+import { aiConfigured, messagesApi, modelId, reasoningParams } from './model';
 
 /**
  * Punch list extraction.
@@ -24,21 +24,6 @@ import { aiConfigured, messagesApi, modelId } from './model';
  * in production, the direct API in local development — is decided in `model.ts`.
  * Both expose the same `messages` resource, so nothing here changes with it.
  */
-
-/**
- * Reasoning effort. This is a LATENCY control, not a cost decision: SWA managed
- * Functions hard-stop a request at 45 seconds, and a dense page at full effort
- * can run past that — which the super would see as a failed page, not a slow one.
- * Medium keeps a page comfortably inside the window. Raise it to "high" if a
- * particular owner's documents read poorly and you move extraction somewhere
- * without the 45s ceiling.
- */
-const EFFORT = (process.env.PUNCH_EXTRACT_EFFORT || 'medium') as
-  | 'low'
-  | 'medium'
-  | 'high'
-  | 'xhigh'
-  | 'max';
 
 /** One photo the browser cropped out of the page, described by position. */
 export interface PhotoRegion {
@@ -184,11 +169,14 @@ List any region that is page furniture rather than a defect photo in page_furnit
 
 Return every punch list item on this page.`;
 
+  // Only send reasoning parameters the chosen model accepts — see model.ts.
+  const reasoning = reasoningParams();
+
   const response = await messagesApi().parse({
     model: modelId(),
     max_tokens: 16000,
     system: SYSTEM,
-    thinking: { type: 'adaptive' },
+    ...(reasoning.thinking ? { thinking: reasoning.thinking } : {}),
     messages: [
       {
         role: 'user',
@@ -201,7 +189,10 @@ Return every punch list item on this page.`;
         ],
       },
     ],
-    output_config: { format: zodOutputFormat(PageSchema), effort: EFFORT },
+    output_config: {
+      format: zodOutputFormat(PageSchema),
+      ...(reasoning.effort ? { effort: reasoning.effort } : {}),
+    },
   });
 
   const parsed = response.parsed_output;

@@ -86,7 +86,8 @@ document name in its `reference` field.
 | `ANTHROPIC_FOUNDRY_RESOURCE` | yes | Azure AI Foundry resource name — the first label of the endpoint host. For `1coryzilisch-resource.services.ai.azure.com`, this is `1coryzilisch-resource`. |
 | `ANTHROPIC_FOUNDRY_API_KEY` | yes | Key from that resource's **Keys and Endpoint** page |
 | `PUNCH_EXTRACT_MODEL` | yes | The Claude model deployed in the resource. **No default on Foundry** — the id depends on what you deployed. |
-| `PUNCH_EXTRACT_EFFORT` | no | Defaults to `medium`. A latency control for the 45s function limit, not a cost dial. |
+| `PUNCH_EXTRACT_EFFORT` | no | Defaults to `medium`. A latency control for the 45s function limit, not a cost dial. Only sent to models that accept it. |
+| `PUNCH_EXTRACT_REASONING` | no | `auto` (default), `adaptive`, or `basic`. See **Choosing a model**. |
 | `ANTHROPIC_API_KEY` | no | Local-development fallback only. Ignored when the Foundry settings are present. |
 | `PUNCH_AI_PROVIDER` | no | Force `foundry` or `anthropic`. Only needed to override the automatic choice. |
 
@@ -139,6 +140,52 @@ key belongs to a different resource. Once that returns a message, set the three
 app settings and open the app — the **Connection check** on step 1 runs the same
 request shape the extractor uses, including structured output and thinking, and
 says which of the three is wrong if any.
+
+### Choosing a model
+
+`PUNCH_EXTRACT_MODEL` takes any Claude model. The default is `claude-opus-5`.
+
+**Cost is not the deciding factor.** Measured shape of one page: roughly 4,300
+input tokens (a 150 DPI page image is ~2,500 of those) and ~1,200 output. For the
+59-item, 17-page reference document that is about 73K input and 20K output, which
+comes to roughly:
+
+| Model | Rate (in / out per MTok) | That document |
+|---|---|---|
+| `claude-opus-5` | $5 / $25 | ~$0.90 |
+| `claude-sonnet-5` | $3 / $15 | ~$0.55 |
+| `claude-haiku-4-5` | $1 / $5 | ~$0.20 |
+
+The spread is about seventy cents per punch list, against an afternoon of a
+superintendent's time. Pick on accuracy and latency, not price. The CLI harness
+prints real token counts, so you can compute your own rather than trust the
+estimate above.
+
+**The arguments that do matter.** Haiku is faster, which buys margin against the
+45-second function ceiling on dense pages. Against that, this is careful-reading
+work on degraded scans — transcribing verbatim, telling a blank field from its
+printed label, keeping photos on the right row — and it feeds subcontractor
+dispatch, so a wrong row costs a trip to the site. Which way that trades is an
+empirical question about *your* documents, so measure it:
+
+```bash
+cd tools/extract-cli
+for m in claude-opus-5 claude-sonnet-5 claude-haiku-4-5; do
+  ANTHROPIC_API_KEY=... node run.mjs punchlist.pdf --model $m --json /tmp/$m.json
+done
+```
+
+Compare item counts, gaps in the owner's numbering, and how many rows come back
+flagged. If a cheaper model matches on your owners' formats, take it.
+
+**Reasoning parameters are gated on the model.** `thinking: {type:'adaptive'}`
+and `output_config.effort` arrived with the 4.6 generation and are *rejected with
+a 400* by Haiku 4.5 and Sonnet 4.5 — not ignored. The extractor therefore sends
+them only to models that accept them, so switching models is a one-setting change
+rather than an outage. On Foundry the model id is a deployment name that may not
+identify the model (`punch-list-prod`), so an unrecognized id falls back to the
+plain request; set `PUNCH_EXTRACT_REASONING=adaptive` to force them on for a
+custom-named deployment of a modern model, or `basic` to force them off.
 
 ### 5. Procore permissions
 

@@ -41,6 +41,22 @@ ANTHROPIC_API_KEY=sk-ant-... node run.mjs punchlist.pdf --json /tmp/result.json
 | `--pages 2` or `--pages 3-7` | Just those pages. |
 | `--out DIR` | Write page renders and cropped photos, to check the crops by eye. |
 | `--json FILE` | Full structured result. |
+| `--model ID` | Override `PUNCH_EXTRACT_MODEL` — the point of the harness for model comparison. |
+
+## Comparing models
+
+The run prints real input and output token counts, so cost comes from
+measurement rather than an estimate:
+
+```bash
+for m in claude-opus-5 claude-sonnet-5 claude-haiku-4-5; do
+  ANTHROPIC_API_KEY=... node run.mjs punchlist.pdf --model $m --json /tmp/$m.json
+done
+```
+
+Compare item counts, gaps in the owner's numbering, and the number of `!` rows.
+The extractor only sends reasoning parameters to models that accept them, so
+older models like Haiku 4.5 run correctly here instead of 400-ing.
 
 It reads `ANTHROPIC_API_KEY` for the direct API, or the `ANTHROPIC_FOUNDRY_*`
 settings to test the Foundry path — the same resolution the deployed app uses.

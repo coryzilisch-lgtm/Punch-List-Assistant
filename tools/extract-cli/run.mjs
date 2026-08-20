@@ -15,6 +15,7 @@
  *   ANTHROPIC_API_KEY=sk-ant-... node run.mjs ../../docs/punchlist.pdf
  *
  * Options:
+ *   --model ID       override PUNCH_EXTRACT_MODEL, to compare models on one document
  *   --pages 1-5      only these pages (default: all)
  *   --out DIR        write page renders and cropped photos here, to eyeball them
  *   --no-ai          render and detect photos only; makes no API calls, costs nothing
@@ -39,11 +40,16 @@ const flag = (name) => {
 };
 const has = (name) => argv.includes(name);
 
-const pdfPath = argv.find((a) => !a.startsWith('--') && argv[argv.indexOf(a) - 1] !== '--pages' &&
-  argv[argv.indexOf(a) - 1] !== '--out' && argv[argv.indexOf(a) - 1] !== '--json');
+// Anything that is not a flag and not a flag's value is the PDF path.
+const VALUE_FLAGS = ['--pages', '--out', '--json', '--model'];
+const pdfPath = argv.find(
+  (a, i) => !a.startsWith('--') && !VALUE_FLAGS.includes(argv[i - 1]),
+);
 
 if (!pdfPath) {
-  console.error('Usage: node run.mjs <file.pdf> [--pages 1-5] [--out DIR] [--json FILE] [--no-ai]');
+  console.error(
+    'Usage: node run.mjs <file.pdf> [--model ID] [--pages 1-5] [--out DIR] [--json FILE] [--no-ai]',
+  );
   process.exit(2);
 }
 if (!fs.existsSync(pdfPath)) {
@@ -52,6 +58,12 @@ if (!fs.existsSync(pdfPath)) {
 }
 
 const useAi = !has('--no-ai');
+
+// Set before the extractor is imported: it reads PUNCH_EXTRACT_MODEL from the
+// environment, so this makes --model a straight override with no special casing
+// in the extraction code.
+const modelOverride = flag('--model');
+if (modelOverride) process.env.PUNCH_EXTRACT_MODEL = modelOverride;
 const outDir = flag('--out');
 const jsonOut = flag('--json');
 
@@ -147,7 +159,10 @@ const pdf = await pdfjs.getDocument({
 
 const total = pdf.numPages;
 const [from, to] = pageFilter || [1, total];
-console.log(`${path.basename(pdfPath)} — ${total} page(s), reading ${from}${to > from ? `-${to}` : ''}\n`);
+const modelLabel = useAi ? process.env.PUNCH_EXTRACT_MODEL || 'claude-opus-5 (default)' : 'no model';
+console.log(
+  `${path.basename(pdfPath)} — ${total} page(s), reading ${from}${to > from ? `-${to}` : ''} · ${modelLabel}\n`,
+);
 
 let extractPage = null;
 if (useAi) ({ extractPage } = require(extractDist));
@@ -156,6 +171,8 @@ const allItems = [];
 const pageResults = [];
 let photoTotal = 0;
 let furnitureTotal = 0;
+let inputTokens = 0;
+let outputTokens = 0;
 
 for (let n = from; n <= Math.min(to, total); n++) {
   const started = Date.now();
@@ -206,6 +223,8 @@ for (let n = from; n <= Math.min(to, total); n++) {
 
   const furniture = result.page_furniture_photo_indexes || [];
   furnitureTotal += furniture.length;
+  inputTokens += result.usage?.inputTokens || 0;
+  outputTokens += result.usage?.outputTokens || 0;
 
   const bits = [
     `page ${pad(n)}`,
@@ -236,6 +255,9 @@ if (useAi) {
   const withPhoto = allItems.filter((i) => i.photo_indexes.length).length;
   console.log(`${allItems.length} items · ${withPhoto} with a photo · ${low} flagged for review`);
   console.log(`${photoTotal} image regions detected · ${furnitureTotal} discarded as page furniture`);
+  // Real token counts, so a model comparison rests on measurement rather than
+  // an estimate. Multiply by the published per-MTok rates for the model used.
+  console.log(`${inputTokens.toLocaleString()} input tokens · ${outputTokens.toLocaleString()} output tokens`);
   const numbered = allItems.map((i) => Number(i.source_number)).filter((n) => Number.isFinite(n));
   if (numbered.length > 1) {
     const missing = gaps(numbered);
