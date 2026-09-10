@@ -11,6 +11,7 @@
  */
 
 import { loadPdf, processPage } from './pdf-pipeline.js';
+import { byLastName } from './name-sort.js';
 
 const STEPS = ['project', 'upload', 'review', 'send'];
 
@@ -546,6 +547,186 @@ function renderReadNotes() {
   $('read-notes').innerHTML = html;
 }
 
+
+// ── Name type-ahead ─────────────────────────────────────────────────────────
+
+/**
+ * Sort key for a person: last name, then first.
+ *
+ * Procore hands back names in several shapes — "Chad Dawson",
+ * "Tim Fishburn (Buffalo Construction Inc.)", occasionally "Dawson, Chad" — and
+ * a superintendent looking for someone scans by surname. Sorting on the raw
+ * string would file everyone under their first name, which is the same as not
+ * sorting at all when you are hunting for "Fishburn".
+ */
+/** People sorted by surname; companies stay in plain alphabetical order. */
+function sortedPeople(list) {
+  return (list || []).slice().sort(byLastName);
+}
+function sortedCompanies(list) {
+  return (list || []).slice().sort((a, b) => String(a.name).localeCompare(String(b.name)));
+}
+
+function optionLabel(list, id) {
+  if (!id) return '';
+  const hit = (list || []).find((o) => String(o.id) === String(id));
+  return hit ? hit.name : '';
+}
+
+/**
+ * Render a name field as a type-ahead input rather than a select.
+ *
+ * `scope` says where a choice is written back: 'default' for the bulk card,
+ * 'item' for a row. The options themselves are NOT rendered here — a punch list
+ * with sixty rows and four name fields each would put a quarter of a million
+ * option elements in the DOM. One shared popup is filled on focus instead.
+ */
+function nameCombo({ act, scope, value, kind, placeholder }) {
+  const list = kind === 'company' ? (S.config?.vendors || []) : (S.config?.users || []);
+  return `<input type="text" class="namecombo" data-combo="${kind}" data-act="${act}"
+    data-scope="${scope}" data-value="${esc(value || '')}" value="${esc(optionLabel(list, value))}"
+    role="combobox" aria-expanded="false" aria-autocomplete="list" autocomplete="off"
+    placeholder="${esc(placeholder || 'Type a name…')}" />`;
+}
+
+let nameComboState = { input: null, matches: [], index: -1 };
+
+function namePopup() {
+  let el = $('name-popup');
+  if (!el) {
+    el = document.createElement('ul');
+    el.id = 'name-popup';
+    el.className = 'name-popup';
+    el.setAttribute('role', 'listbox');
+    el.hidden = true;
+    document.body.appendChild(el);
+  }
+  return el;
+}
+
+function closeNameCombo(revert = true) {
+  const { input } = nameComboState;
+  if (input && revert) {
+    // Free text that matches nobody is misleading — snap back to the real value.
+    const list = input.dataset.combo === 'company' ? S.config?.vendors : S.config?.users;
+    input.value = optionLabel(list, input.dataset.value);
+    input.setAttribute('aria-expanded', 'false');
+  }
+  namePopup().hidden = true;
+  nameComboState = { input: null, matches: [], index: -1 };
+}
+
+function openNameCombo(input) {
+  const kind = input.dataset.combo;
+  const all = kind === 'company' ? sortedCompanies(S.config?.vendors) : sortedPeople(S.config?.users);
+  const typed = input.value.trim().toLowerCase();
+  const selectedLabel = optionLabel(
+    kind === 'company' ? S.config?.vendors : S.config?.users,
+    input.dataset.value,
+  );
+
+  // Typing filters; opening on the current selection should still show everyone,
+  // otherwise the list collapses to the one name already chosen.
+  const terms = typed && typed !== selectedLabel.toLowerCase() ? typed.split(/\s+/) : [];
+  const matches = terms.length
+    ? all.filter((o) => {
+        const hay = o.name.toLowerCase();
+        return terms.every((t) => hay.includes(t));
+      })
+    : all;
+
+  nameComboState = { input, matches, index: -1 };
+
+  const popup = namePopup();
+  popup.innerHTML = matches.length
+    ? `<li role="option" data-id="" class="name-clear">— None —</li>` +
+      matches
+        .map(
+          (o, i) =>
+            `<li role="option" id="name-opt-${i}" data-id="${o.id}" aria-selected="false">${highlight(
+              o.name,
+              terms.join(' '),
+            )}${o.company ? `<span class="combo-sub">${esc(o.company)}</span>` : ''}</li>`,
+        )
+        .join('')
+    : `<li class="combo-empty">No match for “${esc(input.value)}”</li>`;
+
+  const rect = input.getBoundingClientRect();
+  popup.style.left = `${rect.left + window.scrollX}px`;
+  popup.style.top = `${rect.bottom + window.scrollY + 4}px`;
+  popup.style.width = `${rect.width}px`;
+  popup.hidden = false;
+  input.setAttribute('aria-expanded', 'true');
+}
+
+function moveNameCombo(delta) {
+  const popup = namePopup();
+  if (popup.hidden) return;
+  const opts = popup.querySelectorAll('li[data-id]');
+  if (!opts.length) return;
+  nameComboState.index = (nameComboState.index + delta + opts.length) % opts.length;
+  opts.forEach((el, i) => el.setAttribute('aria-selected', String(i === nameComboState.index)));
+  opts[nameComboState.index]?.scrollIntoView({ block: 'nearest' });
+}
+
+function commitName(id) {
+  const { input } = nameComboState;
+  if (!input) return;
+  const kind = input.dataset.combo;
+  const list = kind === 'company' ? S.config?.vendors : S.config?.users;
+
+  input.dataset.value = id || '';
+  input.value = optionLabel(list, id);
+
+  const act = input.dataset.act;
+  if (input.dataset.scope === 'default') {
+    S.defaults[act] = id || '';
+  } else {
+    const wrapper = input.closest('.item');
+    const item = wrapper && S.items.find((i) => i.id === Number(wrapper.dataset.id));
+    if (item) item[act] = id || '';
+  }
+  closeNameCombo(false);
+}
+
+function wireNameCombos() {
+  document.addEventListener('focusin', (e) => {
+    const input = e.target.closest?.('.namecombo');
+    if (input) openNameCombo(input);
+    else if (!e.target.closest?.('#name-popup')) closeNameCombo();
+  });
+
+  document.addEventListener('input', (e) => {
+    const input = e.target.closest?.('.namecombo');
+    if (input) openNameCombo(input);
+  });
+
+  document.addEventListener('keydown', (e) => {
+    const input = e.target.closest?.('.namecombo');
+    if (!input) return;
+    if (e.key === 'ArrowDown') { e.preventDefault(); moveNameCombo(1); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); moveNameCombo(-1); }
+    else if (e.key === 'Enter') {
+      e.preventDefault();
+      const opts = namePopup().querySelectorAll('li[data-id]');
+      // Enter with exactly one real match takes it without arrowing — the usual
+      // case once a surname has been typed. Index 0 is the "None" row.
+      if (nameComboState.index >= 0) commitName(opts[nameComboState.index].dataset.id);
+      else if (opts.length === 2) commitName(opts[1].dataset.id);
+    } else if (e.key === 'Escape') { closeNameCombo(); input.blur(); }
+  });
+
+  namePopup().addEventListener('mousedown', (e) => {
+    // mousedown, not click: blur would tear the popup down first.
+    const li = e.target.closest('li[data-id]');
+    if (li) { e.preventDefault(); commitName(li.dataset.id); }
+  });
+
+  // Anchored to the viewport, so it has to follow or be dismissed.
+  window.addEventListener('scroll', () => closeNameCombo(), true);
+  window.addEventListener('resize', () => closeNameCombo());
+}
+
 // ── Step 3: review ──────────────────────────────────────────────────────────
 
 function optionList(list, selected, blank) {
@@ -570,20 +751,20 @@ function renderDefaults() {
   $('defaults').innerHTML = `
     <div class="grid-2">
       <div>
-        <label class="fl" for="d-manager">Punch item manager</label>
-        <select id="d-manager">${optionList(people, d.punchItemManagerId, '— None —')}</select>
+        <label class="fl">Punch item manager</label>
+${nameCombo({ act: 'punchItemManagerId', scope: 'default', value: d.punchItemManagerId, kind: 'person' })}
       </div>
       <div>
-        <label class="fl" for="d-approver">Final approver</label>
-        <select id="d-approver">${optionList(people, d.finalApproverId, '— None —')}</select>
+        <label class="fl">Final approver</label>
+${nameCombo({ act: 'finalApproverId', scope: 'default', value: d.finalApproverId, kind: 'person' })}
       </div>
       <div>
-        <label class="fl" for="d-assignee">Assign to (person)</label>
-        <select id="d-assignee">${optionList(people, d.assigneeId, '— None —')}</select>
+        <label class="fl">Assign to (person)</label>
+${nameCombo({ act: 'assigneeId', scope: 'default', value: d.assigneeId, kind: 'person' })}
       </div>
       <div>
-        <label class="fl" for="d-vendor">Assign to (company)</label>
-        <select id="d-vendor">${optionList(c.vendors, d.vendorId, '— None —')}</select>
+        <label class="fl">Assign to (company)</label>
+${nameCombo({ act: 'vendorId', scope: 'default', value: d.vendorId, kind: 'company' })}
       </div>
       <div>
         <label class="fl" for="d-type">Punch item type</label>
@@ -624,10 +805,6 @@ function renderDefaults() {
       S.defaults[key] = e.target.value;
     });
   };
-  bind('d-manager', 'punchItemManagerId');
-  bind('d-approver', 'finalApproverId');
-  bind('d-assignee', 'assigneeId');
-  bind('d-vendor', 'vendorId');
   bind('d-type', 'punchItemTypeId');
   bind('d-priority', 'priority');
   bind('d-due', 'dueDate');
@@ -740,11 +917,11 @@ function renderItems() {
             </div>
             <div>
               <label class="fl">Assign to (person)</label>
-              <select data-act="assigneeId">${optionList(c.users, item.assigneeId, '— Use default —')}</select>
+${nameCombo({ act: 'assigneeId', scope: 'item', value: item.assigneeId, kind: 'person' })}
             </div>
             <div>
               <label class="fl">Assign to (company)</label>
-              <select data-act="vendorId">${optionList(c.vendors, item.vendorId, '— Use default —')}</select>
+${nameCombo({ act: 'vendorId', scope: 'item', value: item.vendorId, kind: 'company' })}
             </div>
             <div>
               <label class="fl">Due date</label>
@@ -761,19 +938,11 @@ function renderItems() {
             </div>
             <div>
               <label class="fl">Punch item manager</label>
-              <select data-act="punchItemManagerId">${optionList(
-                c.users,
-                item.punchItemManagerId,
-                '— None —',
-              )}</select>
+${nameCombo({ act: 'punchItemManagerId', scope: 'item', value: item.punchItemManagerId, kind: 'person' })}
             </div>
             <div>
               <label class="fl">Final approver</label>
-              <select data-act="finalApproverId">${optionList(
-                c.users,
-                item.finalApproverId,
-                '— None —',
-              )}</select>
+${nameCombo({ act: 'finalApproverId', scope: 'item', value: item.finalApproverId, kind: 'person' })}
             </div>
           </div>
           <div style="margin-top:9px">
@@ -830,12 +999,9 @@ function wireItemDelegation() {
       renderBar();
       return;
     }
-    if (
-      [
-        'locationId', 'tradeId', 'punchItemTypeId', 'assigneeId', 'vendorId',
-        'punchItemManagerId', 'finalApproverId', 'priority',
-      ].includes(act)
-    ) {
+    // Name fields are type-ahead inputs and commit themselves; only the plain
+    // selects come through here.
+    if (['locationId', 'tradeId', 'punchItemTypeId', 'priority'].includes(act)) {
       item[act] = e.target.value;
     }
   });
@@ -1162,6 +1328,7 @@ function wire() {
 
   wireDropzone();
   wireItemDelegation();
+  wireNameCombos();
 
   $('page-chips').addEventListener('click', async (e) => {
     const page = Number(e.target.dataset.page);
