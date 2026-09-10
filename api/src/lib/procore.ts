@@ -423,6 +423,7 @@ export interface CreatedPunchItem {
  * it", which is the only claim worth making.
  */
 export interface ObservedPunchItem {
+  status: string | null;
   attachmentCount: number;
   ballInCourt: string[];
   assignees: string[];
@@ -460,6 +461,7 @@ export async function observePunchItem(
     );
     const attachments = row.attachments ?? row.images ?? [];
     return {
+      status: typeof row.status === 'string' ? row.status : null,
       attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
       ballInCourt: namesOf(row.ball_in_court ?? row.ball_in_courts),
       assignees: namesOf(row.assignments ?? row.assignees),
@@ -472,75 +474,109 @@ export async function observePunchItem(
 }
 
 /**
- * Attachment strategies, tried in order until one demonstrably works.
+ * Flatten the punch item payload into Rails-style multipart keys.
  *
- * Procore's documented key for punch item images is `images[]` — NOT the
- * `punch_item[attachments][]` this originally sent, which is why photos showed
- * in the app and never appeared in Procore. The key differs per resource, and
- * the punch item endpoint accepts it on create and update.
- *
- * The list exists rather than a single call because the exact accepted shape
- * could not be verified from this environment (Procore's developer docs are
- * unreachable behind the network egress policy), and a wrong guess here fails
- * silently with a 200. Each attempt is verified by reading the item back, so
- * the first real push identifies the one that works — then this can collapse to
- * that single strategy.
+ * `punch_item[name]`, `punch_item[assignments][][assignee_id]`, and so on —
+ * Procore is a Rails app and parses bracket notation back into the same nested
+ * hash the JSON body produces.
  */
-const ATTACH_STRATEGIES: Array<{
-  label: string;
-  method: string;
-  path: (id: number) => string;
-  field: string;
-}> = [
-  { label: 'v1.1 PATCH images[]', method: 'PATCH', path: (id) => `/rest/v1.1/punch_items/${id}`, field: 'images[]' },
-  { label: 'v1.0 PATCH images[]', method: 'PATCH', path: (id) => `/rest/v1.0/punch_items/${id}`, field: 'images[]' },
+function appendNested(form: FormData, prefix: string, value: unknown): void {
+  if (value === null || value === undefined) return;
+  if (Array.isArray(value)) {
+    for (const entry of value) appendNested(form, `${prefix}[]`, entry);
+    return;
+  }
+  if (typeof value === 'object') {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      appendNested(form, `${prefix}[${k}]`, v);
+    }
+    return;
+  }
+  form.append(prefix, String(value));
+}
+
+/**
+ * Send the photos with the CREATE, not as a follow-up update.
+ *
+ * The first attempt attached afterwards with a multipart PATCH, on the reasoning
+ * that a rejected photo should not cost the whole item. Procore accepted every
+ * one of those requests with a 200 and stored nothing: `images[]` is documented
+ * on **Create Punch Item**, and the update endpoint simply ignores it. Photos
+ * therefore go on the create.
+ *
+ * The original concern still stands, so it is handled by falling back: if the
+ * multipart create fails for any reason, the item is created again from the
+ * plain JSON body that is already known to work, and the photo failure is
+ * reported against a row that exists rather than losing the row.
+ */
+async function createWithPhotos(
+  projectId: number,
+  input: PunchItemInput,
+  photos: PunchPhoto[],
+): Promise<CreatedPunchItem> {
+  const form = new FormData();
+  form.append('project_id', String(projectId));
+  appendNested(form, 'punch_item', buildPunchItemPayload(input));
+  for (const photo of photos) {
+    form.append(
+      'images[]',
+      new Blob([new Uint8Array(photo.bytes)], { type: photo.contentType }),
+      photo.filename,
+    );
+  }
+
+  return procoreRequest<CreatedPunchItem>('POST', '/rest/v1.1/punch_items', {
+    query: { project_id: projectId },
+    form,
+  });
+}
+
+/**
+ * Move a Draft item to Initiated.
+ *
+ * Procore's rule: an item is Draft when its creator is not its Punch Item
+ * Manager, and Initiated once it has been sent to that manager. Everything this
+ * app creates is therefore Draft — the API service account creates it, a real
+ * person is the manager — and a Draft item sits in its CREATOR's court. That is
+ * why every imported item showed ball-in-court on the service account: not a bug
+ * in the payload, the workflow simply had not started.
+ *
+ * This is opt-in per push, because sending is what notifies the manager and
+ * assignees. Sending sixty items silently would put sixty emails in front of
+ * people who never agreed to receive them.
+ */
+const SEND_STRATEGIES: Array<{ label: string; send: (p: number, id: number) => Promise<void> }> = [
   {
-    label: 'v1.1 PATCH punch_item[attachments][]',
-    method: 'PATCH',
-    path: (id) => `/rest/v1.1/punch_items/${id}`,
-    field: 'punch_item[attachments][]',
+    label: 'PATCH status=initiated',
+    send: (projectId, id) =>
+      procoreRequest('PATCH', `/rest/v1.1/punch_items/${id}`, {
+        query: { project_id: projectId },
+        body: { project_id: projectId, punch_item: { status: 'initiated' } },
+      }).then(() => undefined),
+  },
+  {
+    label: 'POST send',
+    send: (projectId, id) =>
+      procoreRequest('POST', `/rest/v1.1/punch_items/${id}/send`, {
+        query: { project_id: projectId },
+        body: { project_id: projectId },
+      }).then(() => undefined),
   },
 ];
 
-/**
- * Attach photos to an existing punch item.
- *
- * Returns the strategy that worked, so the caller can report it and so the
- * chain above can eventually be trimmed to one.
- */
-export async function attachPhotos(
+export async function sendPunchItem(
   projectId: number,
   punchItemId: number,
-  photos: PunchPhoto[],
-): Promise<{ attached: number; strategy: string | null; errors: string[] }> {
+): Promise<{ sent: boolean; strategy: string | null; errors: string[] }> {
   const errors: string[] = [];
-  if (!photos.length) return { attached: 0, strategy: null, errors };
-
-  const before = (await observePunchItem(projectId, punchItemId))?.attachmentCount ?? 0;
-
-  for (const strategy of ATTACH_STRATEGIES) {
+  for (const strategy of SEND_STRATEGIES) {
     try {
-      const form = new FormData();
-      form.append('project_id', String(projectId));
-      for (const photo of photos) {
-        form.append(
-          strategy.field,
-          new Blob([new Uint8Array(photo.bytes)], { type: photo.contentType }),
-          photo.filename,
-        );
+      await strategy.send(projectId, punchItemId);
+      const after = await observePunchItem(projectId, punchItemId);
+      if (after && after.status && after.status.toLowerCase() !== 'draft') {
+        return { sent: true, strategy: strategy.label, errors };
       }
-
-      await procoreRequest(strategy.method, strategy.path(punchItemId), {
-        query: { project_id: projectId },
-        form,
-      });
-
-      // A 2xx is not proof — the original bug was a 200 that attached nothing.
-      const after = (await observePunchItem(projectId, punchItemId))?.attachmentCount ?? 0;
-      if (after > before) {
-        return { attached: after - before, strategy: strategy.label, errors };
-      }
-      errors.push(`${strategy.label}: accepted but attached nothing`);
+      errors.push(`${strategy.label}: accepted but the item is still Draft`);
     } catch (err) {
       errors.push(
         `${strategy.label}: ${
@@ -551,24 +587,21 @@ export async function attachPhotos(
       );
     }
   }
-
-  return { attached: 0, strategy: null, errors };
+  return { sent: false, strategy: null, errors };
 }
 
 /**
  * Assignment strategies, tried in order until the read-back shows an assignee.
  *
- * The first production push landed every item with ball-in-court on the API
- * service account rather than on the assigned person. Procore accepted the
- * inline `assignments` array on create and stored nothing from it, then defaulted
- * the court to the creating user. As with attachments, the accepted shape could
- * not be confirmed from here (developer docs are unreachable behind the network
- * egress policy), so the chain runs only when the inline attempt demonstrably
- * failed, and reports which one worked.
+ * Procore accepted the inline `assignments` array on create and stored nothing
+ * from it. The accepted shape could not be confirmed from here — Procore's
+ * developer docs are unreachable behind this environment's network egress
+ * policy — so the chain runs only when the inline attempt demonstrably failed,
+ * and reports which member worked so it can later collapse to that one.
  *
- * Nothing here runs when no assignee was chosen — an unassigned item is meant to
- * sit in nobody's court, and inventing one to satisfy Procore's default would put
- * work in front of a person who never agreed to it.
+ * Nothing here runs when no assignee was chosen. An unassigned item is meant to
+ * sit in nobody's court, and inventing an assignee to satisfy Procore's default
+ * would put work in front of a person who never agreed to it.
  */
 const ASSIGN_STRATEGIES: Array<{
   label: string;
@@ -603,8 +636,8 @@ const ASSIGN_STRATEGIES: Array<{
 ];
 
 /**
- * Make sure the requested assignee actually holds the item, retrying through
- * the strategies above only if the create did not already achieve it.
+ * Make sure the requested assignee actually holds the item, retrying through the
+ * strategies above only if the create did not already achieve it.
  */
 export async function ensureAssignees(
   projectId: number,
@@ -645,9 +678,9 @@ export interface CreatePunchItemResult {
   item: CreatedPunchItem;
   photoErrors: string[];
   photosAttached: number;
-  attachStrategy: string | null;
   assignErrors: string[];
   assignStrategy: string | null;
+  sendErrors: string[];
   observed: ObservedPunchItem | null;
 }
 
@@ -664,24 +697,43 @@ export async function createPunchItem(
   projectId: number,
   input: PunchItemInput,
   photos: PunchPhoto[] = [],
+  options: { send?: boolean } = {},
 ): Promise<CreatePunchItemResult> {
-  const created = await procoreRequest<CreatedPunchItem>('POST', '/rest/v1.1/punch_items', {
-    query: { project_id: projectId },
-    body: { project_id: projectId, punch_item: buildPunchItemPayload(input) },
-  });
+  const photoErrors: string[] = [];
+  let created: CreatedPunchItem;
 
-  let photoErrors: string[] = [];
-  let photosAttached = 0;
-  let attachStrategy: string | null = null;
-
-  if (photos.length && created?.id) {
-    const result = await attachPhotos(projectId, created.id, photos);
-    photosAttached = result.attached;
-    attachStrategy = result.strategy;
-    if (!result.attached) photoErrors = result.errors;
+  if (photos.length) {
+    try {
+      created = await createWithPhotos(projectId, input, photos);
+    } catch (err) {
+      photoErrors.push(
+        `photos rejected on create: ${
+          err instanceof ProcoreError
+            ? `${err.status} ${err.fieldErrors().join('; ') || summarize(err.body)}`
+            : String(err)
+        }`,
+      );
+      // Never lose the row over a photo — fall back to the plain JSON create.
+      created = await procoreRequest<CreatedPunchItem>('POST', '/rest/v1.1/punch_items', {
+        query: { project_id: projectId },
+        body: { project_id: projectId, punch_item: buildPunchItemPayload(input) },
+      });
+    }
+  } else {
+    created = await procoreRequest<CreatedPunchItem>('POST', '/rest/v1.1/punch_items', {
+      query: { project_id: projectId },
+      body: { project_id: projectId, punch_item: buildPunchItemPayload(input) },
+    });
   }
 
   let observed = created?.id ? await observePunchItem(projectId, created.id) : null;
+
+  // A 2xx on the create is not evidence the photos landed; the previous attempt
+  // returned 200 and stored nothing. Only the read-back counts.
+  const photosAttached = observed?.attachmentCount ?? 0;
+  if (photos.length && photosAttached === 0 && !photoErrors.length) {
+    photoErrors.push('Procore accepted the create but stored no attachment');
+  }
 
   let assignErrors: string[] = [];
   let assignStrategy: string | null = null;
@@ -698,13 +750,20 @@ export async function createPunchItem(
     observed = assigned.observed ?? observed;
   }
 
+  let sendErrors: string[] = [];
+  if (options.send && created?.id && observed?.status?.toLowerCase() === 'draft') {
+    const sent = await sendPunchItem(projectId, created.id);
+    sendErrors = sent.sent ? [] : sent.errors;
+    observed = (await observePunchItem(projectId, created.id)) ?? observed;
+  }
+
   return {
     item: created,
     photoErrors,
     photosAttached,
-    attachStrategy,
     assignErrors,
     assignStrategy,
+    sendErrors,
     observed,
   };
 }

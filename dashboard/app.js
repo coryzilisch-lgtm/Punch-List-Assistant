@@ -36,6 +36,8 @@ const S = {
   },
   results: [],
   sending: false,
+  /** Move created items out of Draft. Off by default — sending notifies people. */
+  sendOnPush: false,
 };
 
 let nextItemId = 1;
@@ -943,6 +945,20 @@ function renderSendSummary() {
         'press <strong>Apply to selected items</strong>.',
     );
   }
+  html += `
+    <label class="sendopt">
+      <input type="checkbox" id="send-opt" ${S.sendOnPush ? 'checked' : ''} />
+      <span>
+        <strong>Send items to the punch item manager</strong> (moves them out of Draft)
+        <span class="muted">
+          Procore creates API items as <em>Draft</em>, held by the account that created them — which is why
+          imported items show ball-in-court on the API service account. Sending starts the workflow and moves
+          the item to its manager and assignees. It also <strong>notifies them by email</strong>, so leave this
+          off if you would rather review in Procore and press Send there.
+        </span>
+      </span>
+    </label>`;
+
   html += note(
     'info',
     'Send one item first if this is a new project — the result will tell you exactly what Procore requires ' +
@@ -950,6 +966,8 @@ function renderSendSummary() {
   );
 
   $('send-summary').innerHTML = html;
+  const opt = $('send-opt');
+  if (opt) opt.addEventListener('change', (e) => { S.sendOnPush = e.target.checked; });
 }
 
 async function doPush(dryRun) {
@@ -982,6 +1000,7 @@ async function doPush(dryRun) {
         body: JSON.stringify({
           projectId: S.project.id,
           dryRun,
+          send: S.sendOnPush,
           // Dry runs never carry photo bytes — the payload preview only needs the count.
           items: batch.map((i) => {
             const p = toPayload(i);
@@ -1065,12 +1084,31 @@ function renderResults() {
           );
         }
 
+        const status = r.observed?.status || '';
+        if (status) {
+          bits.push(
+            status.toLowerCase() === 'draft'
+              ? '<span class="badge flat">Draft — not yet sent</span>'
+              : `<span class="badge ok">${esc(status)}</span>`,
+          );
+        }
+        if (r.sendErrors?.length) {
+          bits.push(`<span class="badge err">Send failed</span><span class="muted">${esc(
+            r.sendErrors.join('; '),
+          )}</span>`);
+        }
+
         const bic = r.observed?.ballInCourt || [];
         const wantedAssignee = Boolean(item?.assigneeId);
         if (bic.length) {
           bits.push(`<span class="badge info">Ball in court: ${esc(bic.join(', '))}</span>`);
         } else if (wantedAssignee) {
           bits.push('<span class="badge err">Assignee did not stick</span>');
+        }
+        // A Draft item sitting with its creator is Procore's own workflow, not a
+        // defect — say so rather than letting it read as a bug.
+        if (bic.length === 1 && /abs-api-export/i.test(bic[0]) && status.toLowerCase() === 'draft') {
+          bits.push('<span class="muted">Draft items sit with their creator until sent.</span>');
         }
         if (r.assignErrors?.length) {
           bits.push(`<span class="muted">${esc(r.assignErrors.join('; '))}</span>`);

@@ -41,6 +41,12 @@ interface PushItemBody {
 interface PushBody {
   projectId: number;
   dryRun?: boolean;
+  /**
+   * Move each created item out of Draft. Off by default: sending is what
+   * notifies the punch item manager and assignees, and a silent send of sixty
+   * items would email people who never agreed to receive them.
+   */
+  send?: boolean;
   items: PushItemBody[];
 }
 
@@ -56,11 +62,14 @@ interface PushResult {
   photosAttached?: number;
   /** Assignment attempts that failed, when the requested assignee did not stick. */
   assignErrors?: string[];
+  /** Failures moving the item out of Draft, when sending was requested. */
+  sendErrors?: string[];
   /**
    * What Procore actually stored, read back after the write — not what we sent.
    * Both early bugs here were silent successes, so the UI reports this instead.
    */
   observed?: {
+    status: string | null;
     attachmentCount: number;
     ballInCourt: string[];
     assignees: string[];
@@ -159,8 +168,10 @@ export async function pushHandler(
     }
 
     try {
-      const created = await createPunchItem(body.projectId, input, photos);
-      const { item, photoErrors, photosAttached, assignErrors, attachStrategy, assignStrategy, observed } =
+      const created = await createPunchItem(body.projectId, input, photos, {
+        send: Boolean(body.send),
+      });
+      const { item, photoErrors, photosAttached, assignErrors, assignStrategy, sendErrors, observed } =
         created;
       results.push({
         clientId: raw.clientId,
@@ -170,13 +181,14 @@ export async function pushHandler(
         photoErrors: photoErrors.length ? photoErrors : undefined,
         photosAttached,
         assignErrors: assignErrors.length ? assignErrors : undefined,
+        sendErrors: sendErrors.length ? sendErrors : undefined,
         observed: observed ?? undefined,
       });
       // Log which strategy worked. Once the same one wins across a few real
       // projects, the chains in procore.ts can collapse to it.
       context.log(
         `push ok project=${body.projectId} punch_item=${item.id} by=${actor} ` +
-          `photos=${photosAttached}/${photos.length} attach=${attachStrategy ?? 'none'} ` +
+          `photos=${photosAttached}/${photos.length} status=${observed?.status ?? '?'} ` +
           `assign=${assignStrategy ?? 'none'} bic=${observed?.ballInCourt.join('|') ?? '?'}`,
       );
     } catch (err) {

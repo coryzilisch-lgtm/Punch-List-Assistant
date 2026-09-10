@@ -472,3 +472,19 @@ pre.payload {
   border-top: 1px solid var(--buf-border);
 }
 .apply-bar .muted { flex: 1 1 220px; }
+
+.sendopt {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 12px 13px;
+  margin-bottom: 14px;
+  border: 1px solid var(--buf-border);
+  border-left: 4px solid var(--buf-orange);
+  border-radius: var(--radius-sm);
+  background: var(--buf-card-bg);
+  font-size: 13px;
+  cursor: pointer;
+}
+.sendopt input { width: 18px; height: 18px; margin-top: 2px; accent-color: var(--buf-orange); flex: none; }
+.sendopt .muted { display: block; margin-top: 4px; }
