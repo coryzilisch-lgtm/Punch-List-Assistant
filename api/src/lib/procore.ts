@@ -341,6 +341,36 @@ export async function listProjects(): Promise<{ projects: ProcoreProject[]; trun
   return { projects: rows, truncated };
 }
 
+/**
+ * Look up one project by its Procore id.
+ *
+ * Backs the "type the id" escape hatch in the picker. It goes to Procore rather
+ * than the Fabric mirror on purpose: the whole reason someone types an id is
+ * that the project is missing from the mirrored list — usually because it was
+ * created since last night's sync. Reading the mirror again would just fail the
+ * same way.
+ *
+ * Returns null for an id that does not exist or is not visible to the service
+ * account, so the caller can say which of those it was.
+ */
+export async function getProject(projectId: number): Promise<ProcoreProject | null> {
+  // v1.0 is the documented detail endpoint; v1.1 answers on some tenants.
+  for (const path of [`/rest/v1.0/projects/${projectId}`, `/rest/v1.1/projects/${projectId}`]) {
+    try {
+      const row = await procoreRequest<ProcoreProject>('GET', path, {
+        query: { company_id: companyId() },
+      });
+      if (row && typeof row.id === 'number') return row;
+    } catch (err) {
+      // A 404 means "not this endpoint" or "no such project" — try the other
+      // before concluding anything. Anything else is a real failure.
+      if (err instanceof ProcoreError && (err.status === 404 || err.status === 400)) continue;
+      throw err;
+    }
+  }
+  return null;
+}
+
 export interface NamedRef {
   id: number;
   name: string;

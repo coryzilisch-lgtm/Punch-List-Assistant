@@ -1,6 +1,7 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
 import { errorResponse, guarded, json } from '../lib/http';
 import {
+  getProject,
   getProjectPunchConfig,
   listProjects,
   ProcoreError,
@@ -102,6 +103,42 @@ export async function projectsHandler(
 
   const projectId = request.params.id ? Number(request.params.id) : null;
 
+  // GET /api/projects/{id} — resolve a hand-typed Procore id.
+  if (projectId && !request.url.includes('/config')) {
+    if (!Number.isFinite(projectId) || projectId <= 0) {
+      return errorResponse(400, 'That is not a valid Procore project id.');
+    }
+    try {
+      const project = await getProject(projectId);
+      if (!project) {
+        return errorResponse(
+          404,
+          `Procore has no project ${projectId} visible to this account. Check the id in Procore's ` +
+            'URL — it is the number right after app.procore.com.',
+        );
+      }
+      return json({
+        source: 'procore',
+        project: {
+          id: project.id,
+          name: project.name,
+          number: project.project_number ?? null,
+          stage: stageName(project),
+          active: project.active !== false,
+        },
+      });
+    } catch (err) {
+      const status = err instanceof ProcoreError ? err.status : 0;
+      context.error(`project lookup ${projectId} failed: ${String(err)}`);
+      return errorResponse(
+        status === 403 ? 403 : 502,
+        status === 403
+          ? `The service account cannot see project ${projectId}. It may need adding to that project in Procore.`
+          : `Could not look up project ${projectId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   try {
     if (projectId) {
       const key = `config:${projectId}`;
@@ -139,6 +176,13 @@ app.http('projects', {
   methods: ['GET'],
   authLevel: 'anonymous', // the SWA route config requires an authenticated user
   route: 'projects',
+  handler: guarded('projects', projectsHandler),
+});
+
+app.http('projectLookup', {
+  methods: ['GET'],
+  authLevel: 'anonymous',
+  route: 'projects/{id}',
   handler: guarded('projects', projectsHandler),
 });
 

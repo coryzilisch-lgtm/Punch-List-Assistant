@@ -560,3 +560,37 @@ input.namecombo:placeholder-shown { background: #fff; }
 
 .name-popup .combo-empty { color: var(--buf-muted); cursor: default; }
 .name-popup .combo-empty:hover { background: transparent; color: var(--buf-muted); }
+
+/* ── "Enter the project ID" escape hatch ────────────────────────────────── */
+
+details.byid {
+  margin-top: 14px;
+  border-top: 1px solid var(--buf-border);
+  padding-top: 12px;
+}
+
+details.byid summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--buf-navy);
+  list-style: none;
+}
+details.byid summary::-webkit-details-marker { display: none; }
+details.byid summary::before {
+  content: '▸';
+  display: inline-block;
+  margin-right: 6px;
+  color: var(--buf-orange);
+}
+details.byid[open] summary::before { content: '▾'; }
+details.byid summary:hover { color: var(--buf-orange); }
+
+details.byid .hint { margin: 10px 0 12px; }
+details.byid code {
+  background: var(--buf-card-bg);
+  border: 1px solid var(--buf-border);
+  border-radius: var(--radius-sm);
+  padding: 1px 5px;
+  font-size: 12px;
+}

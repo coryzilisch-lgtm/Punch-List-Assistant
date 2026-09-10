@@ -296,6 +296,62 @@ function clearProject() {
   $('project-search').focus();
 }
 
+/**
+ * Resolve a hand-typed Procore project id, then make the user confirm it.
+ *
+ * The confirmation step is the whole point. An id is four to seven digits with
+ * no redundancy — one wrong keystroke is another real project, and punch items
+ * pushed into the wrong job are not noticed until a subcontractor is dispatched
+ * to a building nobody meant. Showing the name Procore returns turns a silent
+ * mistake into an obvious one.
+ */
+async function lookupProjectById() {
+  const raw = $('project-id').value.trim().replace(/[^0-9]/g, '');
+  const out = $('project-id-result');
+
+  if (!raw) {
+    out.innerHTML = note('warn', 'Enter the project ID first.');
+    return;
+  }
+
+  out.innerHTML = '<div class="muted">Looking it up in Procore…</div>';
+  try {
+    const { project } = await api(`/api/projects/${raw}`);
+    out.innerHTML = `
+      <div class="note ok" style="margin-bottom:0">
+        <div style="font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--buf-muted)">
+          Procore project ${esc(project.id)}
+        </div>
+        <div style="font-size:17px;font-weight:700;margin:4px 0">${esc(project.name)}</div>
+        <div class="muted">
+          ${project.number ? `#${esc(project.number)} · ` : ''}${esc(project.stage || 'No stage')}
+          ${project.active ? '' : ' · <strong>Inactive in Procore</strong>'}
+        </div>
+        <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn-primary btn-sm" id="project-id-confirm">Yes — use this project</button>
+          <button class="btn-ghost btn-sm" id="project-id-cancel">No, that's not it</button>
+        </div>
+      </div>`;
+
+    $('project-id-confirm').addEventListener('click', () => {
+      // Fold it into the list so the combobox can find it again this session.
+      if (!S.projects.some((p) => p.id === project.id)) S.projects.push(project);
+      $('project-search').value = project.name;
+      $('project-clear').hidden = false;
+      out.innerHTML = '';
+      $('project-id').value = '';
+      selectProject(project.id);
+    });
+    $('project-id-cancel').addEventListener('click', () => {
+      out.innerHTML = '';
+      $('project-id').focus();
+      $('project-id').select();
+    });
+  } catch (err) {
+    out.innerHTML = note('error', esc(err.message));
+  }
+}
+
 async function selectProject(id) {
   S.project = S.projects.find((p) => p.id === Number(id)) || null;
   S.config = null;
@@ -1343,6 +1399,10 @@ function wire() {
     if (li) { e.preventDefault(); chooseProject(li.dataset.id); }
   });
   $('project-clear').addEventListener('click', clearProject);
+  $('project-id-go').addEventListener('click', lookupProjectById);
+  $('project-id').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); lookupProjectById(); }
+  });
   document.addEventListener('mousedown', (e) => {
     if (!e.target.closest('.combo')) openCombo(false);
   });

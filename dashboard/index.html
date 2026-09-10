@@ -50,6 +50,26 @@
           <ul id="project-list" role="listbox" hidden></ul>
         </div>
         <div class="muted" id="project-chosen" style="margin-top:8px"></div>
+
+        <details class="byid">
+          <summary>Can't find it? Enter the Procore project ID</summary>
+          <p class="hint">
+            The list comes from a nightly sync and shows active jobs, so a project created today —
+            or one that is closed out — may not appear. The ID is the number in Procore's own URL:
+            <code>app.procore.com/<strong>123456</strong>/project/home</code>.
+          </p>
+          <div class="row">
+            <div>
+              <label class="fl" for="project-id">Procore project ID</label>
+              <input type="text" id="project-id" inputmode="numeric" placeholder="e.g. 123456"
+                     autocomplete="off" />
+            </div>
+            <div class="fixed">
+              <button class="btn-secondary" id="project-id-go">Look up</button>
+            </div>
+          </div>
+          <div id="project-id-result"></div>
+        </details>
       </div>
       <div id="project-error"></div>
     </div>
