@@ -278,7 +278,25 @@ The workflow deploys on push to `main`, so merge the pull request:
 Watch the run under the repo's **Actions** tab. First deploy takes 2–4 minutes
 because Oryx installs and builds the API.
 
-Then open `https://<swa-host>` and sign in with your Buffalo account.
+The run prints the site URL on success — use that one, not a host you noted
+earlier:
+
+```
+Visit your site at: https://<name>.azurestaticapps.net
+```
+
+Open it, sign in with your Buffalo account, then check `/api/health`. A healthy
+deployment answers:
+
+```json
+{"status":"ok","procoreConfigured":true,"extractionConfigured":true,
+ "aiProvider":"anthropic","aiModel":"claude-opus-5"}
+```
+
+Both `*Configured` flags `true` is the fastest proof that all six app settings
+are readable by the Functions. If either is `false`, the settings were probably
+saved against a preview environment rather than **Production** — the
+Environment variables blade has an environment selector at the top.
 
 ---
 
@@ -313,6 +331,8 @@ Then open `https://<swa-host>` and sign in with your Buffalo account.
 | Sign-in loops, or `AADSTS700054` | The Secret **ID** was pasted instead of the secret **Value** (step 3.2) |
 | Sign-in fails with no useful error | **ID tokens** not ticked (step 3.1), or the app is on the Free plan (step 2) |
 | Deploy fails "No matching Static Web App" | The secret is missing, named something other than `AZURE_STATIC_WEB_APPS_API_TOKEN`, or still holds a token from a Static Web App that was deleted and recreated |
+| Deploy fails "Could not determine the Static Web App from the GitHub OIDC workflow reference" | The workflow is using OIDC, which identifies the app by matching the **workflow filename** to the one Azure generated. This repo deploys with the token instead, precisely so the filename does not matter — do not re-add `github_id_token` or the `id-token` permission |
+| `/api/health` returns 404 | Almost always the wrong host, or no deploy has succeeded yet. The site URL is printed at the end of a successful run: `Visit your site at: https://<name>.azurestaticapps.net`. Note an unauthenticated `/api/*` request 302s to login rather than 404ing, so a cold 404 means nothing is deployed at that host |
 | Two deploys run per push | Azure wrote its own workflow file. Delete it; keep `azure-static-web-apps.yml` |
 | Projects list is empty | Procore credentials wrong or missing — check the Connection check card |
 | Every page fails to read | `ANTHROPIC_API_KEY` missing or wrong; `/api/health` reports whether it is configured |
