@@ -1,5 +1,5 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
-import { errorResponse, json, readJson, userEmail } from '../lib/http';
+import { errorResponse, guarded, json, readJson, userEmail } from '../lib/http';
 import {
   buildPunchItemPayload,
   createPunchItem,
@@ -247,5 +247,5 @@ app.http('push', {
   methods: ['POST'],
   authLevel: 'anonymous', // the SWA route config requires an authenticated user
   route: 'push',
-  handler: pushHandler,
+  handler: guarded('push', pushHandler),
 });

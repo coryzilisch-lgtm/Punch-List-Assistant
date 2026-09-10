@@ -1,4 +1,4 @@
-import type { HttpRequest, HttpResponseInit } from '@azure/functions';
+import type { HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
 
 /**
  * Shared HTTP helpers. Every response is JSON and no-store: this app is a
@@ -56,4 +56,28 @@ export async function readJson<T>(request: HttpRequest): Promise<T> {
   } catch {
     throw new Error('Request body was not valid JSON');
   }
+}
+
+/**
+ * Wrap a handler so an unexpected throw becomes a described error, not a bare 500.
+ *
+ * A 500 from the Functions host carries no body the app can show, so it reaches
+ * the user as "something failed" and reaches the developer as nothing at all.
+ * Every handler here already catches the failures it anticipates; this catches
+ * the ones it does not, which are exactly the ones worth seeing.
+ */
+export function guarded(
+  name: string,
+  handler: (request: HttpRequest, context: InvocationContext) => Promise<HttpResponseInit>,
+) {
+  return async (request: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> => {
+    try {
+      return await handler(request, context);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const stack = err instanceof Error ? err.stack : undefined;
+      context.error(`${name} threw: ${message}\n${stack ?? ''}`);
+      return errorResponse(500, `${name} failed unexpectedly: ${message}`, { handler: name });
+    }
+  };
 }

@@ -1,5 +1,5 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
-import { errorResponse, json, readJson, userEmail } from '../lib/http';
+import { errorResponse, guarded, json, readJson, userEmail } from '../lib/http';
 import { extractPage, extractionConfigured, extractionModel, PhotoRegion } from '../lib/extract';
 
 /**
@@ -101,5 +101,5 @@ app.http('extract', {
   methods: ['POST'],
   authLevel: 'anonymous', // the SWA route config requires an authenticated user
   route: 'extract',
-  handler: extractHandler,
+  handler: guarded('extract', extractHandler),
 });

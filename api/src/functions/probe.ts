@@ -1,5 +1,5 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
-import { errorResponse, json } from '../lib/http';
+import { errorResponse, guarded, json } from '../lib/http';
 import {
   companyId,
   getProjectPunchConfig,
@@ -149,5 +149,5 @@ app.http('probe', {
   methods: ['GET'],
   authLevel: 'anonymous', // the SWA route config requires an authenticated user
   route: 'probe',
-  handler: probeHandler,
+  handler: guarded('probe', probeHandler),
 });
