@@ -70,6 +70,8 @@ interface PushResult {
    */
   observed?: {
     status: string | null;
+    workflowLabel: string | null;
+    isDraft: boolean | null;
     attachmentCount: number;
     ballInCourt: string[];
     assignees: string[];
@@ -171,7 +173,7 @@ export async function pushHandler(
       const created = await createPunchItem(body.projectId, input, photos, {
         send: Boolean(body.send),
       });
-      const { item, photoErrors, photosAttached, assignErrors, assignStrategy, sendErrors, observed } =
+      const { item, photoErrors, photosAttached, assignErrors, assignStrategy, sendErrors, sendStrategy, observed } =
         created;
       results.push({
         clientId: raw.clientId,
@@ -189,6 +191,7 @@ export async function pushHandler(
       context.log(
         `push ok project=${body.projectId} punch_item=${item.id} by=${actor} ` +
           `photos=${photosAttached}/${photos.length} status=${observed?.status ?? '?'} ` +
+          `draft=${observed?.isDraft ?? '?'} send=${sendStrategy ?? 'none'} ` +
           `assign=${assignStrategy ?? 'none'} bic=${observed?.ballInCourt.join('|') ?? '?'}`,
       );
     } catch (err) {

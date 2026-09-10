@@ -519,11 +519,68 @@ export interface CreatedPunchItem {
  * it", which is the only claim worth making.
  */
 export interface ObservedPunchItem {
+  /** Procore's `status` field — which is open/closed, NOT the workflow state. */
   status: string | null;
+  /** The workflow state Procore's UI shows as Draft / Initiated, when findable. */
+  workflowLabel: string | null;
+  /** true / false when the workflow state was readable, null when it was not. */
+  isDraft: boolean | null;
   attachmentCount: number;
   ballInCourt: string[];
   assignees: string[];
   punchItemManager: string | null;
+}
+
+/**
+ * Work out whether Procore considers this item a Draft.
+ *
+ * This is separated out and deliberately cautious because the first version of
+ * the send step got it wrong in a way that failed silently. It gated on
+ * `status === 'draft'`, and Procore's `status` field turned out to be the
+ * open/closed status: an item the UI plainly labels **Draft** reads back as
+ * `status: "open"`. The gate was therefore never true, the send never ran, and
+ * the app reported no error — the super ticked "send to the punch item manager",
+ * nothing happened, and nothing said so.
+ *
+ * The workflow field's real name is not known from here (Procore's API reference
+ * is unreachable behind this environment's egress proxy), so this checks the
+ * plausible names and, crucially, returns **null** rather than false when none of
+ * them resolve. Unknown must not be read as "already sent" — that is precisely
+ * the failure above. `/api/inspect` exists to replace this guesswork with the
+ * field name the tenant actually uses.
+ */
+const DRAFT_BOOLEAN_KEYS = ['draft', 'is_draft'];
+const DRAFT_LABEL_KEYS = ['workflow_status', 'punch_item_status', 'item_status', 'stage'];
+const NON_DRAFT_LABELS = new Set([
+  'initiated',
+  'ready_for_review',
+  'work_required',
+  'work_not_accepted',
+  'in_dispute',
+  'ready_to_close',
+  'approved',
+  'closed',
+]);
+
+function draftState(row: Record<string, unknown>): { isDraft: boolean | null; label: string | null } {
+  for (const key of DRAFT_BOOLEAN_KEYS) {
+    if (typeof row[key] === 'boolean') {
+      return { isDraft: row[key] as boolean, label: row[key] ? 'draft' : null };
+    }
+  }
+  for (const key of DRAFT_LABEL_KEYS) {
+    const value = row[key];
+    if (typeof value !== 'string') continue;
+    const label = value.toLowerCase().replace(/\s+/g, '_');
+    if (label === 'draft') return { isDraft: true, label: value };
+    if (NON_DRAFT_LABELS.has(label)) return { isDraft: false, label: value };
+  }
+  // `status` is only ever evidence of a draft here, never evidence against one:
+  // it reads "open" on an item the UI calls Draft.
+  if (typeof row.status === 'string' && row.status.toLowerCase() === 'draft') {
+    return { isDraft: true, label: 'draft' };
+  }
+  return { isDraft: null, label: null };
 }
 
 function nameOf(v: unknown): string | null {
@@ -556,8 +613,11 @@ export async function observePunchItem(
       { query: { project_id: projectId } },
     );
     const attachments = row.attachments ?? row.images ?? [];
+    const draft = draftState(row);
     return {
       status: typeof row.status === 'string' ? row.status : null,
+      workflowLabel: draft.label,
+      isDraft: draft.isDraft,
       attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
       ballInCourt: namesOf(row.ball_in_court ?? row.ball_in_courts),
       assignees: namesOf(row.assignments ?? row.assignees),
@@ -641,18 +701,46 @@ async function createWithPhotos(
  * assignees. Sending sixty items silently would put sixty emails in front of
  * people who never agreed to receive them.
  */
-const SEND_STRATEGIES: Array<{ label: string; send: (p: number, id: number) => Promise<void> }> = [
+interface WriteStrategy<A extends unknown[]> {
+  label: string;
+  run: (projectId: number, punchItemId: number, ...args: A) => Promise<void>;
+}
+
+/**
+ * A signature of everything a workflow change is expected to move.
+ *
+ * Verification cannot rely on one field, because the field that carries the
+ * workflow state has not been identified yet. Comparing a snapshot before and
+ * after means "something Procore shows the super actually changed" counts as
+ * evidence even when the specific field name is still unknown — and, just as
+ * importantly, "nothing changed" is reported as a failure instead of being
+ * announced as a success, which is how the first three write bugs got shipped.
+ */
+function workflowSignature(o: ObservedPunchItem | null): string {
+  if (!o) return '';
+  return JSON.stringify([o.status, o.workflowLabel, o.isDraft, o.ballInCourt, o.assignees]);
+}
+
+const SEND_STRATEGIES: Array<WriteStrategy<[]>> = [
   {
-    label: 'PATCH status=initiated',
-    send: (projectId, id) =>
+    label: 'PATCH draft=false',
+    run: (projectId, id) =>
       procoreRequest('PATCH', `/rest/v1.1/punch_items/${id}`, {
         query: { project_id: projectId },
-        body: { project_id: projectId, punch_item: { status: 'initiated' } },
+        body: { project_id: projectId, punch_item: { draft: false } },
+      }).then(() => undefined),
+  },
+  {
+    label: 'PATCH workflow_status=initiated',
+    run: (projectId, id) =>
+      procoreRequest('PATCH', `/rest/v1.1/punch_items/${id}`, {
+        query: { project_id: projectId },
+        body: { project_id: projectId, punch_item: { workflow_status: 'initiated' } },
       }).then(() => undefined),
   },
   {
     label: 'POST send',
-    send: (projectId, id) =>
+    run: (projectId, id) =>
       procoreRequest('POST', `/rest/v1.1/punch_items/${id}/send`, {
         query: { project_id: projectId },
         body: { project_id: projectId },
@@ -660,30 +748,78 @@ const SEND_STRATEGIES: Array<{ label: string; send: (p: number, id: number) => P
   },
 ];
 
+/**
+ * Remember what worked, and what could not be made to work.
+ *
+ * A push is up to ten items, and a punch list is sixty. Re-running a chain of
+ * guesses per item would multiply both the wall clock (the Function is killed at
+ * 45 seconds) and the Procore rate-limit budget by the length of the chain, for
+ * an answer that cannot change between two items a second apart. So the first
+ * item in a process pays for the discovery and every later one takes the short
+ * path — including the unhappy short path, where the whole chain has already
+ * been shown not to work and re-proving it just burns the quota.
+ */
+const memo: {
+  send: string | null;
+  sendFailure: string[] | null;
+  assign: string | null;
+  assignFailure: string[] | null;
+} = { send: null, sendFailure: null, assign: null, assignFailure: null };
+
+function ordered<A extends unknown[]>(list: Array<WriteStrategy<A>>, known: string | null) {
+  if (!known) return list;
+  const hit = list.find((s) => s.label === known);
+  return hit ? [hit, ...list.filter((s) => s !== hit)] : list;
+}
+
+function describeError(err: unknown): string {
+  return err instanceof ProcoreError
+    ? `${err.status} ${err.fieldErrors().join('; ') || summarize(err.body)}`
+    : String(err);
+}
+
+/**
+ * Move a Draft item out of the creator's court.
+ *
+ * Procore's rule: an item is Draft until it is sent to its Punch Item Manager,
+ * and a Draft item sits in its CREATOR's court. Everything this app creates is
+ * therefore Draft — the API service account creates it, a real person is the
+ * manager — which is why every imported item showed ball-in-court on
+ * "ABS abs-api-export". That is the workflow behaving correctly, not a bad
+ * payload; the item simply had not been sent.
+ *
+ * Sending is opt-in per push because it is what emails the manager and the
+ * assignees. Sending sixty items silently would put sixty notifications in front
+ * of people who never agreed to receive them.
+ */
 export async function sendPunchItem(
   projectId: number,
   punchItemId: number,
-): Promise<{ sent: boolean; strategy: string | null; errors: string[] }> {
+  before: ObservedPunchItem | null,
+): Promise<{ sent: boolean; strategy: string | null; errors: string[]; observed: ObservedPunchItem | null }> {
+  if (memo.sendFailure) {
+    return { sent: false, strategy: null, errors: memo.sendFailure, observed: before };
+  }
+
   const errors: string[] = [];
-  for (const strategy of SEND_STRATEGIES) {
+  const baseline = workflowSignature(before);
+
+  for (const strategy of ordered(SEND_STRATEGIES, memo.send)) {
     try {
-      await strategy.send(projectId, punchItemId);
+      await strategy.run(projectId, punchItemId);
       const after = await observePunchItem(projectId, punchItemId);
-      if (after && after.status && after.status.toLowerCase() !== 'draft') {
-        return { sent: true, strategy: strategy.label, errors };
+      if (after && (after.isDraft === false || workflowSignature(after) !== baseline)) {
+        memo.send = strategy.label;
+        return { sent: true, strategy: strategy.label, errors, observed: after };
       }
-      errors.push(`${strategy.label}: accepted but the item is still Draft`);
+      errors.push(`${strategy.label}: accepted, but nothing about the item changed`);
     } catch (err) {
-      errors.push(
-        `${strategy.label}: ${
-          err instanceof ProcoreError
-            ? `${err.status} ${err.fieldErrors().join('; ') || summarize(err.body)}`
-            : String(err)
-        }`,
-      );
+      errors.push(`${strategy.label}: ${describeError(err)}`);
     }
   }
-  return { sent: false, strategy: null, errors };
+
+  memo.sendFailure = errors;
+  return { sent: false, strategy: null, errors, observed: before };
 }
 
 /**
@@ -699,19 +835,41 @@ export async function sendPunchItem(
  * sit in nobody's court, and inventing an assignee to satisfy Procore's default
  * would put work in front of a person who never agreed to it.
  */
-const ASSIGN_STRATEGIES: Array<{
-  label: string;
-  send: (projectId: number, punchItemId: number, assigneeIds: number[], vendorId: number | null) => Promise<void>;
-}> = [
+const ASSIGN_STRATEGIES: Array<WriteStrategy<[number[], number | null]>> = [
   {
+    // Rails nested attributes. The plain `assignments` array on create was
+    // accepted and stored nothing, which is exactly what a Rails controller does
+    // with a nested collection that is not named `*_attributes`.
+    label: 'PATCH assignments_attributes',
+    run: async (projectId, punchItemId, assigneeIds, vendorId) => {
+      await procoreRequest('PATCH', `/rest/v1.1/punch_items/${punchItemId}`, {
+        query: { project_id: projectId },
+        body: {
+          project_id: projectId,
+          punch_item: {
+            assignments_attributes: assigneeIds.map((id) => ({
+              assignee_id: id,
+              ...(vendorId ? { vendor_id: vendorId } : {}),
+            })),
+          },
+        },
+      });
+    },
+  },
+  {
+    // The nested path `/punch_items/{id}/punch_item_assignments` 404s with an
+    // empty body, so it does not exist. Procore's flat-URL-with-query-param shape
+    // is the same one that turned out to be correct for project_roles, where the
+    // nested form also answered emptily.
     label: 'POST punch_item_assignments',
-    send: async (projectId, punchItemId, assigneeIds, vendorId) => {
+    run: async (projectId, punchItemId, assigneeIds, vendorId) => {
       for (const assigneeId of assigneeIds) {
-        await procoreRequest('POST', `/rest/v1.1/punch_items/${punchItemId}/punch_item_assignments`, {
+        await procoreRequest('POST', '/rest/v1.1/punch_item_assignments', {
           query: { project_id: projectId },
           body: {
             project_id: projectId,
             punch_item_assignment: {
+              punch_item_id: punchItemId,
               assignee_id: assigneeId,
               ...(vendorId ? { vendor_id: vendorId } : {}),
             },
@@ -722,7 +880,7 @@ const ASSIGN_STRATEGIES: Array<{
   },
   {
     label: 'PATCH assignee_ids',
-    send: async (projectId, punchItemId, assigneeIds) => {
+    run: async (projectId, punchItemId, assigneeIds) => {
       await procoreRequest('PATCH', `/rest/v1.1/punch_items/${punchItemId}`, {
         query: { project_id: projectId },
         body: { project_id: projectId, punch_item: { assignee_ids: assigneeIds } },
@@ -732,8 +890,12 @@ const ASSIGN_STRATEGIES: Array<{
 ];
 
 /**
- * Make sure the requested assignee actually holds the item, retrying through the
- * strategies above only if the create did not already achieve it.
+ * Make sure the requested assignee actually holds the item.
+ *
+ * Runs only when the create did not already achieve it, and only when an
+ * assignee was chosen. An unassigned item is meant to sit in nobody's court —
+ * inventing an assignee to satisfy a Procore default would put work in front of
+ * a person who never agreed to it.
  */
 export async function ensureAssignees(
   projectId: number,
@@ -742,31 +904,30 @@ export async function ensureAssignees(
   vendorId: number | null,
   observed: ObservedPunchItem | null,
 ): Promise<{ strategy: string | null; errors: string[]; observed: ObservedPunchItem | null }> {
-  const errors: string[] = [];
-  if (!assigneeIds.length) return { strategy: null, errors, observed };
+  if (!assigneeIds.length) return { strategy: null, errors: [], observed };
   if (observed && observed.assignees.length > 0) {
-    return { strategy: 'inline assignments on create', errors, observed };
+    return { strategy: 'inline assignments on create', errors: [], observed };
+  }
+  if (memo.assignFailure) {
+    return { strategy: null, errors: memo.assignFailure, observed };
   }
 
-  for (const strategy of ASSIGN_STRATEGIES) {
+  const errors: string[] = [];
+  for (const strategy of ordered(ASSIGN_STRATEGIES, memo.assign)) {
     try {
-      await strategy.send(projectId, punchItemId, assigneeIds, vendorId);
+      await strategy.run(projectId, punchItemId, assigneeIds, vendorId);
       const after = await observePunchItem(projectId, punchItemId);
       if (after && after.assignees.length > 0) {
+        memo.assign = strategy.label;
         return { strategy: strategy.label, errors, observed: after };
       }
       errors.push(`${strategy.label}: accepted but no assignee was stored`);
     } catch (err) {
-      errors.push(
-        `${strategy.label}: ${
-          err instanceof ProcoreError
-            ? `${err.status} ${err.fieldErrors().join('; ') || summarize(err.body)}`
-            : String(err)
-        }`,
-      );
+      errors.push(`${strategy.label}: ${describeError(err)}`);
     }
   }
 
+  memo.assignFailure = errors;
   return { strategy: null, errors, observed };
 }
 
@@ -777,17 +938,18 @@ export interface CreatePunchItemResult {
   assignErrors: string[];
   assignStrategy: string | null;
   sendErrors: string[];
+  sendStrategy: string | null;
   observed: ObservedPunchItem | null;
 }
 
 /**
- * Create one punch item, then attach its photos and report what Procore stored.
+ * Create one punch item, then report what Procore actually stored.
  *
- * Attachments go in a SECOND request on purpose. Procore accepts images on
- * create, but then a photo it rejects (size, type) fails the whole item and the
- * superintendent loses the row. Creating first means a photo failure degrades to
- * "item created, photo missing" — recoverable in the field — and it is reported
- * per item rather than silently swallowed.
+ * Nothing here trusts a 2xx. Three separate writes have been answered 200 by
+ * Procore and stored nothing — attachments twice, assignees once — so the item is
+ * read back and the report is built from the read, not from the response. A
+ * photo that does not arrive degrades to "item created, photo missing", which is
+ * recoverable in the field, rather than losing the row.
  */
 export async function createPunchItem(
   projectId: number,
@@ -846,11 +1008,17 @@ export async function createPunchItem(
     observed = assigned.observed ?? observed;
   }
 
+  // Attempt the send whenever it was asked for and the item is not already known
+  // to have left Draft. `isDraft === null` means the workflow field could not be
+  // identified, and unknown must fall through to trying — reading unknown as
+  // "already sent" is exactly the bug that made the send silently do nothing.
   let sendErrors: string[] = [];
-  if (options.send && created?.id && observed?.status?.toLowerCase() === 'draft') {
-    const sent = await sendPunchItem(projectId, created.id);
+  let sendStrategy: string | null = null;
+  if (options.send && created?.id && observed?.isDraft !== false) {
+    const sent = await sendPunchItem(projectId, created.id, observed);
     sendErrors = sent.sent ? [] : sent.errors;
-    observed = (await observePunchItem(projectId, created.id)) ?? observed;
+    sendStrategy = sent.strategy;
+    observed = sent.observed ?? observed;
   }
 
   return {
@@ -860,6 +1028,7 @@ export async function createPunchItem(
     assignErrors,
     assignStrategy,
     sendErrors,
+    sendStrategy,
     observed,
   };
 }

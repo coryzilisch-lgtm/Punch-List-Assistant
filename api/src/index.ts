@@ -6,6 +6,7 @@
 import './functions/health';
 import './functions/me';
 import './functions/projects';
+import './functions/inspect';
 import './functions/probe';
 import './functions/extract';
 import './functions/push';

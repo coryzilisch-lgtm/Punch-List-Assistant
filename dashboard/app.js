@@ -1327,13 +1327,19 @@ function renderResults() {
           );
         }
 
+        // Procore's `status` field is open/closed, NOT the Draft/Initiated
+        // workflow state — an item the UI plainly labels Draft reads back as
+        // "open". Report the workflow state when it could be read, and say so
+        // plainly when it could not, rather than dressing "open" up as sent.
         const status = r.observed?.status || '';
-        if (status) {
-          bits.push(
-            status.toLowerCase() === 'draft'
-              ? '<span class="badge flat">Draft — not yet sent</span>'
-              : `<span class="badge ok">${esc(status)}</span>`,
-          );
+        const isDraft = r.observed?.isDraft ?? null;
+        const workflow = r.observed?.workflowLabel || '';
+        if (isDraft === true) {
+          bits.push('<span class="badge flat">Draft — not yet sent</span>');
+        } else if (isDraft === false) {
+          bits.push(`<span class="badge ok">${esc(workflow || status || 'Sent')}</span>`);
+        } else if (status) {
+          bits.push(`<span class="badge flat">${esc(status)}</span>`);
         }
         if (r.sendErrors?.length) {
           bits.push(`<span class="badge err">Send failed</span><span class="muted">${esc(
@@ -1350,8 +1356,10 @@ function renderResults() {
         }
         // A Draft item sitting with its creator is Procore's own workflow, not a
         // defect — say so rather than letting it read as a bug.
-        if (bic.length === 1 && /abs-api-export/i.test(bic[0]) && status.toLowerCase() === 'draft') {
-          bits.push('<span class="muted">Draft items sit with their creator until sent.</span>');
+        if (bic.length === 1 && /abs-api-export/i.test(bic[0]) && isDraft !== false) {
+          bits.push(
+            '<span class="muted">Draft items sit with their creator until they are sent to the punch item manager.</span>',
+          );
         }
         if (r.assignErrors?.length) {
           bits.push(`<span class="muted">${esc(r.assignErrors.join('; '))}</span>`);

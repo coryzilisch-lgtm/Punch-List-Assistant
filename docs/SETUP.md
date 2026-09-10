@@ -377,3 +377,47 @@ in the Foundry resource and swap three settings — `ANTHROPIC_FOUNDRY_RESOURCE`
 remove `ANTHROPIC_API_KEY`. No code change and no redeploy beyond saving the
 settings. Full steps are in the main README under **Deploy Claude in Azure AI
 Foundry**.
+
+## Reading Procore's real field shapes (`/api/inspect`)
+
+Procore's API reference is unreachable from the environment this app was built
+in — the egress proxy answers `CONNECT developers.procore.com` with a 403 — so
+the punch-item **write** contract has been inferred from search-result snippets.
+That inference has been wrong three times, each time in the same expensive way:
+Procore answered `200`, stored nothing, and the app reported success.
+
+`GET /api/inspect` replaces the guessing. It is strictly read-only.
+
+```
+/api/inspect?project_id=123                  # survey the project's punch items
+/api/inspect?project_id=123&punch_item_id=274 # dump one item verbatim
+```
+
+The survey reports:
+
+- `enums` — every scalar field with a small number of repeated values, and how
+  often each appears. **This is how you find the field that means "Draft"**
+  without knowing its name: a workflow flag shows up as a handful of values
+  across hundreds of rows, while a title or a timestamp does not.
+- `collections` — every array-valued field that is non-empty somewhere, with one
+  example element. This is how the attachment and assignee shapes get pinned
+  down: find a row created through Procore's own UI that has a photo on it.
+- `objects` — object-valued fields (`ball_in_court`, `punch_item_manager`) and
+  their keys.
+- `raw` — the full JSON of up to three illustrative items, fetched individually
+  because the list view is slimmer than the show view.
+
+The fastest way to settle both open questions: in Procore's UI, add a photo and
+an assignee to any punch item on a test project, then call the survey and read
+`collections` — the key names it reports are the ones the write payload has to
+use.
+
+### Why `status` is not the workflow state
+
+`status` is **open / closed**. An item Procore's UI labels `Draft` reads back as
+`status: "open"`. The first version of the send step gated on
+`status === 'draft'`, so it never ran, and because nothing errored the app
+reported nothing — a super ticked "send to the punch item manager" and silently
+got no send at all. Draft detection now checks the plausible workflow fields and
+returns **unknown** rather than `false` when none resolve, so unknown falls
+through to attempting the send instead of being read as "already sent".
