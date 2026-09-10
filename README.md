@@ -103,7 +103,11 @@ document name in its `reference` field.
 | `PUNCH_AI_PROVIDER` | no | Force `foundry` or `anthropic`. Only needed to override the automatic choice. |
 
 The same Procore credentials the Safety Dashboard uses live in Key Vault as
-`procore-client-id` / `procore-client-secret` / `procore-company-id`.
+`procore-client-id` / `procore-client-secret` / `procore-company-id`. They are
+**copied** into app settings rather than referenced: Key Vault references work only
+for bring-your-own Function Apps, not the managed functions this app deploys. See
+[`docs/SETUP.md`](docs/SETUP.md) → *Why the values are pasted* for the rotation
+consequence and why reading Key Vault from code is worse here.
 
 ### Where Claude runs
 

@@ -192,7 +192,63 @@ That is the whole list. `PUNCH_EXTRACT_MODEL` is not needed — the direct API p
 defaults to `claude-opus-5`.
 
 Key Vault values are in `kv-dataplatform-bci.vault.azure.net`, the same secrets
-the Safety Dashboard notebooks use.
+the Safety Dashboard notebooks use:
+
+```bash
+az keyvault secret show --vault-name kv-dataplatform-bci \
+  --name procore-client-id --query value -o tsv
+az keyvault secret show --vault-name kv-dataplatform-bci \
+  --name procore-client-secret --query value -o tsv
+```
+
+Verify them before pasting — this separates "wrong credentials" from "wrong
+permissions" later, and should come back as the service account
+`abs-api-export-b171139a@procore.com`:
+
+```bash
+CID='<client-id>'; CSEC='<client-secret>'
+TOKEN=$(curl -sS -X POST https://login.procore.com/oauth/token \
+  -H 'Content-Type: application/json' \
+  -d "{\"grant_type\":\"client_credentials\",\"client_id\":\"$CID\",\"client_secret\":\"$CSEC\"}" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+curl -sS https://api.procore.com/rest/v1.0/me \
+  -H "Authorization: Bearer $TOKEN" -H "Procore-Company-Id: 18895"
+```
+
+### Why the values are pasted, not Key Vault references
+
+The obvious improvement is `@Microsoft.KeyVault(SecretUri=...)` instead of the
+literal secret. **It does not work here.** Key Vault references in Static Web Apps
+application settings are supported only for *bring-your-own* (linked) Function
+Apps — **not for the managed functions this app uses**, which is what
+`api_location` deploys. Microsoft documents the limitation, and it has been open
+on the Static Web Apps tracker for years:
+
+- <https://learn.microsoft.com/en-us/azure/static-web-apps/key-vault-secrets>
+- <https://github.com/Azure/static-web-apps/issues/1090>
+- <https://github.com/Azure/static-web-apps/issues/428>
+
+The next idea — read Key Vault from code with `DefaultAzureCredential` and a
+managed identity — is worse here for two independently sufficient reasons, both
+already paid for on the Herd Intranet:
+
+1. **Managed identity is unreliable inside SWA managed functions.** It is a
+   restricted sandbox; the Herd Intranet dropped `@azure/identity` for exactly
+   this and settled on key auth.
+2. **`@azure/identity` + `@azure/keyvault-secrets` add well over a thousand
+   files.** SWA caps a deployment at **~15,000 files**, and adding one SDK
+   (`openai`) is what broke every Herd Intranet deploy for hours. This API is
+   deliberately small — see the deps in `api/package.json`.
+
+**⚠️ Rotation consequence.** The Procore credentials now live in two places: Key
+Vault (for the Safety Dashboard notebooks) and this app's settings. Rotating the
+Procore secret means updating **both**, or this app starts failing auth while the
+dashboard keeps working. The Connection check on step 1 of the app reports it
+plainly when that happens.
+
+This is not much of a security downgrade: Static Web Apps settings are encrypted
+at rest and readable only by someone with Azure RBAC on the resource. What is
+lost is central rotation and Key Vault's access audit trail.
 
 ---
 
