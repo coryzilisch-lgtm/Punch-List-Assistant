@@ -28,6 +28,13 @@ const API_BASE = process.env.PROCORE_API_BASE_URL || 'https://api.procore.com';
 const TOKEN_SKEW_MS = 5 * 60 * 1000; // re-mint 5 min early
 const MAX_RETRIES = 4;
 
+/**
+ * The longest a rate-limit wait can be before it is pointless to wait at all.
+ * SWA managed Functions are killed at 45 seconds, so anything longer turns a
+ * diagnosable 429 into an undiagnosable platform kill.
+ */
+const MAX_RATE_LIMIT_WAIT_MS = 5_000;
+
 export class ProcoreError extends Error {
   readonly status: number;
   readonly body: unknown;
@@ -209,11 +216,27 @@ export async function procoreRequest<T = unknown>(
       continue;
     }
 
-    if (res.status === 429 && attempt < MAX_RETRIES) {
+    if (res.status === 429) {
       const reset = Number(res.headers.get('X-Rate-Limit-Reset') || 0);
       const waitMs = reset > 0 ? Math.max(0, reset * 1000 - Date.now()) : backoffMs(attempt);
-      await sleep(Math.min(waitMs, 60_000));
-      continue;
+
+      // Waiting out a rate limit inside a Function that is killed at 45 seconds
+      // does not produce a rate-limit error — it produces Azure's opaque
+      // "Backend call failure", which looks like the app is broken. This used
+      // to sleep up to 60s and could never have succeeded. Wait only if the
+      // window is short; otherwise say plainly what happened.
+      if (attempt < MAX_RETRIES && waitMs <= MAX_RATE_LIMIT_WAIT_MS) {
+        await sleep(waitMs);
+        continue;
+      }
+
+      const seconds = Math.ceil(waitMs / 1000);
+      throw new ProcoreError(method, url.pathname, 429, {
+        message:
+          `Procore rate limit reached; it resets in about ${seconds}s. ` +
+          'The API service account is shared with the Safety Dashboard ingest, so a large sync ' +
+          'running at the same time can exhaust the company quota.',
+      });
     }
 
     if (res.status >= 500 && attempt < MAX_RETRIES) {

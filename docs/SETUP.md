@@ -205,6 +205,31 @@ then **Save**.
 | `PROCORE_COMPANY_ID` | `18895` |
 | `ANTHROPIC_API_KEY` | The key you tested with in step 0 |
 
+**Optional but recommended — read the project list from Fabric.** Listing
+projects from the Procore API is serial, paginated, and shares a ~3,600/hour
+quota with the Safety Dashboard's ingest, inside a Function Azure kills at 45
+seconds. Pointing it at the existing Fabric mirror makes it instant and costs
+Procore nothing. Add these and the app switches over on its own; leave them out
+and it uses Procore.
+
+| Name | Value |
+|---|---|
+| `FABRIC_SQL_SERVER` | `54jvo5wifiiejghqbdvjkuwfay-rqmkwr6prz3uvivvev3rm3fgpa.database.fabric.microsoft.com` |
+| `FABRIC_SQL_DATABASE` | The database holding the project mirror (`herd-intranet` or `Safety-Dash-…`) |
+| `AZURE_CLIENT_ID` | Service principal with read access to it |
+| `AZURE_CLIENT_SECRET` | |
+| `AZURE_TENANT_ID` | `765713ef-2ac8-4410-98f0-08ea9552c506` |
+| `PUNCH_PROJECTS_TABLE` | Optional. The table is auto-detected; set this to force one. |
+
+Two things that are easy to get wrong, both learned on the sibling apps:
+
+- The server must be a Fabric **SQL Database** (`*.database.fabric.microsoft.com`).
+  The Lakehouse/Warehouse endpoint (`*.datawarehouse.fabric.microsoft.com`)
+  cannot be reached by this driver at all — no auth mode or TLS setting fixes it.
+- The service principal needs **both** workspace Contributor **and** Read-all-data
+  on the database item, granted in the Fabric portal. T-SQL `CREATE USER` was
+  locked down at GA and is not an alternative.
+
 That is the whole list. `PUNCH_EXTRACT_MODEL` is not needed — the direct API path
 defaults to `claude-opus-5`.
 

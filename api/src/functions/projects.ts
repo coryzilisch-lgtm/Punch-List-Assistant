@@ -7,6 +7,7 @@ import {
   procoreConfigured,
   ProcoreProject,
 } from '../lib/procore';
+import { fabricConfigured, fabricSyncedAt, listProjectsFromFabric } from '../lib/fabric';
 
 /**
  * GET /api/projects            — projects the super can import into.
@@ -44,6 +45,50 @@ function stageName(p: ProcoreProject): string | null {
   return typeof s === 'string' ? s : (s.name ?? null);
 }
 
+/**
+ * The project list, from the Fabric mirror when it is available.
+ *
+ * Procore is the fallback, not the default. Listing a real company's projects
+ * from the API is serial and paginated, and it shares a ~3,600/hour quota with
+ * the Safety Dashboard's ingest — inside a Function Azure kills at 45 seconds.
+ * That is what "Backend call failure" was.
+ *
+ * The mirror is a nightly snapshot, so a project created this morning will not
+ * be in it. That is the whole reason Procore is kept: if the mirror is missing
+ * or fails, the slower path still answers, and the response says which source
+ * produced the list and how fresh it is so a stale list is never mistaken for
+ * the truth.
+ */
+async function loadProjectList(context: InvocationContext) {
+  if (fabricConfigured()) {
+    try {
+      const [projects, syncedAt] = await Promise.all([listProjectsFromFabric(), fabricSyncedAt()]);
+      if (projects.length) {
+        return { source: 'fabric' as const, syncedAt, truncated: false, projects };
+      }
+      context.warn('fabric project mirror returned no rows; falling back to Procore');
+    } catch (err) {
+      context.error(`fabric project mirror failed, falling back to Procore: ${String(err)}`);
+    }
+  }
+
+  const { projects, truncated } = await listProjects();
+  return {
+    source: 'procore' as const,
+    syncedAt: null,
+    truncated,
+    projects: projects
+      .map((p) => ({
+        id: p.id,
+        name: p.name,
+        number: p.project_number ?? null,
+        stage: stageName(p),
+        active: p.active !== false,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name)),
+  };
+}
+
 export async function projectsHandler(
   request: HttpRequest,
   context: InvocationContext,
@@ -70,19 +115,7 @@ export async function projectsHandler(
     const hit = cached<unknown>('projects', PROJECTS_TTL_MS);
     if (hit) return json(hit);
 
-    const { projects, truncated } = await listProjects();
-    const payload = {
-      truncated,
-      projects: projects
-        .map((p) => ({
-          id: p.id,
-          name: p.name,
-          number: p.project_number ?? null,
-          stage: stageName(p),
-          active: p.active !== false,
-        }))
-        .sort((a, b) => a.name.localeCompare(b.name)),
-    };
+    const payload = await loadProjectList(context);
     putCache('projects', payload);
     return json(payload);
   } catch (err) {

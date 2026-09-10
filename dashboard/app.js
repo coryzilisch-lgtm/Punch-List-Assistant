@@ -160,6 +160,18 @@ async function loadProjects() {
   try {
     const data = await api('/api/projects');
     S.projects = data.projects || [];
+    // Say where the list came from. A nightly mirror is fine for picking a job,
+    // but a project created this morning will not be in it — and silently
+    // missing is indistinguishable from "not in Procore".
+    if (data.source === 'fabric') {
+      const age = data.syncedAt ? new Date(data.syncedAt) : null;
+      const stale = age && Date.now() - age.getTime() > 36 * 60 * 60 * 1000;
+      $('project-chosen').innerHTML =
+        `<span class="muted">${S.projects.length} projects from the Fabric mirror` +
+        (age ? `, synced ${age.toLocaleString()}` : '') +
+        (stale ? ' — <strong>that is over a day old</strong>' : '') +
+        '. A project created today may not be listed yet.</span>';
+    }
     if (data.truncated) {
       // Say so rather than letting a missing project read as "not in Procore".
       $('project-error').innerHTML = note(
