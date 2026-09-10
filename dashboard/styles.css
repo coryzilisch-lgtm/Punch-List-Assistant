@@ -383,3 +383,92 @@ pre.payload {
   .item { grid-template-columns: 30px 1fr; }
   .item .photos { grid-column: 1 / -1; }
 }
+
+/* ── Project combobox ───────────────────────────────────────────────────── */
+
+.combo { position: relative; }
+
+.combo input { padding-right: 34px; }
+
+.combo #project-clear {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--buf-border);
+  color: var(--buf-navy);
+  font-size: 15px;
+  line-height: 1;
+}
+
+.combo ul {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: #fff;
+  border: 1px solid var(--buf-border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 24px rgba(23, 28, 38, 0.14);
+  /* Roughly eight rows, then scroll — a taller list just hides the input. */
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.combo li {
+  padding: 9px 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1.35;
+}
+
+.combo li[aria-selected='true'],
+.combo li:hover {
+  background: var(--buf-navy);
+  color: #fff;
+}
+
+.combo li[aria-selected='true'] .combo-sub,
+.combo li:hover .combo-sub { color: #cbd5e0; }
+
+.combo li .combo-sub {
+  display: block;
+  font-size: 12px;
+  color: var(--buf-muted);
+}
+
+.combo li mark {
+  background: rgba(255, 95, 0, 0.24);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+.combo li.combo-empty {
+  color: var(--buf-muted);
+  cursor: default;
+}
+.combo li.combo-empty:hover { background: transparent; color: var(--buf-muted); }
+
+/* ── Apply-to-selected bar ──────────────────────────────────────────────── */
+
+.apply-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--buf-border);
+}
+.apply-bar .muted { flex: 1 1 220px; }

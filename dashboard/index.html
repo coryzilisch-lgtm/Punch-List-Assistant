@@ -41,16 +41,15 @@
       <p class="hint">Items are created on this project's punch list in Procore.</p>
       <div id="project-load" class="muted">Loading projects from Procore…</div>
       <div id="project-pick" style="display:none">
-        <div class="row">
-          <div>
-            <label class="fl" for="project-search">Search</label>
-            <input type="search" id="project-search" placeholder="Project name or number" autocomplete="off" />
-          </div>
-          <div>
-            <label class="fl" for="project-select">Project</label>
-            <select id="project-select"></select>
-          </div>
+        <label class="fl" for="project-search">Project</label>
+        <div class="combo">
+          <input type="text" id="project-search" role="combobox" aria-expanded="false"
+                 aria-controls="project-list" aria-autocomplete="list" autocomplete="off"
+                 placeholder="Start typing a project name or number…" />
+          <button type="button" id="project-clear" aria-label="Clear" hidden>&times;</button>
+          <ul id="project-list" role="listbox" hidden></ul>
         </div>
+        <div class="muted" id="project-chosen" style="margin-top:8px"></div>
       </div>
       <div id="project-error"></div>
     </div>

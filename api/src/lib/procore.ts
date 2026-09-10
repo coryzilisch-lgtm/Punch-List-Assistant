@@ -413,60 +413,300 @@ export interface CreatedPunchItem {
 }
 
 /**
- * Create one punch item, then attach its photos.
+ * What Procore actually stored, read back after the write.
  *
- * Attachments go in a SECOND request on purpose. Procore accepts multipart on
- * create, but then a photo that Procore rejects (size, type) fails the whole
- * item and the super loses the row entirely. Creating first means a photo
- * failure degrades to "item created, photo missing" — which is recoverable in
- * the field — and it is reported per-item rather than silently swallowed.
+ * This exists because both of this integration's first production bugs were
+ * SILENT: the attachment PATCH returned 200 and attached nothing, and the
+ * assignment was accepted and ignored, leaving ball-in-court on the API service
+ * account. Both looked like success to the app and like a mistake to the
+ * superintendent. Reading the item back turns "we sent it" into "Procore has
+ * it", which is the only claim worth making.
+ */
+export interface ObservedPunchItem {
+  attachmentCount: number;
+  ballInCourt: string[];
+  assignees: string[];
+  punchItemManager: string | null;
+}
+
+function nameOf(v: unknown): string | null {
+  if (!v) return null;
+  if (typeof v === 'string') return v;
+  const o = v as { name?: string; login?: string };
+  return o.name || o.login || null;
+}
+
+function namesOf(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  return v
+    .map((entry) => {
+      const e = entry as Record<string, unknown>;
+      // Assignment rows nest the person; plain user rows carry the name directly.
+      return nameOf(e?.assignee ?? e?.user ?? e?.vendor ?? entry);
+    })
+    .filter((n): n is string => Boolean(n));
+}
+
+/** Read one punch item back and summarize the fields we care about. */
+export async function observePunchItem(
+  projectId: number,
+  punchItemId: number,
+): Promise<ObservedPunchItem | null> {
+  try {
+    const row = await procoreRequest<Record<string, unknown>>(
+      'GET',
+      `/rest/v1.1/punch_items/${punchItemId}`,
+      { query: { project_id: projectId } },
+    );
+    const attachments = row.attachments ?? row.images ?? [];
+    return {
+      attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+      ballInCourt: namesOf(row.ball_in_court ?? row.ball_in_courts),
+      assignees: namesOf(row.assignments ?? row.assignees),
+      punchItemManager: nameOf(row.punch_item_manager),
+    };
+  } catch {
+    // Verification is a nicety; never fail a successful create over it.
+    return null;
+  }
+}
+
+/**
+ * Attachment strategies, tried in order until one demonstrably works.
+ *
+ * Procore's documented key for punch item images is `images[]` — NOT the
+ * `punch_item[attachments][]` this originally sent, which is why photos showed
+ * in the app and never appeared in Procore. The key differs per resource, and
+ * the punch item endpoint accepts it on create and update.
+ *
+ * The list exists rather than a single call because the exact accepted shape
+ * could not be verified from this environment (Procore's developer docs are
+ * unreachable behind the network egress policy), and a wrong guess here fails
+ * silently with a 200. Each attempt is verified by reading the item back, so
+ * the first real push identifies the one that works — then this can collapse to
+ * that single strategy.
+ */
+const ATTACH_STRATEGIES: Array<{
+  label: string;
+  method: string;
+  path: (id: number) => string;
+  field: string;
+}> = [
+  { label: 'v1.1 PATCH images[]', method: 'PATCH', path: (id) => `/rest/v1.1/punch_items/${id}`, field: 'images[]' },
+  { label: 'v1.0 PATCH images[]', method: 'PATCH', path: (id) => `/rest/v1.0/punch_items/${id}`, field: 'images[]' },
+  {
+    label: 'v1.1 PATCH punch_item[attachments][]',
+    method: 'PATCH',
+    path: (id) => `/rest/v1.1/punch_items/${id}`,
+    field: 'punch_item[attachments][]',
+  },
+];
+
+/**
+ * Attach photos to an existing punch item.
+ *
+ * Returns the strategy that worked, so the caller can report it and so the
+ * chain above can eventually be trimmed to one.
+ */
+export async function attachPhotos(
+  projectId: number,
+  punchItemId: number,
+  photos: PunchPhoto[],
+): Promise<{ attached: number; strategy: string | null; errors: string[] }> {
+  const errors: string[] = [];
+  if (!photos.length) return { attached: 0, strategy: null, errors };
+
+  const before = (await observePunchItem(projectId, punchItemId))?.attachmentCount ?? 0;
+
+  for (const strategy of ATTACH_STRATEGIES) {
+    try {
+      const form = new FormData();
+      form.append('project_id', String(projectId));
+      for (const photo of photos) {
+        form.append(
+          strategy.field,
+          new Blob([new Uint8Array(photo.bytes)], { type: photo.contentType }),
+          photo.filename,
+        );
+      }
+
+      await procoreRequest(strategy.method, strategy.path(punchItemId), {
+        query: { project_id: projectId },
+        form,
+      });
+
+      // A 2xx is not proof — the original bug was a 200 that attached nothing.
+      const after = (await observePunchItem(projectId, punchItemId))?.attachmentCount ?? 0;
+      if (after > before) {
+        return { attached: after - before, strategy: strategy.label, errors };
+      }
+      errors.push(`${strategy.label}: accepted but attached nothing`);
+    } catch (err) {
+      errors.push(
+        `${strategy.label}: ${
+          err instanceof ProcoreError
+            ? `${err.status} ${err.fieldErrors().join('; ') || summarize(err.body)}`
+            : String(err)
+        }`,
+      );
+    }
+  }
+
+  return { attached: 0, strategy: null, errors };
+}
+
+/**
+ * Assignment strategies, tried in order until the read-back shows an assignee.
+ *
+ * The first production push landed every item with ball-in-court on the API
+ * service account rather than on the assigned person. Procore accepted the
+ * inline `assignments` array on create and stored nothing from it, then defaulted
+ * the court to the creating user. As with attachments, the accepted shape could
+ * not be confirmed from here (developer docs are unreachable behind the network
+ * egress policy), so the chain runs only when the inline attempt demonstrably
+ * failed, and reports which one worked.
+ *
+ * Nothing here runs when no assignee was chosen — an unassigned item is meant to
+ * sit in nobody's court, and inventing one to satisfy Procore's default would put
+ * work in front of a person who never agreed to it.
+ */
+const ASSIGN_STRATEGIES: Array<{
+  label: string;
+  send: (projectId: number, punchItemId: number, assigneeIds: number[], vendorId: number | null) => Promise<void>;
+}> = [
+  {
+    label: 'POST punch_item_assignments',
+    send: async (projectId, punchItemId, assigneeIds, vendorId) => {
+      for (const assigneeId of assigneeIds) {
+        await procoreRequest('POST', `/rest/v1.1/punch_items/${punchItemId}/punch_item_assignments`, {
+          query: { project_id: projectId },
+          body: {
+            project_id: projectId,
+            punch_item_assignment: {
+              assignee_id: assigneeId,
+              ...(vendorId ? { vendor_id: vendorId } : {}),
+            },
+          },
+        });
+      }
+    },
+  },
+  {
+    label: 'PATCH assignee_ids',
+    send: async (projectId, punchItemId, assigneeIds) => {
+      await procoreRequest('PATCH', `/rest/v1.1/punch_items/${punchItemId}`, {
+        query: { project_id: projectId },
+        body: { project_id: projectId, punch_item: { assignee_ids: assigneeIds } },
+      });
+    },
+  },
+];
+
+/**
+ * Make sure the requested assignee actually holds the item, retrying through
+ * the strategies above only if the create did not already achieve it.
+ */
+export async function ensureAssignees(
+  projectId: number,
+  punchItemId: number,
+  assigneeIds: number[],
+  vendorId: number | null,
+  observed: ObservedPunchItem | null,
+): Promise<{ strategy: string | null; errors: string[]; observed: ObservedPunchItem | null }> {
+  const errors: string[] = [];
+  if (!assigneeIds.length) return { strategy: null, errors, observed };
+  if (observed && observed.assignees.length > 0) {
+    return { strategy: 'inline assignments on create', errors, observed };
+  }
+
+  for (const strategy of ASSIGN_STRATEGIES) {
+    try {
+      await strategy.send(projectId, punchItemId, assigneeIds, vendorId);
+      const after = await observePunchItem(projectId, punchItemId);
+      if (after && after.assignees.length > 0) {
+        return { strategy: strategy.label, errors, observed: after };
+      }
+      errors.push(`${strategy.label}: accepted but no assignee was stored`);
+    } catch (err) {
+      errors.push(
+        `${strategy.label}: ${
+          err instanceof ProcoreError
+            ? `${err.status} ${err.fieldErrors().join('; ') || summarize(err.body)}`
+            : String(err)
+        }`,
+      );
+    }
+  }
+
+  return { strategy: null, errors, observed };
+}
+
+export interface CreatePunchItemResult {
+  item: CreatedPunchItem;
+  photoErrors: string[];
+  photosAttached: number;
+  attachStrategy: string | null;
+  assignErrors: string[];
+  assignStrategy: string | null;
+  observed: ObservedPunchItem | null;
+}
+
+/**
+ * Create one punch item, then attach its photos and report what Procore stored.
+ *
+ * Attachments go in a SECOND request on purpose. Procore accepts images on
+ * create, but then a photo it rejects (size, type) fails the whole item and the
+ * superintendent loses the row. Creating first means a photo failure degrades to
+ * "item created, photo missing" — recoverable in the field — and it is reported
+ * per item rather than silently swallowed.
  */
 export async function createPunchItem(
   projectId: number,
   input: PunchItemInput,
   photos: PunchPhoto[] = [],
-): Promise<{ item: CreatedPunchItem; photoErrors: string[] }> {
+): Promise<CreatePunchItemResult> {
   const created = await procoreRequest<CreatedPunchItem>('POST', '/rest/v1.1/punch_items', {
     query: { project_id: projectId },
     body: { project_id: projectId, punch_item: buildPunchItemPayload(input) },
   });
 
-  const photoErrors: string[] = [];
+  let photoErrors: string[] = [];
+  let photosAttached = 0;
+  let attachStrategy: string | null = null;
+
   if (photos.length && created?.id) {
-    for (const photo of photos) {
-      try {
-        await attachPhoto(projectId, created.id, photo);
-      } catch (err) {
-        photoErrors.push(
-          err instanceof ProcoreError
-            ? `${photo.filename}: ${err.status} ${err.fieldErrors().join('; ') || summarize(err.body)}`
-            : `${photo.filename}: ${String(err)}`,
-        );
-      }
-    }
+    const result = await attachPhotos(projectId, created.id, photos);
+    photosAttached = result.attached;
+    attachStrategy = result.strategy;
+    if (!result.attached) photoErrors = result.errors;
   }
 
-  return { item: created, photoErrors };
-}
+  let observed = created?.id ? await observePunchItem(projectId, created.id) : null;
 
-/** Attach one image to an existing punch item via multipart PATCH. */
-export async function attachPhoto(
-  projectId: number,
-  punchItemId: number,
-  photo: PunchPhoto,
-): Promise<void> {
-  const form = new FormData();
-  form.append('project_id', String(projectId));
-  form.append(
-    'punch_item[attachments][]',
-    new Blob([new Uint8Array(photo.bytes)], { type: photo.contentType }),
-    photo.filename,
-  );
+  let assignErrors: string[] = [];
+  let assignStrategy: string | null = null;
+  if (created?.id) {
+    const assigned = await ensureAssignees(
+      projectId,
+      created.id,
+      input.assigneeIds || [],
+      input.vendorId ?? null,
+      observed,
+    );
+    assignStrategy = assigned.strategy;
+    assignErrors = assigned.errors;
+    observed = assigned.observed ?? observed;
+  }
 
-  await procoreRequest('PATCH', `/rest/v1.1/punch_items/${punchItemId}`, {
-    query: { project_id: projectId },
-    form,
-  });
+  return {
+    item: created,
+    photoErrors,
+    photosAttached,
+    attachStrategy,
+    assignErrors,
+    assignStrategy,
+    observed,
+  };
 }
 
 /** Read punch items back — used by the probe and by duplicate detection. */

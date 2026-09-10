@@ -159,7 +159,7 @@ async function loadProjects() {
     S.projects = data.projects || [];
     $('project-load').style.display = 'none';
     $('project-pick').style.display = 'block';
-    renderProjectOptions('');
+    $('project-search').placeholder = `Start typing — ${S.projects.length} projects`;
   } catch (err) {
     $('project-load').style.display = 'none';
     $('project-error').innerHTML = note(
@@ -169,27 +169,107 @@ async function loadProjects() {
   }
 }
 
-function renderProjectOptions(filter) {
-  const q = filter.trim().toLowerCase();
-  const matches = S.projects.filter(
-    (p) =>
-      !q ||
-      p.name.toLowerCase().includes(q) ||
-      String(p.number || '').toLowerCase().includes(q) ||
-      String(p.id).includes(q),
-  );
-  const sel = $('project-select');
-  sel.innerHTML =
-    `<option value="">— Select a project (${matches.length}) —</option>` +
-    matches
-      .map(
-        (p) =>
-          `<option value="${p.id}">${esc(p.name)}${p.number ? ` · ${esc(p.number)}` : ''}${
-            p.stage ? ` · ${esc(p.stage)}` : ''
-          }</option>`,
-      )
+let comboIndex = -1;
+let comboMatches = [];
+
+/**
+ * Filter projects for the type-ahead.
+ *
+ * Every term must appear somewhere in the project's searchable text, in any
+ * order — so "durham long" finds "LongHorn Durham" and a job number typed on its
+ * own still hits. Substring, not fuzzy: a superintendent typing a real project
+ * name should never be beaten to the top by something that merely shares letters.
+ */
+function matchProjects(query) {
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (!terms.length) return S.projects.slice(0, 50);
+
+  const scored = [];
+  for (const p of S.projects) {
+    const hay = `${p.name} ${p.number || ''} ${p.id} ${p.stage || ''}`.toLowerCase();
+    if (!terms.every((t) => hay.includes(t))) continue;
+    // Rank a name that starts with the query above one that merely contains it.
+    const name = p.name.toLowerCase();
+    const rank = name.startsWith(terms[0]) ? 0 : name.includes(terms[0]) ? 1 : 2;
+    scored.push({ p, rank });
+  }
+  scored.sort((a, b) => a.rank - b.rank || a.p.name.localeCompare(b.p.name));
+  return scored.map((x) => x.p).slice(0, 50);
+}
+
+function highlight(text, query) {
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  let out = esc(text);
+  for (const t of terms) {
+    // Escape the term for regex, and match against the already-escaped string.
+    const safe = esc(t).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    out = out.replace(new RegExp(`(${safe})`, 'ig'), '<mark>$1</mark>');
+  }
+  return out;
+}
+
+function renderProjectList(query) {
+  const list = $('project-list');
+  comboMatches = matchProjects(query);
+
+  if (!comboMatches.length) {
+    list.innerHTML = `<li class="combo-empty">No project matches “${esc(query)}”</li>`;
+  } else {
+    list.innerHTML = comboMatches
+      .map((p, i) => {
+        const sub = [p.number ? `#${esc(p.number)}` : '', esc(p.stage || '')]
+          .filter(Boolean)
+          .join(' · ');
+        return `<li role="option" id="combo-opt-${i}" data-id="${p.id}" aria-selected="${
+          i === comboIndex
+        }">${highlight(p.name, query)}${sub ? `<span class="combo-sub">${sub}</span>` : ''}</li>`;
+      })
       .join('');
-  if (S.project && matches.some((m) => m.id === S.project.id)) sel.value = String(S.project.id);
+  }
+  openCombo(true);
+}
+
+function openCombo(open) {
+  const list = $('project-list');
+  list.hidden = !open;
+  $('project-search').setAttribute('aria-expanded', String(open));
+  if (!open) {
+    comboIndex = -1;
+    $('project-search').removeAttribute('aria-activedescendant');
+  }
+}
+
+function moveCombo(delta) {
+  if ($('project-list').hidden || !comboMatches.length) return;
+  comboIndex = (comboIndex + delta + comboMatches.length) % comboMatches.length;
+  const opts = $('project-list').querySelectorAll('li[role="option"]');
+  opts.forEach((el, i) => el.setAttribute('aria-selected', String(i === comboIndex)));
+  const active = opts[comboIndex];
+  if (active) {
+    active.scrollIntoView({ block: 'nearest' });
+    $('project-search').setAttribute('aria-activedescendant', active.id);
+  }
+}
+
+function chooseProject(id) {
+  const project = S.projects.find((p) => p.id === Number(id));
+  if (!project) return;
+  $('project-search').value = project.name;
+  $('project-clear').hidden = false;
+  openCombo(false);
+  selectProject(project.id);
+}
+
+function clearProject() {
+  $('project-search').value = '';
+  $('project-clear').hidden = true;
+  $('project-chosen').textContent = '';
+  S.project = null;
+  S.config = null;
+  $('readiness-card').style.display = 'none';
+  openCombo(false);
+  renderBar();
+  $('project-search').focus();
 }
 
 async function selectProject(id) {
@@ -201,6 +281,10 @@ async function selectProject(id) {
     return;
   }
 
+  $('project-chosen').innerHTML =
+    `Selected: <strong>${esc(S.project.name)}</strong>` +
+    (S.project.number ? ` · #${esc(S.project.number)}` : '') +
+    (S.project.stage ? ` · ${esc(S.project.stage)}` : '');
   $('readiness-card').style.display = 'block';
   $('readiness').innerHTML = '<div class="muted">Checking Procore access…</div>';
 
@@ -389,8 +473,12 @@ function toItem(raw, pageNumber, pagePhotos) {
     photos: (raw.photo_indexes || [])
       .map((idx) => pagePhotos.find((p) => p.index === idx)?.dataUrl)
       .filter(Boolean),
-    // Per-item Procore overrides. Empty means "use the default from step 3".
+    // Every Procore field lives on the item. Nothing is a hidden default: what
+    // the row shows is exactly what gets sent.
     punchItemTypeId: '',
+    punchItemManagerId: '',
+    finalApproverId: '',
+    priority: '',
     locationId: locationMatch ? String(locationMatch.id) : '',
     tradeId: tradeMatch ? String(tradeMatch.id) : '',
     assigneeId: '',
@@ -513,6 +601,10 @@ function renderDefaults() {
         <input type="date" id="d-due" value="${esc(d.dueDate)}" />
       </div>
     </div>
+    <div class="apply-bar">
+      <button class="btn-primary" id="apply-defaults">Apply to selected items</button>
+      <span class="muted" id="apply-hint"></span>
+    </div>
     ${
       people.length
         ? ''
@@ -537,6 +629,53 @@ function renderDefaults() {
   bind('d-type', 'punchItemTypeId');
   bind('d-priority', 'priority');
   bind('d-due', 'dueDate');
+  $('apply-defaults').addEventListener('click', applyDefaults);
+}
+
+/**
+ * Copy the bulk values onto every selected item.
+ *
+ * Deliberately an explicit action rather than a silent fallback at push time.
+ * The old behaviour filled these in invisibly, so the review screen showed blank
+ * fields while something else was sent — the reviewer was approving a row they
+ * could not actually see. Now the only values that reach Procore are the ones
+ * on screen.
+ *
+ * A blank bulk value is skipped rather than written, so pressing Apply never
+ * wipes a choice already made on an individual row.
+ */
+function applyDefaults() {
+  const d = S.defaults;
+  const targets = S.items.filter((i) => i.include);
+  if (!targets.length) {
+    $('apply-hint').textContent = 'No items are selected.';
+    return;
+  }
+
+  const fields = [
+    ['punchItemTypeId', 'punchItemTypeId'],
+    ['punchItemManagerId', 'punchItemManagerId'],
+    ['finalApproverId', 'finalApproverId'],
+    ['assigneeId', 'assigneeId'],
+    ['vendorId', 'vendorId'],
+    ['priority', 'priority'],
+    ['dueDate', 'dueDate'],
+  ];
+
+  const applied = [];
+  for (const [defKey, itemKey] of fields) {
+    const value = d[defKey];
+    if (!value) continue;
+    for (const item of targets) item[itemKey] = value;
+    applied.push(defKey);
+  }
+
+  renderItems();
+  $('apply-hint').textContent = applied.length
+    ? `Applied ${applied.length} field${applied.length === 1 ? '' : 's'} to ${targets.length} item${
+        targets.length === 1 ? '' : 's'
+      }.`
+    : 'Nothing to apply — set a value above first.';
 }
 
 function visibleItems() {
@@ -609,6 +748,31 @@ function renderItems() {
               <label class="fl">Due date</label>
               <input type="date" data-act="dueDate" value="${esc(item.dueDate)}" />
             </div>
+            <div>
+              <label class="fl">Priority</label>
+              <select data-act="priority">
+                <option value="">— None —</option>
+                <option value="low" ${item.priority === 'low' ? 'selected' : ''}>Low</option>
+                <option value="medium" ${item.priority === 'medium' ? 'selected' : ''}>Medium</option>
+                <option value="high" ${item.priority === 'high' ? 'selected' : ''}>High</option>
+              </select>
+            </div>
+            <div>
+              <label class="fl">Punch item manager</label>
+              <select data-act="punchItemManagerId">${optionList(
+                c.users,
+                item.punchItemManagerId,
+                '— None —',
+              )}</select>
+            </div>
+            <div>
+              <label class="fl">Final approver</label>
+              <select data-act="finalApproverId">${optionList(
+                c.users,
+                item.finalApproverId,
+                '— None —',
+              )}</select>
+            </div>
           </div>
           <div style="margin-top:9px">
             <label class="fl">Notes</label>
@@ -664,7 +828,12 @@ function wireItemDelegation() {
       renderBar();
       return;
     }
-    if (['locationId', 'tradeId', 'punchItemTypeId', 'assigneeId', 'vendorId'].includes(act)) {
+    if (
+      [
+        'locationId', 'tradeId', 'punchItemTypeId', 'assigneeId', 'vendorId',
+        'punchItemManagerId', 'finalApproverId', 'priority',
+      ].includes(act)
+    ) {
       item[act] = e.target.value;
     }
   });
@@ -718,24 +887,31 @@ function buildReference(item) {
   return bits.join(' · ').slice(0, 250) || null;
 }
 
+/**
+ * Build the Procore payload from the row and nothing else.
+ *
+ * No fallback to the bulk values on purpose — those are copied onto the rows by
+ * Apply, where the reviewer can see them. An invisible fallback here would mean
+ * the screen and the payload could disagree, which is how the first run put
+ * ball-in-court on the service account without anyone seeing why.
+ */
 function toPayload(item) {
-  const d = S.defaults;
   const num = (v) => (v ? Number(v) : null);
-  const assignee = item.assigneeId || d.assigneeId;
 
   return {
     clientId: String(item.id),
     name: item.title.trim(),
     description: buildDescription(item) || null,
-    priority: d.priority || null,
-    dueDate: item.dueDate || d.dueDate || null,
-    punchItemTypeId: num(item.punchItemTypeId || d.punchItemTypeId),
+    priority: item.priority || null,
+    dueDate: item.dueDate || null,
+    punchItemTypeId: num(item.punchItemTypeId),
     locationId: num(item.locationId),
     tradeId: num(item.tradeId),
-    punchItemManagerId: num(d.punchItemManagerId),
-    finalApproverId: num(d.finalApproverId),
-    assigneeIds: assignee ? [Number(assignee)] : [],
-    vendorId: num(item.vendorId || d.vendorId),
+    punchItemManagerId: num(item.punchItemManagerId),
+    finalApproverId: num(item.finalApproverId),
+    // No assignee means the item sits in nobody's court, which is the ask.
+    assigneeIds: item.assigneeId ? [Number(item.assigneeId)] : [],
+    vendorId: num(item.vendorId),
     reference: buildReference(item),
     photos: item.photos,
   };
@@ -758,11 +934,13 @@ function renderSendSummary() {
   if (missingTitle) {
     html += note('error', `${missingTitle} selected item(s) have no text and will be skipped.`);
   }
-  if (!S.defaults.punchItemManagerId || !S.defaults.finalApproverId) {
+  const missingRoles = selected.filter((i) => !i.punchItemManagerId || !i.finalApproverId).length;
+  if (missingRoles) {
     html += note(
       'warn',
-      '<strong>No punch item manager and/or final approver set.</strong> Most Procore configurations ' +
-        'require both. If the push comes back rejected, that is the first thing to set on the review step.',
+      `<strong>${missingRoles} item(s) have no punch item manager and/or final approver.</strong> ` +
+        'Most Procore configurations require both. Set them in the bulk card on the review step and ' +
+        'press <strong>Apply to selected items</strong>.',
     );
   }
   html += note(
@@ -869,14 +1047,38 @@ function renderResults() {
       const item = S.items.find((i) => String(i.id) === r.clientId);
       const label = esc(item?.title || r.clientId);
       if (r.ok) {
-        const photoWarn = r.photoErrors?.length
-          ? `<br><span class="badge warn">Photo</span><span class="muted">${esc(
-              r.photoErrors.join('; '),
-            )}</span>`
-          : '';
+        // Report what Procore stored, read back after the write — not what was
+        // sent. A 200 is not evidence: the first production run returned 200 for
+        // photos it silently discarded and assignments it silently ignored.
+        const bits = [];
+
+        const wanted = item?.photos.length || 0;
+        if (wanted) {
+          const got = r.photosAttached ?? 0;
+          bits.push(
+            got >= wanted
+              ? `<span class="badge ok">${got} photo${got === 1 ? '' : 's'}</span>`
+              : `<span class="badge err">${got}/${wanted} photos attached</span>` +
+                  (r.photoErrors?.length
+                    ? `<span class="muted"> ${esc(r.photoErrors.join('; '))}</span>`
+                    : ''),
+          );
+        }
+
+        const bic = r.observed?.ballInCourt || [];
+        const wantedAssignee = Boolean(item?.assigneeId);
+        if (bic.length) {
+          bits.push(`<span class="badge info">Ball in court: ${esc(bic.join(', '))}</span>`);
+        } else if (wantedAssignee) {
+          bits.push('<span class="badge err">Assignee did not stick</span>');
+        }
+        if (r.assignErrors?.length) {
+          bits.push(`<span class="muted">${esc(r.assignErrors.join('; '))}</span>`);
+        }
+
         return `<div class="result-row ok"><span class="ic">✓</span><span>${label}${
           r.punchItemNumber ? ` <span class="muted">(#${esc(r.punchItemNumber)})</span>` : ''
-        }${photoWarn}</span></div>`;
+        }${bits.length ? `<br>${bits.join(' ')}` : ''}</span></div>`;
       }
       const fields = r.fieldErrors?.length
         ? `<br><span class="muted">Procore said: ${esc(r.fieldErrors.join('; '))}</span>`
@@ -893,8 +1095,32 @@ function renderResults() {
 // ── Wiring ──────────────────────────────────────────────────────────────────
 
 function wire() {
-  $('project-search').addEventListener('input', (e) => renderProjectOptions(e.target.value));
-  $('project-select').addEventListener('change', (e) => selectProject(e.target.value));
+  const search = $('project-search');
+  search.addEventListener('input', (e) => {
+    comboIndex = -1;
+    $('project-clear').hidden = !e.target.value;
+    renderProjectList(e.target.value);
+  });
+  search.addEventListener('focus', () => renderProjectList(search.value));
+  search.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown') { e.preventDefault(); moveCombo(1); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); moveCombo(-1); }
+    else if (e.key === 'Enter') {
+      // Enter with one match selects it even without arrowing — the common case
+      // is typing enough to leave exactly one project.
+      if (comboIndex >= 0) { e.preventDefault(); chooseProject(comboMatches[comboIndex].id); }
+      else if (comboMatches.length === 1) { e.preventDefault(); chooseProject(comboMatches[0].id); }
+    } else if (e.key === 'Escape') { openCombo(false); }
+  });
+  $('project-list').addEventListener('mousedown', (e) => {
+    // mousedown, not click: blur would close the list before click landed.
+    const li = e.target.closest('li[data-id]');
+    if (li) { e.preventDefault(); chooseProject(li.dataset.id); }
+  });
+  $('project-clear').addEventListener('click', clearProject);
+  document.addEventListener('mousedown', (e) => {
+    if (!e.target.closest('.combo')) openCombo(false);
+  });
 
   wireDropzone();
   wireItemDelegation();

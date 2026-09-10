@@ -53,6 +53,19 @@ interface PushResult {
   punchItemNumber?: string | number | null;
   /** Photos that failed to attach even though the item itself was created. */
   photoErrors?: string[];
+  photosAttached?: number;
+  /** Assignment attempts that failed, when the requested assignee did not stick. */
+  assignErrors?: string[];
+  /**
+   * What Procore actually stored, read back after the write — not what we sent.
+   * Both early bugs here were silent successes, so the UI reports this instead.
+   */
+  observed?: {
+    attachmentCount: number;
+    ballInCourt: string[];
+    assignees: string[];
+    punchItemManager: string | null;
+  };
   error?: string;
   /** Field-level messages straight from Procore, when it gave any. */
   fieldErrors?: string[];
@@ -146,15 +159,26 @@ export async function pushHandler(
     }
 
     try {
-      const { item, photoErrors } = await createPunchItem(body.projectId, input, photos);
+      const created = await createPunchItem(body.projectId, input, photos);
+      const { item, photoErrors, photosAttached, assignErrors, attachStrategy, assignStrategy, observed } =
+        created;
       results.push({
         clientId: raw.clientId,
         ok: true,
         punchItemId: item.id,
         punchItemNumber: item.number ?? null,
         photoErrors: photoErrors.length ? photoErrors : undefined,
+        photosAttached,
+        assignErrors: assignErrors.length ? assignErrors : undefined,
+        observed: observed ?? undefined,
       });
-      context.log(`push ok project=${body.projectId} punch_item=${item.id} by=${actor}`);
+      // Log which strategy worked. Once the same one wins across a few real
+      // projects, the chains in procore.ts can collapse to it.
+      context.log(
+        `push ok project=${body.projectId} punch_item=${item.id} by=${actor} ` +
+          `photos=${photosAttached}/${photos.length} attach=${attachStrategy ?? 'none'} ` +
+          `assign=${assignStrategy ?? 'none'} bic=${observed?.ballInCourt.join('|') ?? '?'}`,
+      );
     } catch (err) {
       if (err instanceof ProcoreError) {
         results.push({
