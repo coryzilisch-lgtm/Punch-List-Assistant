@@ -22,12 +22,15 @@ import {
  * now, not the ones it held at 2am.
  */
 
+// The project list barely changes and is expensive to fetch, so it is cached
+// harder than the per-project config.
 const CACHE_TTL_MS = 5 * 60 * 1000;
+const PROJECTS_TTL_MS = 30 * 60 * 1000;
 const cache = new Map<string, { at: number; value: unknown }>();
 
-function cached<T>(key: string): T | null {
+function cached<T>(key: string, ttl = CACHE_TTL_MS): T | null {
   const hit = cache.get(key);
-  if (!hit || Date.now() - hit.at > CACHE_TTL_MS) return null;
+  if (!hit || Date.now() - hit.at > ttl) return null;
   return hit.value as T;
 }
 
@@ -64,11 +67,12 @@ export async function projectsHandler(
       return json(config);
     }
 
-    const hit = cached<unknown>('projects');
+    const hit = cached<unknown>('projects', PROJECTS_TTL_MS);
     if (hit) return json(hit);
 
-    const projects = await listProjects();
+    const { projects, truncated } = await listProjects();
     const payload = {
+      truncated,
       projects: projects
         .map((p) => ({
           id: p.id,

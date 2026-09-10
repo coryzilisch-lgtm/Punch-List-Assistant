@@ -235,13 +235,33 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/** Paginate a v1.x list endpoint (bare-array response). */
+/**
+ * Paginate a v1.x list endpoint (bare-array response).
+ *
+ * `budgetMs` exists because SWA managed Functions are killed at 45 seconds with
+ * no error the app can catch — the caller just sees Azure's "Backend call
+ * failure", which says nothing about what went wrong. Serial page fetches plus
+ * Procore's rate-limit backoff can reach that ceiling easily, so pagination
+ * stops early and reports truncation instead of being killed mid-loop.
+ */
 export async function procorePaginate<T = unknown>(
   path: string,
   opts: RequestOptions = {},
   perPage = 100,
+  budgetMs = 0,
 ): Promise<T[]> {
+  return (await paginateWithBudget<T>(path, opts, perPage, budgetMs)).rows;
+}
+
+export async function paginateWithBudget<T = unknown>(
+  path: string,
+  opts: RequestOptions = {},
+  perPage = 100,
+  budgetMs = 0,
+): Promise<{ rows: T[]; truncated: boolean }> {
   const out: T[] = [];
+  const started = Date.now();
+
   for (let page = 1; page <= 100; page++) {
     const body = await procoreRequest<unknown>('GET', path, {
       ...opts,
@@ -253,9 +273,12 @@ export async function procorePaginate<T = unknown>(
         ? ((body as { data: T[] }).data)
         : [];
     out.push(...rows);
-    if (rows.length < perPage) break;
+    if (rows.length < perPage) return { rows: out, truncated: false };
+    if (budgetMs && Date.now() - started > budgetMs) {
+      return { rows: out, truncated: true };
+    }
   }
-  return out;
+  return { rows: out, truncated: true };
 }
 
 // ── Reads ───────────────────────────────────────────────────────────────────
@@ -269,10 +292,30 @@ export interface ProcoreProject {
   project_stage?: { name?: string } | string | null;
 }
 
-export async function listProjects(): Promise<ProcoreProject[]> {
-  return procorePaginate<ProcoreProject>('/rest/v1.1/projects', {
-    query: { company_id: companyId() },
-  });
+/**
+ * Projects the picker can import into.
+ *
+ * Filtered to ACTIVE and fetched 300 at a time. The first version asked for
+ * every project the company has ever had, 100 per page, as serial requests —
+ * which on a real tenant runs past the 45-second Function ceiling and gets the
+ * whole invocation killed, surfacing as Azure's opaque "Backend call failure".
+ *
+ * Active is also the right answer, not just the fast one: a punch list is
+ * imported into a job that is being built. A closed-out project in the list is
+ * a wrong choice waiting to be made. `PUNCH_PROJECT_STATUS=all` widens it if a
+ * closed job ever genuinely needs an import.
+ */
+export async function listProjects(): Promise<{ projects: ProcoreProject[]; truncated: boolean }> {
+  const status = process.env.PUNCH_PROJECT_STATUS || 'Active';
+  const { rows, truncated } = await paginateWithBudget<ProcoreProject>(
+    '/rest/v1.1/projects',
+    { query: { company_id: companyId(), 'filters[by_status]': status } },
+    300,
+    // Well inside the 45s ceiling, leaving room for the token mint and the
+    // response itself.
+    25_000,
+  );
+  return { projects: rows, truncated };
 }
 
 export interface NamedRef {

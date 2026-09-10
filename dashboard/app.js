@@ -160,6 +160,15 @@ async function loadProjects() {
   try {
     const data = await api('/api/projects');
     S.projects = data.projects || [];
+    if (data.truncated) {
+      // Say so rather than letting a missing project read as "not in Procore".
+      $('project-error').innerHTML = note(
+        'warn',
+        `<strong>Showing the first ${S.projects.length} projects.</strong> Procore had more than could ` +
+          'be fetched inside the request limit. If the job you want is missing, tell me and we will page it ' +
+          'differently.',
+      );
+    }
     $('project-load').style.display = 'none';
     $('project-pick').style.display = 'block';
     $('project-search').placeholder = `Start typing — ${S.projects.length} projects`;
