@@ -101,7 +101,8 @@ preconfigured providers and sign-in will not work.
 
 **Azure writes its own workflow, and its defaults are wrong for this repo.**
 On creation Azure commits `.github/workflows/azure-static-web-apps-<name>.yml`
-to `main` and adds a matching `AZURE_STATIC_WEB_APPS_API_TOKEN_<NAME>` secret.
+to `main` and adds a matching `AZURE_STATIC_WEB_APPS_API_TOKEN_<NAME>` secret,
+where `<NAME>` is generated from the app's own name.
 Its generated build configuration defaults to:
 
 ```yaml
@@ -135,13 +136,29 @@ You need it in step 3.
 
 ### Deployment token
 
-Azure created the secret for you when it connected the repo — check
-GitHub → **Settings** → **Secrets and variables** → **Actions** for
-`AZURE_STATIC_WEB_APPS_API_TOKEN_<NAME>`, and confirm the name matches the one
-referenced in the workflow file. Nothing to copy by hand.
+The workflow in this repo reads a **resource-neutral** secret name,
+**`AZURE_STATIC_WEB_APPS_API_TOKEN`** — not the `…_<NAME>` one Azure generates.
+That is deliberate: Azure's generated name embeds the app's name, so deleting and
+recreating the Static Web App leaves both the name and the token pointing at a
+resource that no longer exists. The deploy then fails with
 
-If you ever recreate the Static Web App, the token changes: get the new one from
-**Overview** → **Manage deployment token** and update that secret.
+```
+Reason: No matching Static Web App was found or the api key was invalid.
+```
+
+which reads like a bad credential rather than a stale reference, and costs an
+afternoon. It cost one here.
+
+So after creating the app:
+
+1. Static Web App → **Overview** → **Manage deployment token** → copy.
+2. GitHub → **Settings** → **Secrets and variables** → **Actions** → new secret
+   named exactly **`AZURE_STATIC_WEB_APPS_API_TOKEN`** → paste.
+3. Delete the `AZURE_STATIC_WEB_APPS_API_TOKEN_<NAME>` secret Azure created, so
+   there is only one and nobody updates the wrong one later.
+
+Recreating the app from then on is a one-secret value change with nothing in the
+repo to touch.
 
 ---
 
@@ -295,7 +312,7 @@ Then open `https://<swa-host>` and sign in with your Buffalo account.
 |---|---|
 | Sign-in loops, or `AADSTS700054` | The Secret **ID** was pasted instead of the secret **Value** (step 3.2) |
 | Sign-in fails with no useful error | **ID tokens** not ticked (step 3.1), or the app is on the Free plan (step 2) |
-| Deploy fails "No matching Static Web App" | The GitHub secret name is not exactly `AZURE_STATIC_WEB_APPS_API_TOKEN` |
+| Deploy fails "No matching Static Web App" | The secret is missing, named something other than `AZURE_STATIC_WEB_APPS_API_TOKEN`, or still holds a token from a Static Web App that was deleted and recreated |
 | Two deploys run per push | Azure wrote its own workflow file. Delete it; keep `azure-static-web-apps.yml` |
 | Projects list is empty | Procore credentials wrong or missing — check the Connection check card |
 | Every page fails to read | `ANTHROPIC_API_KEY` missing or wrong; `/api/health` reports whether it is configured |
