@@ -526,6 +526,12 @@ export interface ObservedPunchItem {
   /** true / false when the workflow state was readable, null when it was not. */
   isDraft: boolean | null;
   attachmentCount: number;
+  /**
+   * Procore's own `has_attachments` boolean. The show payload carries both an
+   * `attachments` array and this flag; the flag is the one to trust, because a
+   * list view can summarize the array away while the flag stays accurate.
+   */
+  hasAttachments: boolean | null;
   ballInCourt: string[];
   assignees: string[];
   punchItemManager: string | null;
@@ -550,6 +556,9 @@ export interface ObservedPunchItem {
  * field name the tenant actually uses.
  */
 const DRAFT_BOOLEAN_KEYS = ['draft', 'is_draft'];
+// `workflow_status` is confirmed against the tenant: item #274 read back as
+// `status: "Closed", workflow_status: "closed"`, so the two fields track
+// different things and only the second one carries Draft / Initiated.
 const DRAFT_LABEL_KEYS = ['workflow_status', 'punch_item_status', 'item_status', 'stage'];
 const NON_DRAFT_LABELS = new Set([
   'initiated',
@@ -619,6 +628,7 @@ export async function observePunchItem(
       workflowLabel: draft.label,
       isDraft: draft.isDraft,
       attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+      hasAttachments: typeof row.has_attachments === 'boolean' ? row.has_attachments : null,
       ballInCourt: namesOf(row.ball_in_court ?? row.ball_in_courts),
       assignees: namesOf(row.assignments ?? row.assignees),
       punchItemManager: nameOf(row.punch_item_manager),

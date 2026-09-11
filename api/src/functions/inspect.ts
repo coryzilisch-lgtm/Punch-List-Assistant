@@ -1,6 +1,6 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
 import { errorResponse, guarded, json } from '../lib/http';
-import { listPunchItems, ProcoreError, procoreConfigured, procoreRequest } from '../lib/procore';
+import { companyId, listPunchItems, ProcoreError, procoreConfigured, procoreRequest } from '../lib/procore';
 
 /**
  * GET /api/inspect?project_id=123[&punch_item_id=274] — read Procore's own shapes.
@@ -116,6 +116,68 @@ function interesting(rows: Row[]): Array<{ why: string; id: unknown }> {
   return picks;
 }
 
+/**
+ * Does this tenant expose Procore's direct-upload endpoint, and in what shape?
+ *
+ * Punch item attachments have failed three times as multipart file parts, which
+ * points at Procore having moved this resource to the uploads flow: ask for an
+ * upload slot, PUT the bytes where it tells you, then reference the returned
+ * uuid on the item. That is three unknowns stacked on each other, so this probes
+ * only the first one — it asks for a slot and reports verbatim what came back.
+ *
+ * An upload slot that is never referenced by anything attaches to nothing and is
+ * visible nowhere in Procore, so this is safe to run against a live company.
+ */
+async function probeUploads(projectId: number) {
+  const descriptor = {
+    response_filename: 'punch-list-assistant-probe.jpg',
+    response_content_type: 'image/jpeg',
+  };
+  const attempts = [
+    {
+      label: 'POST /rest/v1.1/companies/{id}/uploads (segments)',
+      path: `/rest/v1.1/companies/${companyId()}/uploads`,
+      body: { ...descriptor, segments: [{ size: 4 }] },
+    },
+    {
+      label: 'POST /rest/v1.1/companies/{id}/uploads (size)',
+      path: `/rest/v1.1/companies/${companyId()}/uploads`,
+      body: { ...descriptor, size: 4 },
+    },
+    {
+      label: 'POST /rest/v1.0/companies/{id}/uploads',
+      path: `/rest/v1.0/companies/${companyId()}/uploads`,
+      body: { ...descriptor, segments: [{ size: 4 }] },
+    },
+    {
+      label: 'POST /rest/v1.1/projects/{id}/uploads',
+      path: `/rest/v1.1/projects/${projectId}/uploads`,
+      body: { ...descriptor, segments: [{ size: 4 }] },
+    },
+  ];
+
+  const out: Array<Record<string, unknown>> = [];
+  for (const attempt of attempts) {
+    try {
+      const response = await procoreRequest<unknown>('POST', attempt.path, {
+        query: { project_id: projectId },
+        body: attempt.body,
+      });
+      out.push({ ...attempt, ok: true, response });
+      // One success is all that is needed; stop before making more slots.
+      break;
+    } catch (err) {
+      out.push({
+        ...attempt,
+        ok: false,
+        status: err instanceof ProcoreError ? err.status : null,
+        error: err instanceof ProcoreError ? err.body : String(err),
+      });
+    }
+  }
+  return out;
+}
+
 export async function inspectHandler(
   request: HttpRequest,
   context: InvocationContext,
@@ -130,6 +192,10 @@ export async function inspectHandler(
   }
 
   const punchItemId = Number(request.query.get('punch_item_id') || 0);
+
+  if (request.query.get('uploads')) {
+    return json({ projectId, uploads: await probeUploads(projectId) });
+  }
 
   // Single-item mode: dump one item verbatim. Used to read back an item this app
   // created, and to compare it field-by-field against one Procore's UI created.
