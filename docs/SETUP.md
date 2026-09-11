@@ -421,3 +421,19 @@ reported nothing — a super ticked "send to the punch item manager" and silentl
 got no send at all. Draft detection now checks the plausible workflow fields and
 returns **unknown** rather than `false` when none resolve, so unknown falls
 through to attempting the send instead of being read as "already sent".
+
+### What item #275 settled
+
+A punch item created through Procore's UI, with one photo and one assignee, is
+what finally pinned the write contract down. Three things came off it:
+
+| Field | What the tenant actually returns |
+|---|---|
+| `workflow_status` | `draft` → `initiated` → … → `closed`. **This**, not `status`, is the Draft/Initiated state. `status` is `Open` / `Closed`. |
+| `attachments` | The photo. `images` is an **empty array even on an item that has a photo** — a field this product no longer fills. `web_images` mirrors `attachments`. `has_attachments` is the boolean to trust. |
+| `assignments[].login_information_id` | The assignee. **Not `assignee_id`.** The show view nests the person under `login_information` and carries no top-level name; only the slimmer list view spells out `login_information_id` / `login_information_name`. |
+
+All three earlier failures were the same failure: a parameter name Procore's
+controller does not permit is filtered out silently, so the request returns 200
+and stores nothing. Rails does not tell you that you misnamed a key. Treat any
+write here that "succeeds" without a read-back as unverified.

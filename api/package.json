@@ -8,6 +8,7 @@
     "build": "tsc",
     "start": "func start",
     "typecheck": "tsc --noEmit",
+    "pretest": "tsc",
     "test": "node --test test/*.test.mjs"
   },
   "dependencies": {

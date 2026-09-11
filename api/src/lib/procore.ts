@@ -487,13 +487,19 @@ export function buildPunchItemPayload(input: PunchItemInput): Record<string, unk
   if (input.finalApproverId) item.final_approver_id = input.finalApproverId;
   if (input.reference) item.reference = input.reference;
 
-  // Assignments carry the ball-in-court. Procore accepts a list so an item can
-  // go to several people; the UI sends one in practice.
+  // Assignments carry the ball-in-court, and the key is `login_information_id`.
+  //
+  // Not `assignee_id`, which is what this sent first and what Procore accepted
+  // and silently dropped. The real name came off an assignment Procore's own UI
+  // created: the row nests the person under `login_information` and the list
+  // view spells the scalar out as `login_information_id`. A Rails controller
+  // filters an unpermitted key without complaining, which is exactly the shape
+  // of the failure that was seen — 200, and no assignee.
   const assignees = input.assigneeIds || [];
   if (assignees.length || input.vendorId) {
     item.assignments = assignees.length
       ? assignees.map((id) => ({
-          assignee_id: id,
+          login_information_id: id,
           ...(input.vendorId ? { vendor_id: input.vendorId } : {}),
         }))
       : [{ vendor_id: input.vendorId }];
@@ -604,8 +610,12 @@ function namesOf(v: unknown): string[] {
   return v
     .map((entry) => {
       const e = entry as Record<string, unknown>;
-      // Assignment rows nest the person; plain user rows carry the name directly.
-      return nameOf(e?.assignee ?? e?.user ?? e?.vendor ?? entry);
+      // An assignment from the show endpoint nests the person under
+      // `login_information` and carries NO top-level name — only the slimmer
+      // list view does. Missing that would have reported a correctly assigned
+      // item as unassigned, and then "fixed" it by retrying writes that had
+      // already worked.
+      return nameOf(e?.login_information ?? e?.assignee ?? e?.user ?? e?.vendor ?? entry);
     })
     .filter((n): n is string => Boolean(n));
 }
@@ -662,18 +672,17 @@ function appendNested(form: FormData, prefix: string, value: unknown): void {
 }
 
 /**
- * Send the photos with the CREATE, not as a follow-up update.
+ * The file part is `punch_item[attachments][]`.
  *
- * The first attempt attached afterwards with a multipart PATCH, on the reasoning
- * that a rejected photo should not cost the whole item. Procore accepted every
- * one of those requests with a 200 and stored nothing: `images[]` is documented
- * on **Create Punch Item**, and the update endpoint simply ignores it. Photos
- * therefore go on the create.
+ * `images[]` was the guess behind two of the three silent failures, and an item
+ * Procore's UI put a photo on settles it: that item reads back with the photo in
+ * **`attachments`** (and mirrored into `web_images`), while `images` is an empty
+ * array. `images` is a field this product no longer fills. Sending a file under
+ * a name the controller does not permit is dropped without comment, which is
+ * why every attempt returned 200 and stored nothing.
  *
- * The original concern still stands, so it is handled by falling back: if the
- * multipart create fails for any reason, the item is created again from the
- * plain JSON body that is already known to work, and the photo failure is
- * reported against a row that exists rather than losing the row.
+ * Photos go on the create, with a plain-JSON create as the fallback so a photo
+ * Procore rejects costs the photo and not the whole row.
  */
 async function createWithPhotos(
   projectId: number,
@@ -685,7 +694,7 @@ async function createWithPhotos(
   appendNested(form, 'punch_item', buildPunchItemPayload(input));
   for (const photo of photos) {
     form.append(
-      'images[]',
+      'punch_item[attachments][]',
       new Blob([new Uint8Array(photo.bytes)], { type: photo.contentType }),
       photo.filename,
     );
@@ -774,7 +783,16 @@ const memo: {
   sendFailure: string[] | null;
   assign: string | null;
   assignFailure: string[] | null;
-} = { send: null, sendFailure: null, assign: null, assignFailure: null };
+  attach: string | null;
+  attachFailure: string[] | null;
+} = {
+  send: null,
+  sendFailure: null,
+  assign: null,
+  assignFailure: null,
+  attach: null,
+  attachFailure: null,
+};
 
 function ordered<A extends unknown[]>(list: Array<WriteStrategy<A>>, known: string | null) {
   if (!known) return list;
@@ -786,6 +804,88 @@ function describeError(err: unknown): string {
   return err instanceof ProcoreError
     ? `${err.status} ${err.fieldErrors().join('; ') || summarize(err.body)}`
     : String(err);
+}
+
+/**
+ * Attach photos to an item that already exists.
+ *
+ * Only runs when the create did not carry them, so in the happy path it costs
+ * nothing. It exists because losing the photos is recoverable in the field and
+ * losing the row is not: whatever happens here, the superintendent still has the
+ * item in Procore and a report of what is missing from it.
+ */
+const ATTACH_STRATEGIES: Array<WriteStrategy<[PunchPhoto[]]>> = [
+  {
+    label: 'PATCH punch_item[attachments][]',
+    run: async (projectId, punchItemId, photos) => {
+      const form = new FormData();
+      form.append('project_id', String(projectId));
+      for (const photo of photos) {
+        form.append(
+          'punch_item[attachments][]',
+          new Blob([new Uint8Array(photo.bytes)], { type: photo.contentType }),
+          photo.filename,
+        );
+      }
+      await procoreRequest('PATCH', `/rest/v1.1/punch_items/${punchItemId}`, {
+        query: { project_id: projectId },
+        form,
+      });
+    },
+  },
+  {
+    label: 'PATCH attachments[]',
+    run: async (projectId, punchItemId, photos) => {
+      const form = new FormData();
+      form.append('project_id', String(projectId));
+      for (const photo of photos) {
+        form.append(
+          'attachments[]',
+          new Blob([new Uint8Array(photo.bytes)], { type: photo.contentType }),
+          photo.filename,
+        );
+      }
+      await procoreRequest('PATCH', `/rest/v1.1/punch_items/${punchItemId}`, {
+        query: { project_id: projectId },
+        form,
+      });
+    },
+  },
+];
+
+/** How many photos Procore says it is holding, trusting its own flag first. */
+function storedPhotos(o: ObservedPunchItem | null): number {
+  if (!o) return 0;
+  if (o.hasAttachments === false) return 0;
+  return o.attachmentCount;
+}
+
+async function ensurePhotos(
+  projectId: number,
+  punchItemId: number,
+  photos: PunchPhoto[],
+  observed: ObservedPunchItem | null,
+): Promise<{ errors: string[]; observed: ObservedPunchItem | null }> {
+  if (!photos.length || storedPhotos(observed) > 0) return { errors: [], observed };
+  if (memo.attachFailure) return { errors: memo.attachFailure, observed };
+
+  const errors: string[] = [];
+  for (const strategy of ordered(ATTACH_STRATEGIES, memo.attach)) {
+    try {
+      await strategy.run(projectId, punchItemId, photos);
+      const after = await observePunchItem(projectId, punchItemId);
+      if (storedPhotos(after) > 0) {
+        memo.attach = strategy.label;
+        return { errors, observed: after };
+      }
+      errors.push(`${strategy.label}: accepted but stored no attachment`);
+    } catch (err) {
+      errors.push(`${strategy.label}: ${describeError(err)}`);
+    }
+  }
+
+  memo.attachFailure = errors;
+  return { errors, observed };
 }
 
 /**
@@ -858,7 +958,7 @@ const ASSIGN_STRATEGIES: Array<WriteStrategy<[number[], number | null]>> = [
           project_id: projectId,
           punch_item: {
             assignments_attributes: assigneeIds.map((id) => ({
-              assignee_id: id,
+              login_information_id: id,
               ...(vendorId ? { vendor_id: vendorId } : {}),
             })),
           },
@@ -880,7 +980,7 @@ const ASSIGN_STRATEGIES: Array<WriteStrategy<[number[], number | null]>> = [
             project_id: projectId,
             punch_item_assignment: {
               punch_item_id: punchItemId,
-              assignee_id: assigneeId,
+              login_information_id: assigneeId,
               ...(vendorId ? { vendor_id: vendorId } : {}),
             },
           },
@@ -889,11 +989,11 @@ const ASSIGN_STRATEGIES: Array<WriteStrategy<[number[], number | null]>> = [
     },
   },
   {
-    label: 'PATCH assignee_ids',
+    label: 'PATCH login_information_ids',
     run: async (projectId, punchItemId, assigneeIds) => {
       await procoreRequest('PATCH', `/rest/v1.1/punch_items/${punchItemId}`, {
         query: { project_id: projectId },
-        body: { project_id: projectId, punch_item: { assignee_ids: assigneeIds } },
+        body: { project_id: projectId, punch_item: { login_information_ids: assigneeIds } },
       });
     },
   },
@@ -996,12 +1096,14 @@ export async function createPunchItem(
 
   let observed = created?.id ? await observePunchItem(projectId, created.id) : null;
 
-  // A 2xx on the create is not evidence the photos landed; the previous attempt
-  // returned 200 and stored nothing. Only the read-back counts.
-  const photosAttached = observed?.attachmentCount ?? 0;
-  if (photos.length && photosAttached === 0 && !photoErrors.length) {
-    photoErrors.push('Procore accepted the create but stored no attachment');
+  // A 2xx on the create is not evidence the photos landed — three separate
+  // attempts returned 200 and stored nothing. Only the read-back counts.
+  if (photos.length && created?.id) {
+    const attached = await ensurePhotos(projectId, created.id, photos, observed);
+    observed = attached.observed ?? observed;
+    photoErrors.push(...attached.errors);
   }
+  const photosAttached = storedPhotos(observed);
 
   let assignErrors: string[] = [];
   let assignStrategy: string | null = null;
