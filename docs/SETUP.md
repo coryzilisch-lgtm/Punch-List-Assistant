@@ -496,3 +496,38 @@ Two bugs made one throttled item look like a whole failed push, both fixed:
   is broken in this tenant", after which every remaining item skipped sending and
   reported the same stale error. Transient failures (429, 5xx, network) now stop
   the chain without recording a verdict.
+
+## Opening the app inside Procore
+
+Two separate URLs in the Procore app manifest, and they are easy to swap by
+mistake:
+
+| Field | Value |
+|---|---|
+| Embedded Full Screen **app URL** | `https://<swa-host>/` — the app itself |
+| OAuth **redirect URI** | `https://<swa-host>/api/procore/callback` |
+
+Pointing the Full Screen component at the callback path produces a browser error
+page inside the Procore frame ("might be temporarily down or moved permanently"),
+because that route is the OAuth landing spot, not the application — and it does
+not exist until the OAuth flow is built.
+
+The CSP also has to permit the frame. `frame-ancestors` was `'none'`, which
+blocks the embed outright; it now names Procore's origins explicitly rather than
+being removed, so nothing else may frame the app.
+
+**The open question is identity.** The app is gated by Entra, and Microsoft's
+login page refuses to render in an iframe just as Procore's does — so if the
+browser does not already carry a valid Static Web Apps auth cookie into the
+frame, the embed will show a blank panel rather than the sign-in screen. Whether
+it does depends on that cookie surviving as third-party in the frame, which is
+worth testing before building anything: point the Full Screen URL at the app root
+and open it in Procore while signed in.
+
+- **It renders** → the embed works on Entra today, and per-user Procore OAuth is
+  then only about attribution (who created the item), not about getting the app
+  on screen.
+- **It is blank** → Procore has to become the identity provider inside the frame,
+  which is the fuller build described above: `/api/procore/connect`,
+  `/api/procore/callback`, the popup flow via `procore-iframe-helpers`, and an API
+  that accepts either a Static Web Apps principal or a verified Procore token.
