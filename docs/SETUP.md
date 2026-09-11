@@ -437,3 +437,35 @@ All three earlier failures were the same failure: a parameter name Procore's
 controller does not permit is filtered out silently, so the request returns 200
 and stores nothing. Rails does not tell you that you misnamed a key. Treat any
 write here that "succeeds" without a read-back as unverified.
+
+## Who the item is created by, and whose court it lands in
+
+These read like two questions and are one mechanism.
+
+**Ball-in-court is derived, not set.** There is no writable field for it. The
+tenant shows the rule plainly: item #274, Draft, created by the service account
+with Cory as punch item manager, had ball-in-court on **the service account**.
+Item #275, initiated, assigned to Cory, had ball-in-court on **Cory**. And #274
+once closed had ball-in-court on nobody. So:
+
+- **Draft → the ball sits with the CREATOR.** Naming a punch item manager does
+  not move it; #274 proves that.
+- **Initiated → the ball moves to the ASSIGNEE.**
+
+Which means the only way to have a Draft item wait on a chosen person is to make
+that person the creator.
+
+**`GET /api/inspect?as_user=<procore user id>`** tests whether that is possible.
+Procore documents a header for acting on behalf of another user; its exact name
+is not guessable safely, so the probe tries the candidates against `GET /me` —
+which returns whoever the request authenticated as, and is therefore its own
+verification. A header Procore does not recognise is ignored, so `ok: true` with
+`impersonated: false` means the header did nothing, not that it worked. Nothing
+is written either way.
+
+If a header works, the super's Procore user id can be resolved from their Entra
+sign-in email against the project's user list, and imported items become theirs:
+created by them, and while Draft, sitting in their court. If none works, the
+fallback is per-user OAuth (each super authorizes Procore once and the push uses
+their token), and the fallback to that is leaving items attributed to the
+integration and relying on the punch item manager instead.

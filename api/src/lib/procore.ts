@@ -160,6 +160,12 @@ export interface RequestOptions {
   form?: FormData;
   /** Procore-Company-Id header. Defaults to PROCORE_COMPANY_ID. */
   company?: string;
+  /**
+   * Extra headers. Exists for Procore's act-on-behalf-of header, which is what
+   * decides whether a punch item is created BY the superintendent or by the
+   * integration's service account.
+   */
+  headers?: Record<string, string>;
 }
 
 export async function procoreRequest<T = unknown>(
@@ -184,6 +190,7 @@ export async function procoreRequest<T = unknown>(
       // Procore integration mistake.
       'Procore-Company-Id': opts.company || companyId(),
       Accept: 'application/json',
+      ...(opts.headers || {}),
     };
 
     let payload: BodyInit | undefined;

@@ -178,12 +178,80 @@ async function probeUploads(projectId: number) {
   return out;
 }
 
+/**
+ * Can this service account act as a real person?
+ *
+ * Everything the app creates is stamped "created by ABS abs-api-export", and a
+ * Draft punch item sits in its CREATOR's court — so the creator is not a cosmetic
+ * detail, it decides who the work is actually in front of. Procore documents a
+ * header for acting on behalf of another user, but the reference is unreachable
+ * from here and the header's exact name is not something to guess at against a
+ * live company.
+ *
+ * So this asks Procore. `GET /me` returns whoever the request is authenticated
+ * as, which makes it a perfect self-verifying test: try each candidate header
+ * and see whether the answer changes. Nothing is written, and a header Procore
+ * does not recognise is ignored.
+ */
+const IMPERSONATION_HEADERS = [
+  'Procore-Sso-User-Id',
+  'Procore-User-Id',
+  'Procore-On-Behalf-Of',
+  'On-Behalf-Of',
+];
+
+async function probeImpersonation(userId: string) {
+  const me = async (headers?: Record<string, string>) =>
+    procoreRequest<{ id?: number; login?: string; name?: string }>('GET', '/rest/v1.0/me', {
+      ...(headers ? { headers } : {}),
+    });
+
+  const baseline = await me();
+  const attempts: Array<Record<string, unknown>> = [];
+
+  for (const header of IMPERSONATION_HEADERS) {
+    try {
+      const as = await me({ [header]: userId });
+      attempts.push({
+        header,
+        ok: true,
+        // The header working means /me came back as somebody else. Coming back
+        // as the service account means Procore ignored it — which reads as a
+        // success on the wire and is a failure here.
+        impersonated: as.id !== baseline.id,
+        sawUser: { id: as.id, login: as.login, name: as.name },
+      });
+      if (as.id !== baseline.id) break;
+    } catch (err) {
+      attempts.push({
+        header,
+        ok: false,
+        status: err instanceof ProcoreError ? err.status : null,
+        error: err instanceof ProcoreError ? err.body : String(err),
+      });
+    }
+  }
+
+  return {
+    serviceAccount: { id: baseline.id, login: baseline.login, name: baseline.name },
+    requestedUserId: userId,
+    attempts,
+    worked: attempts.find((a) => a.impersonated)?.header ?? null,
+  };
+}
+
 export async function inspectHandler(
   request: HttpRequest,
   context: InvocationContext,
 ): Promise<HttpResponseInit> {
   if (!procoreConfigured()) {
     return errorResponse(503, 'Procore is not configured on this deployment.');
+  }
+
+  // Acting as another user is a company-level question, so it needs no project.
+  const asUser = request.query.get('as_user');
+  if (asUser) {
+    return json({ impersonation: await probeImpersonation(asUser) });
   }
 
   const projectId = Number(request.query.get('project_id') || 0);
