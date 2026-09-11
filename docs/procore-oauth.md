@@ -113,3 +113,113 @@ this was assembled from search summaries of those same pages. Endpoint names and
 parameters should be confirmed against the live docs before implementation — that
 assumption is exactly what cost three silent-failure rounds on the punch item
 write contract.
+
+---
+
+# Adding an Embedded component instead of a second app
+
+A Procore app is a manifest made of **components**. This one currently has a
+**Data Connection (DMSA)** component — that is the client-credentials service
+account. The other two are **Embedded Full Screen** and **Side Panel**, and both
+are authorization-code: they run as the signed-in user.
+
+So "act on behalf of a user" and "open inside Procore" are not two projects. Add
+an Embedded component to the existing app and both arrive together. Keep the Data
+Connection component alongside it; the service account stays useful as the
+fallback and for anything that has to run without a person present.
+
+- **Embedded Full Screen** puts the app in Procore's **Select an App** menu, at
+  project level and/or company level, rendered in an iframe.
+- **Side Panel** docks it beside an existing tool — which for this app would mean
+  opening it from the Punch List tool itself, on the project the super is already
+  looking at. Worth considering: it removes the project-picking step entirely.
+
+## The constraint that shapes the whole design
+
+**Procore's login page will not render in an iframe** — deliberately, for
+clickjacking reasons. So an embedded app cannot simply redirect to the OAuth
+authorize URL the way a normal web app does.
+
+`procore-iframe-helpers` exists for this. The iframe asks the parent to open a
+real browser window:
+
+```javascript
+const context = ProcoreIframeHelpers.initialize();
+
+context.authentication.authenticate({
+  url: "/auth/procore",           // our endpoint, which redirects to Procore
+  onSuccess: function (payload) { /* token is in hand */ },
+  onFailure: function (error) { console.log(error); },
+});
+```
+
+and the page our OAuth callback renders — in that popup window, on our origin —
+closes the loop:
+
+```javascript
+ProcoreIframeHelpers.initialize().authentication.notifySuccess({});
+```
+
+which fires `onSuccess` in the iframe and closes the window.
+
+## What embedding costs us here, and it is not small
+
+This app is currently gated end to end by Azure Static Web Apps + Entra: every
+route requires an authenticated principal, a 401 redirects to
+`/.auth/login/aad`, and the CSP sets `frame-ancestors 'none'`. Every one of those
+is incompatible with running inside Procore's iframe:
+
+- `frame-ancestors 'none'` blocks the render outright. It has to become an
+  explicit allowance for Procore's origin — **not** a wildcard, and not removed.
+- Microsoft's login page also refuses to be framed, so the Entra redirect cannot
+  complete inside the iframe either.
+
+Which means: **inside Procore, Procore is the identity provider, not Entra.** The
+API has to accept either a valid SWA principal (standalone URL) or a valid
+Procore token (embedded), and the app shell has to be reachable without the Entra
+gate. That is a real reduction in the current security posture and should be a
+deliberate decision, not a side effect — the mitigation is that the API verifies
+the Procore token against Procore on every call rather than trusting the frame.
+
+## Where the token lives — the cheap option is also the better one
+
+The research above assumed refresh tokens stored server-side, which drags in a
+storage account and a compare-and-swap to survive rotation. Embedding makes that
+mostly unnecessary.
+
+The popup flow ends with an access token in the browser. Keep it there, send it
+to our API in a custom header per request, and never store a refresh token at
+all. This is exactly the pattern Herd-Intranet already uses for Microsoft Graph
+(`X-Graph-Token`), so it is a known quantity in this stack:
+
+- No storage account, no connection string, no new secret at rest.
+- No refresh-token rotation race — the failure mode that would have silently
+  signed people out mid-push.
+- The client secret still never reaches the browser: the code-for-token exchange
+  happens in our callback Function.
+
+The cost is re-authenticating when the token expires. That is ~2 hours today,
+which comfortably covers a punch import. Procore has said it is moving toward 15
+minutes, and that would start to bite during a long review — at which point add
+the server-side refresh-token store as an upgrade, with the concurrency care
+described above. Starting without it is not a shortcut that has to be undone; the
+token-resolution seam is the same either way.
+
+## Order of operations
+
+Procore-side first, because it gates everything:
+
+1. Add the Embedded Full Screen (and/or Side Panel) component to the existing app
+   in the developer portal.
+2. Register the redirect URI: `https://<swa-host>/api/procore/callback`.
+3. Note the auth-code **client id and secret** — these are separate from the DMSA
+   credentials already in the app settings.
+4. Promote the manifest from sandbox to production, then have a company admin
+   install it: **Company Admin → App Management → Install Custom App**, using the
+   36-character App Version ID.
+
+Then the code: `/api/procore/connect` and `/api/procore/callback`, the iframe
+helper wired into the dashboard, CSP and SWA route changes for the embedded path,
+dual identity in the API, and the push choosing the user's token when present and
+the service account when not — reporting which it used, because "created by the
+integration" should never come as a surprise.
