@@ -15,16 +15,55 @@
   },
   "navigationFallback": {
     "rewrite": "/index.html",
-    "exclude": ["/.auth/*", "/api/*", "/vendor/*", "*.{css,js,mjs,png,jpg,svg,ico,woff,woff2}"]
+    "exclude": [
+      "/.auth/*",
+      "/api/*",
+      "/vendor/*",
+      "*.{css,js,mjs,png,jpg,svg,ico,woff,woff2}"
+    ]
   },
   "routes": [
-    { "route": "/.auth/login/github", "statusCode": 404 },
-    { "route": "/.auth/login/twitter", "statusCode": 404 },
-    { "route": "/api/*", "allowedRoles": ["authenticated"] },
-    { "route": "/*", "allowedRoles": ["authenticated"] }
+    {
+      "route": "/.auth/login/github",
+      "statusCode": 404
+    },
+    {
+      "route": "/.auth/login/twitter",
+      "statusCode": 404
+    },
+    {
+      "route": "/procore-launch",
+      "rewrite": "/procore-launch.html",
+      "allowedRoles": [
+        "anonymous",
+        "authenticated"
+      ]
+    },
+    {
+      "route": "/procore-launch.html",
+      "allowedRoles": [
+        "anonymous",
+        "authenticated"
+      ]
+    },
+    {
+      "route": "/api/*",
+      "allowedRoles": [
+        "authenticated"
+      ]
+    },
+    {
+      "route": "/*",
+      "allowedRoles": [
+        "authenticated"
+      ]
+    }
   ],
   "responseOverrides": {
-    "401": { "redirect": "/.auth/login/aad", "statusCode": 302 }
+    "401": {
+      "redirect": "/.auth/login/aad",
+      "statusCode": 302
+    }
   },
   "globalHeaders": {
     "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors https://app.procore.com https://*.procore.com; base-uri 'self'; object-src 'none'",

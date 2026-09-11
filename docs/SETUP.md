@@ -527,7 +527,26 @@ and open it in Procore while signed in.
 - **It renders** → the embed works on Entra today, and per-user Procore OAuth is
   then only about attribution (who created the item), not about getting the app
   on screen.
-- **It is blank** → Procore has to become the identity provider inside the frame,
-  which is the fuller build described above: `/api/procore/connect`,
-  `/api/procore/callback`, the popup flow via `procore-iframe-helpers`, and an API
-  that accepts either a Static Web Apps principal or a verified Procore token.
+- **It is blank, or shows a browser error page** → the Entra redirect is dying in
+  the frame, as expected.
+
+### The launcher — working inside Procore without weakening the gate
+
+Point the Full Screen component at **`/procore-launch`** instead of the app root.
+
+That page is served anonymously and holds nothing worth gating: no data, no API
+calls, no identity — a Buffalo-branded card with one button that opens the real
+app in a top-level tab, where Microsoft sign-in behaves normally. It forwards the
+project id Procore passes on the embedded URL, so the super lands on the right
+job with the picker already filled in.
+
+The alternative was to make the app itself reachable without Entra so a frame
+could render it, which trades a real security boundary for a cosmetic one. The
+launcher keeps one front door and one identity provider, and the only cost is
+that the app opens in a tab rather than inside the panel.
+
+The fuller build — the app running *in* the panel, as the signed-in Procore user
+— is still worth doing, and is unchanged by this: `/api/procore/connect`,
+`/api/procore/callback`, the popup flow via `procore-iframe-helpers`, and an API
+that accepts either a Static Web Apps principal or a verified Procore token. The
+launcher is what works today, not a replacement for that.

@@ -1560,6 +1560,23 @@ async function init() {
   }
 
   await loadProjects();
+  preselectFromUrl();
+}
+
+/**
+ * Honour `?project_id=` so Procore can hand the job over.
+ *
+ * The launcher Procore embeds forwards the project it was opened on, which
+ * removes the one step a super would otherwise repeat for a job they are
+ * already standing in. It is a convenience, never an assumption: the project
+ * still has to exist in the list, and the chosen name is shown so a wrong or
+ * stale id is visible rather than silently importing into the wrong job.
+ */
+function preselectFromUrl() {
+  const id = Number(new URLSearchParams(location.search).get('project_id'));
+  if (!Number.isFinite(id) || id <= 0) return;
+  if (!S.projects.some((p) => p.id === id)) return;
+  chooseProject(id);
 }
 
 init();
