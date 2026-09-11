@@ -1378,7 +1378,77 @@ function renderResults() {
     })
     .join('');
 
+  // Items that exist in Procore but never left Draft can be finished without
+  // creating anything — pushing the list again would duplicate every row.
+  const unsent = S.results.filter((r) => r.ok && r.punchItemId && r.sendErrors?.length);
+  if (unsent.length) {
+    html +=
+      `<div class="note warn" style="margin-top:14px">` +
+      `<strong>${unsent.length} item${unsent.length === 1 ? '' : 's'} ${
+        unsent.length === 1 ? 'was' : 'were'
+      } created but not sent.</strong> ` +
+      `The items are in Procore with their photos and assignees — only the send failed, ` +
+      `usually because Procore rate limited us partway through. ` +
+      `Retrying finishes them in place; it does not create anything new.` +
+      `<div style="margin-top:10px"><button class="btn-secondary" id="retry-send">Retry sending ${
+        unsent.length
+      } item${unsent.length === 1 ? '' : 's'}</button></div>` +
+      `<div id="retry-send-status"></div></div>`;
+  }
+
   $('results').innerHTML = html;
+  const retry = $('retry-send');
+  if (retry) retry.addEventListener('click', () => retrySend(unsent));
+}
+
+/**
+ * Finish items that were created but never sent.
+ *
+ * Batched and sequential for the same reason the push is: this runs precisely
+ * when Procore's quota is already under pressure, so firing everything at once
+ * would recreate the failure it is recovering from.
+ */
+async function retrySend(unsent) {
+  const btn = $('retry-send');
+  const status = $('retry-send-status');
+  btn.disabled = true;
+  btn.textContent = 'Sending…';
+
+  const ids = unsent.map((r) => r.punchItemId);
+  let sent = 0;
+  const failures = [];
+
+  try {
+    for (let i = 0; i < ids.length; i += 8) {
+      const batch = ids.slice(i, i + 8);
+      status.innerHTML = `<span class="muted">Sending ${i + 1}-${i + batch.length} of ${ids.length}…</span>`;
+      const data = await api('/api/resend', {
+        method: 'POST',
+        body: JSON.stringify({ projectId: S.project.id, punchItemIds: batch }),
+      });
+      for (const r of data.results || []) {
+        const row = S.results.find((x) => x.punchItemId === r.punchItemId);
+        if (r.ok) {
+          sent += 1;
+          // Clear the failure so a second retry only covers what is still stuck.
+          if (row) { row.sendErrors = undefined; row.observed = r.observed || row.observed; }
+        } else {
+          failures.push(`#${r.punchItemId}: ${(r.errors || ['failed']).join('; ')}`);
+        }
+      }
+    }
+  } catch (err) {
+    failures.push(err.message || String(err));
+  }
+
+  // Re-render off the updated results so the badges match Procore, then report.
+  renderResults();
+  const after = $('retry-send-status');
+  if (after) {
+    after.innerHTML = failures.length
+      ? `<span class="muted">Sent ${sent}. Still stuck: ${esc(failures.join(' · '))}</span>`
+      : `<span class="muted">Sent ${sent}.</span>`;
+  }
 }
 
 // ── Wiring ──────────────────────────────────────────────────────────────────

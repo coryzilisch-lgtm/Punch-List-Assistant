@@ -10,3 +10,4 @@ import './functions/inspect';
 import './functions/probe';
 import './functions/extract';
 import './functions/push';
+import './functions/resend';

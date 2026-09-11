@@ -224,8 +224,7 @@ export async function procoreRequest<T = unknown>(
     }
 
     if (res.status === 429) {
-      const reset = Number(res.headers.get('X-Rate-Limit-Reset') || 0);
-      const waitMs = reset > 0 ? Math.max(0, reset * 1000 - Date.now()) : backoffMs(attempt);
+      const waitMs = rateLimitWaitMs(res.headers.get('X-Rate-Limit-Reset'), attempt);
 
       // Waiting out a rate limit inside a Function that is killed at 45 seconds
       // does not produce a rate-limit error — it produces Azure's opaque
@@ -259,6 +258,43 @@ export async function procoreRequest<T = unknown>(
 
 function backoffMs(attempt: number): number {
   return Math.min(2 ** attempt * 1000, 16_000);
+}
+
+/**
+ * How long to wait out a 429, from a header whose units are not guaranteed.
+ *
+ * `X-Rate-Limit-Reset` may be an absolute epoch second or a number of seconds
+ * from now, and the first version of this assumed epoch unconditionally:
+ * `reset * 1000 - Date.now()` on a seconds-from-now value is hugely negative,
+ * clamped to zero, and the retry fired **immediately** — four times, against a
+ * limit that was still in force. A real push hit this and reported "it resets in
+ * about 0s", which is the arithmetic describing its own bug.
+ *
+ * A value above ~1e9 is an epoch second (that threshold passed in 2001); below
+ * it is a duration. Either way the wait never drops under the normal backoff, so
+ * a missing, stale or nonsensical header degrades to waiting rather than to
+ * hammering.
+ */
+export function rateLimitWaitMs(header: string | null, attempt: number): number {
+  const floor = backoffMs(attempt);
+  const reset = Number(header);
+  if (!Number.isFinite(reset) || reset <= 0) return floor;
+  const ms = reset > 1_000_000_000 ? reset * 1000 - Date.now() : reset * 1000;
+  return Number.isFinite(ms) && ms > floor ? ms : floor;
+}
+
+/**
+ * Is this failure about the moment rather than about the contract?
+ *
+ * The strategy chains remember what does not work so sixty items do not re-prove
+ * it. That memory must never be written from a rate limit or a gateway blip: a
+ * push that briefly overlapped the Safety Dashboard's ingest marked sending as
+ * permanently broken, and every remaining item then skipped it and reported the
+ * same stale error — items that would have sent perfectly a second later.
+ */
+function isTransient(err: unknown): boolean {
+  if (!(err instanceof ProcoreError)) return true; // network/abort — not a verdict
+  return err.status === 429 || err.status >= 500;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -807,6 +843,48 @@ function ordered<A extends unknown[]>(list: Array<WriteStrategy<A>>, known: stri
   return hit ? [hit, ...list.filter((s) => s !== hit)] : list;
 }
 
+/**
+ * Run a chain of write strategies until the read-back proves one worked.
+ *
+ * Shared by photos, assignees and sending because all three had the same two
+ * problems: Procore answers 200 for writes it discards, so only a read-back
+ * counts; and re-proving the chain per item would multiply the 45-second budget
+ * and the shared rate-limit quota by its length.
+ *
+ * A transient failure stops the chain WITHOUT recording a verdict. Falling
+ * through to the next strategy on a 429 is worse than useless — it spends more
+ * of the quota that is already exhausted, and then blames the contract for a
+ * problem that was the clock.
+ */
+async function runChain<A extends unknown[]>(
+  list: Array<WriteStrategy<A>>,
+  known: string | null,
+  projectId: number,
+  punchItemId: number,
+  args: A,
+  worked: (after: ObservedPunchItem | null) => boolean,
+  rejected: string,
+): Promise<{
+  strategy: string | null;
+  errors: string[];
+  observed: ObservedPunchItem | null;
+  transient: boolean;
+}> {
+  const errors: string[] = [];
+  for (const strategy of ordered(list, known)) {
+    try {
+      await strategy.run(projectId, punchItemId, ...args);
+      const after = await observePunchItem(projectId, punchItemId);
+      if (worked(after)) return { strategy: strategy.label, errors, observed: after, transient: false };
+      errors.push(`${strategy.label}: ${rejected}`);
+    } catch (err) {
+      errors.push(`${strategy.label}: ${describeError(err)}`);
+      if (isTransient(err)) return { strategy: null, errors, observed: null, transient: true };
+    }
+  }
+  return { strategy: null, errors, observed: null, transient: false };
+}
+
 function describeError(err: unknown): string {
   return err instanceof ProcoreError
     ? `${err.status} ${err.fieldErrors().join('; ') || summarize(err.body)}`
@@ -876,23 +954,22 @@ async function ensurePhotos(
   if (!photos.length || storedPhotos(observed) > 0) return { errors: [], observed };
   if (memo.attachFailure) return { errors: memo.attachFailure, observed };
 
-  const errors: string[] = [];
-  for (const strategy of ordered(ATTACH_STRATEGIES, memo.attach)) {
-    try {
-      await strategy.run(projectId, punchItemId, photos);
-      const after = await observePunchItem(projectId, punchItemId);
-      if (storedPhotos(after) > 0) {
-        memo.attach = strategy.label;
-        return { errors, observed: after };
-      }
-      errors.push(`${strategy.label}: accepted but stored no attachment`);
-    } catch (err) {
-      errors.push(`${strategy.label}: ${describeError(err)}`);
-    }
-  }
+  const run = await runChain(
+    ATTACH_STRATEGIES,
+    memo.attach,
+    projectId,
+    punchItemId,
+    [photos],
+    (after) => storedPhotos(after) > 0,
+    'accepted but stored no attachment',
+  );
 
-  memo.attachFailure = errors;
-  return { errors, observed };
+  if (run.strategy) {
+    memo.attach = run.strategy;
+    return { errors: [], observed: run.observed };
+  }
+  if (!run.transient) memo.attachFailure = run.errors;
+  return { errors: run.errors, observed };
 }
 
 /**
@@ -918,40 +995,25 @@ export async function sendPunchItem(
     return { sent: false, strategy: null, errors: memo.sendFailure, observed: before };
   }
 
-  const errors: string[] = [];
   const baseline = workflowSignature(before);
+  const run = await runChain(
+    SEND_STRATEGIES,
+    memo.send,
+    projectId,
+    punchItemId,
+    [],
+    (after) => Boolean(after) && (after!.isDraft === false || workflowSignature(after) !== baseline),
+    'accepted, but nothing about the item changed',
+  );
 
-  for (const strategy of ordered(SEND_STRATEGIES, memo.send)) {
-    try {
-      await strategy.run(projectId, punchItemId);
-      const after = await observePunchItem(projectId, punchItemId);
-      if (after && (after.isDraft === false || workflowSignature(after) !== baseline)) {
-        memo.send = strategy.label;
-        return { sent: true, strategy: strategy.label, errors, observed: after };
-      }
-      errors.push(`${strategy.label}: accepted, but nothing about the item changed`);
-    } catch (err) {
-      errors.push(`${strategy.label}: ${describeError(err)}`);
-    }
+  if (run.strategy) {
+    memo.send = run.strategy;
+    return { sent: true, strategy: run.strategy, errors: [], observed: run.observed };
   }
-
-  memo.sendFailure = errors;
-  return { sent: false, strategy: null, errors, observed: before };
+  if (!run.transient) memo.sendFailure = run.errors;
+  return { sent: false, strategy: null, errors: run.errors, observed: before };
 }
 
-/**
- * Assignment strategies, tried in order until the read-back shows an assignee.
- *
- * Procore accepted the inline `assignments` array on create and stored nothing
- * from it. The accepted shape could not be confirmed from here — Procore's
- * developer docs are unreachable behind this environment's network egress
- * policy — so the chain runs only when the inline attempt demonstrably failed,
- * and reports which member worked so it can later collapse to that one.
- *
- * Nothing here runs when no assignee was chosen. An unassigned item is meant to
- * sit in nobody's court, and inventing an assignee to satisfy Procore's default
- * would put work in front of a person who never agreed to it.
- */
 const ASSIGN_STRATEGIES: Array<WriteStrategy<[number[], number | null]>> = [
   {
     // Rails nested attributes. The plain `assignments` array on create was
@@ -1029,23 +1091,22 @@ export async function ensureAssignees(
     return { strategy: null, errors: memo.assignFailure, observed };
   }
 
-  const errors: string[] = [];
-  for (const strategy of ordered(ASSIGN_STRATEGIES, memo.assign)) {
-    try {
-      await strategy.run(projectId, punchItemId, assigneeIds, vendorId);
-      const after = await observePunchItem(projectId, punchItemId);
-      if (after && after.assignees.length > 0) {
-        memo.assign = strategy.label;
-        return { strategy: strategy.label, errors, observed: after };
-      }
-      errors.push(`${strategy.label}: accepted but no assignee was stored`);
-    } catch (err) {
-      errors.push(`${strategy.label}: ${describeError(err)}`);
-    }
-  }
+  const run = await runChain(
+    ASSIGN_STRATEGIES,
+    memo.assign,
+    projectId,
+    punchItemId,
+    [assigneeIds, vendorId],
+    (after) => Boolean(after && after.assignees.length > 0),
+    'accepted but no assignee was stored',
+  );
 
-  memo.assignFailure = errors;
-  return { strategy: null, errors, observed };
+  if (run.strategy) {
+    memo.assign = run.strategy;
+    return { strategy: run.strategy, errors: [], observed: run.observed };
+  }
+  if (!run.transient) memo.assignFailure = run.errors;
+  return { strategy: null, errors: run.errors, observed };
 }
 
 export interface CreatePunchItemResult {

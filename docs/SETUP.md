@@ -469,3 +469,30 @@ created by them, and while Draft, sitting in their court. If none works, the
 fallback is per-user OAuth (each super authorizes Procore once and the push uses
 their token), and the fallback to that is leaving items attributed to the
 integration and relying on the punch item manager instead.
+
+## When a push half-succeeds
+
+Procore's rate limit is company-wide and this app's service account is **shared
+with the Safety Dashboard ingest**, so a push that overlaps a large sync can be
+throttled partway through. That is not a failure of the import: the items are in
+Procore, with their photos and assignees. Only the send did not happen, and they
+sit in Draft.
+
+**Do not push the list again** — that creates duplicates of everything that
+already landed. The results screen offers **Retry sending N items**, which calls
+`POST /api/resend` with the ids that already exist and finishes them in place. It
+creates nothing, and it skips any item someone has since sent from Procore.
+
+Two bugs made one throttled item look like a whole failed push, both fixed:
+
+- **The 429 wait was computed as zero.** `X-Rate-Limit-Reset` is not guaranteed
+  to be an epoch second, and treating a seconds-from-now value as one gives a
+  hugely negative interval, clamped to zero — so the retry fired immediately,
+  four times, against a limit still in force. The error even said so: "it resets
+  in about 0s". The wait now never drops below the normal backoff whatever the
+  header contains.
+- **A rate limit poisoned the strategy memory.** The chains remember what does
+  not work so sixty items do not re-prove it; a 429 was being recorded as "sending
+  is broken in this tenant", after which every remaining item skipped sending and
+  reported the same stale error. Transient failures (429, 5xx, network) now stop
+  the chain without recording a verdict.
