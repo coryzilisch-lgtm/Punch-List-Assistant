@@ -1,6 +1,7 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
 import { errorResponse, guarded, json } from '../lib/http';
 import { companyId, listPunchItems, ProcoreError, procoreConfigured, procoreRequest } from '../lib/procore';
+import { fabricConfigured, findVendorTables } from '../lib/fabric';
 
 /**
  * GET /api/inspect?project_id=123[&punch_item_id=274] — read Procore's own shapes.
@@ -240,6 +241,87 @@ async function probeImpersonation(userId: string) {
   };
 }
 
+/**
+ * Which list endpoints this tenant actually serves.
+ *
+ * Vendors and Trades both come back 404, which means the paths are wrong rather
+ * than the data missing — Procore is inconsistent about whether a company-scoped
+ * collection is nested (`/companies/{id}/thing`) or flat with a query parameter
+ * (`/thing?company_id=`), and this integration has already paid three times for
+ * guessing at that. The two that work are included as controls: if a known-good
+ * path also 404s here, the probe itself is wrong, not the tenant.
+ *
+ * Read-only. Each call asks for a single row.
+ */
+async function probeLists(projectId: number) {
+  const company = companyId();
+  const candidates: Array<{ group: string; path: string; query: Record<string, string | number> }> = [
+    { group: 'trades', path: `/rest/v1.0/companies/${company}/trades`, query: {} },
+    { group: 'trades', path: '/rest/v1.0/trades', query: { company_id: company } },
+    { group: 'trades', path: '/rest/v1.0/trades', query: { project_id: projectId } },
+    { group: 'trades', path: `/rest/v1.0/projects/${projectId}/trades`, query: {} },
+    { group: 'trades', path: `/rest/v1.1/companies/${company}/trades`, query: {} },
+
+    { group: 'vendors', path: '/rest/v1.0/vendors', query: { company_id: company } },
+    { group: 'vendors', path: `/rest/v1.0/companies/${company}/vendors`, query: {} },
+    { group: 'vendors', path: `/rest/v1.1/companies/${company}/vendors`, query: {} },
+    { group: 'vendors', path: `/rest/v1.0/projects/${projectId}/vendors`, query: {} },
+
+    // Controls — these already work.
+    { group: 'control', path: '/rest/v1.0/punch_item_types', query: { project_id: projectId } },
+    { group: 'control', path: '/rest/v1.0/locations', query: { project_id: projectId } },
+  ];
+
+  const out = [];
+  for (const c of candidates) {
+    try {
+      const rows = await procoreRequest<unknown>('GET', c.path, {
+        query: { ...c.query, per_page: 1 },
+      });
+      const first = Array.isArray(rows) ? rows[0] : null;
+      out.push({
+        ...c,
+        ok: true,
+        isArray: Array.isArray(rows),
+        sampleKeys: first && typeof first === 'object' ? Object.keys(first).sort() : null,
+        sample: first ?? null,
+      });
+    } catch (err) {
+      out.push({
+        ...c,
+        ok: false,
+        status: err instanceof ProcoreError ? err.status : null,
+        error: err instanceof ProcoreError ? err.body : String(err),
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * What a project user row carries about the company they work for.
+ *
+ * If the vendor list cannot be read company-wide, the project's own directory is
+ * a better source anyway: it is the subs actually on THIS job rather than every
+ * vendor the company has ever used. That only works if the row carries a vendor
+ * id, not just a name — so look, rather than assume.
+ */
+async function probeProjectUserVendor(projectId: number) {
+  const rows = await procoreRequest<Array<Record<string, unknown>>>(
+    'GET',
+    `/rest/v1.0/projects/${projectId}/users`,
+    { query: { per_page: 5 } },
+  );
+  if (!Array.isArray(rows) || !rows.length) return { rows: 0, keys: [], vendors: [] };
+  return {
+    rows: rows.length,
+    keys: Object.keys(rows[0]).sort(),
+    // Only the vendor object — the rest of a directory row is personal data and
+    // has no bearing on the question being asked.
+    vendors: rows.map((r) => r.vendor ?? null),
+  };
+}
+
 export async function inspectHandler(
   request: HttpRequest,
   context: InvocationContext,
@@ -260,6 +342,17 @@ export async function inspectHandler(
   }
 
   const punchItemId = Number(request.query.get('punch_item_id') || 0);
+
+  if (request.query.get('lists')) {
+    const [lists, projectUsers, fabricVendors] = await Promise.all([
+      probeLists(projectId),
+      probeProjectUserVendor(projectId).catch((err) => ({ error: String(err) })),
+      fabricConfigured()
+        ? findVendorTables().catch((err) => ({ error: String(err) }))
+        : Promise.resolve({ error: 'Fabric is not configured on this deployment.' }),
+    ]);
+    return json({ projectId, lists, projectUsers, fabricVendors });
+  }
 
   if (request.query.get('uploads')) {
     return json({ projectId, uploads: await probeUploads(projectId) });

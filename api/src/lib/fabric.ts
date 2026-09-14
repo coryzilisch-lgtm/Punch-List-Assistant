@@ -234,3 +234,46 @@ export async function fabricSyncedAt(): Promise<string | null> {
     return null;
   }
 }
+
+/**
+ * Look for a vendor list in whatever Fabric database this app is pointed at.
+ *
+ * The Vendor Compliance tool keeps one, and the subs on a job are exactly the
+ * companies a punch item gets assigned to — but a vendor list is only useful
+ * here if it carries **Procore's** vendor id. Procore will not accept the
+ * compliance tool's own key, and an id that looks plausible and belongs to a
+ * different system is worse than no list at all: it would assign items to the
+ * wrong company silently.
+ *
+ * So this reports what exists rather than assuming a schema — which table, which
+ * columns, and whether any column looks like a Procore id.
+ */
+export async function findVendorTables(): Promise<
+  Array<{ table: string; columns: string[]; procoreIdColumns: string[]; rows: number | null }>
+> {
+  const rows = await query<{ TABLE_SCHEMA: string; TABLE_NAME: string; COLUMN_NAME: string }>(
+    `SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS ` +
+      `WHERE TABLE_NAME LIKE '%vendor%' OR TABLE_NAME LIKE '%subcontractor%' ` +
+      `OR TABLE_NAME LIKE '%compan%'`,
+  );
+
+  const byTable = new Map<string, string[]>();
+  for (const r of rows) {
+    const key = `${r.TABLE_SCHEMA}.${r.TABLE_NAME}`;
+    byTable.set(key, [...(byTable.get(key) ?? []), r.COLUMN_NAME]);
+  }
+
+  const out = [];
+  for (const [table, columns] of byTable) {
+    const procoreIdColumns = columns.filter((c) => /procore/i.test(c) && /id$/i.test(c));
+    let count: number | null = null;
+    try {
+      const [row] = await query<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`);
+      count = row?.n ?? null;
+    } catch {
+      // A table we cannot count is still worth reporting by name and shape.
+    }
+    out.push({ table, columns: columns.sort(), procoreIdColumns, rows: count });
+  }
+  return out.sort((a, b) => a.table.localeCompare(b.table));
+}

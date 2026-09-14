@@ -518,3 +518,35 @@ back. Both are one commit away in history if wanted.
 behalf of a user* are independent. The iframe was never in the way of per-user
 OAuth — that is about who Procore records as the creator, and works the same in a
 tab. The write-up of that build is in `docs/procore-oauth.md` and still stands.
+
+## "Some dropdowns will be empty" — Vendors and Trades 404
+
+A 404 on a list endpoint means the **path** is wrong, not that the data is
+missing. Procore is inconsistent about whether a company-scoped collection is
+nested (`/companies/{id}/thing`) or flat with a query parameter
+(`/thing?company_id=`) — the same inconsistency that hid the curated project team
+for two sessions in the sibling repo, where the nested form answered emptily and
+the flat one was correct.
+
+`GET /api/inspect?project_id=<id>&lists=1` tries the candidates and reports what
+each one answered. Punch item types and locations are included as **controls**:
+they already work, so if they also 404 in the probe then the probe is wrong
+rather than the tenant.
+
+The response also carries two fallbacks worth knowing about before changing a
+path:
+
+- **`projectUsers`** — the `vendor` object on the project's own directory rows.
+  If it carries an id, the vendor list can come from the project itself, which is
+  better than the company-wide list anyway: the subs actually on this job, not
+  every vendor the company has ever used.
+- **`fabricVendors`** — vendor-shaped tables in the Fabric database this app is
+  already pointed at, with their columns and row counts.
+
+⚠️ **A vendor list is only usable here if it carries Procore's vendor id.** The
+Vendor Compliance tool keeps its own keys, and Procore will not accept them. An
+id that looks plausible but belongs to another system is worse than no list: it
+would assign punch items to the wrong company, silently, which is the exact class
+of failure this integration has already hit three times. The probe reports which
+columns look like Procore ids (`%procore%id`) so that can be checked rather than
+assumed.
