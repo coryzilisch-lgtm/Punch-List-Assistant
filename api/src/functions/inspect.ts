@@ -9,6 +9,7 @@ import {
   ProcoreError,
   procoreConfigured,
   procoreRequest,
+  procoreRequestCount,
 } from '../lib/procore';
 import { fabricConfigured, findVendorTables } from '../lib/fabric';
 
@@ -394,7 +395,10 @@ export async function inspectHandler(
         },
       } : { error: 'The project punch list configuration could not be read.' }));
 
-    return json({ projectId, resolved, lists, projectUsers, fabricVendors });
+    // The probe is deliberately the most expensive call in the app — it sweeps
+    // every candidate. Reporting the count keeps that honest, and makes the cost
+    // of the endpoints it exercises measurable rather than argued about.
+    return json({ projectId, resolved, requests: procoreRequestCount(), lists, projectUsers, fabricVendors });
   }
 
   if (request.query.get('uploads')) {

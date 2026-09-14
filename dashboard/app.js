@@ -370,13 +370,14 @@ async function selectProject(id) {
   $('readiness-card').style.display = 'block';
   $('readiness').innerHTML = '<div class="muted">Checking Procore access…</div>';
 
-  // Config and probe are independent; run them together so the check is quick.
-  const [config, probe] = await Promise.allSettled([
-    api(`/api/projects/${S.project.id}/config`),
-    api(`/api/probe?project_id=${S.project.id}`),
-  ]);
+  // ONE call, not two. These used to run in parallel — but the probe builds the
+  // same project configuration the config endpoint does, so picking a project
+  // paid for ~7 Procore requests twice over, simultaneously, against a quota
+  // shared with the Safety Dashboard ingest. Two of them came back 429 the first
+  // time it was measured. The probe now carries the config in its reply.
+  const [probe] = await Promise.allSettled([api(`/api/probe?project_id=${S.project.id}`)]);
 
-  if (config.status === 'fulfilled') S.config = config.value;
+  if (probe.status === 'fulfilled' && probe.value.config) S.config = probe.value.config;
 
   let html = '';
   if (probe.status === 'fulfilled') {

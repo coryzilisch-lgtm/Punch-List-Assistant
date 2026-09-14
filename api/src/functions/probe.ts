@@ -3,10 +3,11 @@ import { errorResponse, guarded, json } from '../lib/http';
 import {
   companyId,
   getProjectPunchConfig,
-  listPunchItems,
   ProcoreError,
   procoreConfigured,
   procoreRequest,
+  procoreRequestCount,
+  punchItemAccess,
 } from '../lib/procore';
 import { checkModelAccess, modelConfig } from '../lib/model';
 
@@ -81,12 +82,22 @@ export async function probeHandler(
   // 2. Can we READ the punch list tool on this project? A 403 here means the
   //    service account lacks the Punch List tool permission, which is the exact
   //    thing that would break the push at the end.
+  //
+  //    This asks for ONE row and reads Procore's `Total` header rather than
+  //    paging the whole list to print a count — on a project with 800 items that
+  //    was 8 requests to answer a yes/no question, every time somebody picked a
+  //    project. The header also catches the case a count alone cannot: rows
+  //    withheld by permission look exactly like rows that do not exist.
   try {
-    const items = await listPunchItems(projectId);
+    const access = await punchItemAccess(projectId);
     checks.push({
       name: 'Punch list read access',
-      ok: true,
-      detail: `Readable — project currently has ${items.length} punch item(s).`,
+      ok: !access.withheld,
+      detail: access.withheld
+        ? `Procore reports ${access.total} punch item(s) on this project but returned none. ` +
+          'That is a permission filter, not an empty list — the service account can see the tool ' +
+          'but not its contents.'
+        : `Readable — project currently has ${access.total ?? 'an unknown number of'} punch item(s).`,
     });
   } catch (err) {
     checks.push({
@@ -100,8 +111,9 @@ export async function probeHandler(
   }
 
   // 3. Which dropdowns will actually have values?
+  let config: Awaited<ReturnType<typeof getProjectPunchConfig>> | null = null;
   try {
-    const config = await getProjectPunchConfig(projectId);
+    config = await getProjectPunchConfig(projectId);
     const onProject = config.vendors.filter((v) => v.onProject).length;
     const parts = [
       `${config.punchItemTypes.length} type(s)`,
@@ -148,7 +160,19 @@ export async function probeHandler(
       'Not tested. Procore offers no validate-only mode, so testing a write means creating a real punch item. Push one item first and read the result before sending the rest.',
   });
 
-  return json({ checks, ready: checks.every((c) => c.ok), projectId });
+  // The config rides along so the review screen needs ONE round trip. It used to
+  // call `/api/projects/{id}/config` and this endpoint in parallel, and this
+  // endpoint built its own copy of the same ~7 requests — so picking a project
+  // paid for the config twice, concurrently, against a quota shared with the
+  // Safety Dashboard ingest. `requests` is what that costs now, reported rather
+  // than asserted.
+  return json({
+    checks,
+    ready: checks.every((c) => c.ok),
+    projectId,
+    config,
+    requests: procoreRequestCount(),
+  });
 }
 
 function describe(err: unknown, fallback: string): string {

@@ -627,3 +627,43 @@ Procore's key, proven. `looksLikeProcoreId` rules a column **out**; it never rul
 one in — a short sequence from another system is indistinguishable by shape and
 points at the wrong company, which is the exact class of failure this integration
 has already shipped three times.
+
+
+## The Procore rate budget
+
+Procore allows ~3,600 requests/hour, **company-wide**. This app shares its
+service account with the Safety Dashboard's nightly ingest, so the budget is not
+ours alone — and the first live run of the lists probe proved it, drawing a 429
+on two lookups on a project where the control call had just succeeded.
+
+Selecting a project cost **34 requests** and now costs **7**, measured against
+live-shaped data (190 trades, 30 vendors, 5 types, 40 locations, a 214-person
+directory, 800 punch items):
+
+- **The connection check now carries the configuration.** The review screen used
+  to call `/api/projects/{id}/config` and `/api/probe` in parallel, and the probe
+  built its own copy of the same ~7 requests — paying for the config twice,
+  simultaneously. One round trip now. The config endpoint still exists for direct
+  use.
+- **The read-access check asks for one row, not the whole list.** It was paging
+  every punch item on the project to print a count in a sentence. It now reads
+  Procore's `Total` header, which also catches what a count cannot: rows withheld
+  by permission look exactly like rows that do not exist.
+- **Repeat and concurrent reads share one fetch** (`api/src/lib/cache.ts`), for
+  10 minutes on configuration and 60 seconds on the punch list.
+- **List reads ask for 1000 rows a page** instead of 100.
+
+`GET /api/probe` and `GET /api/inspect` both report `requests` — the number of
+Procore calls that invocation spent. If a change claims to save calls, that
+number is how to check.
+
+⚠️ **Two rules not to undo.** A failed lookup is never cached — caching a 429
+turns one busy moment into a minute of guaranteed failure. And pagination must
+never decide "that was the last page" from `rows.length < perPage` alone: asking
+for 1000 from an endpoint capped at 100 makes the first page look short, which
+would silently truncate an 800-item punch list to its first 100 and present it as
+complete.
+
+A push is ~2 requests per item, ~4 with send, and is deliberately left alone: the
+read-backs after each write are the only thing standing between this app and the
+silent-failure mode it has already hit three times.

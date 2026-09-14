@@ -200,6 +200,53 @@ key, proven. `looksLikeProcoreId` rules a column **out**; it never rules one in 
 a five-digit sequence from another system is indistinguishable by shape and
 points at the wrong company.
 
+## The Procore rate budget
+
+Procore allows ~3,600 requests/hour and the limit is **company-wide**. This app's
+service account is the same one the Safety Dashboard's nightly ingest uses, so
+the budget is shared: a burst here can be throttled by work nobody in this app
+started, and vice versa. Measured, not asserted — `/api/probe` and
+`/api/inspect` both report `requests`, the count for that invocation.
+
+**Selecting a project: 34 requests → 7** (measured against live-shaped data: 190
+trades, 30 vendors, 5 types, 40 locations, a 214-person directory, 800 punch
+items).
+
+| Fix | Why it was costing |
+|---|---|
+| The probe returns the config | The dashboard called `/api/projects/{id}/config` **and** `/api/probe` in parallel, and the probe built its own copy of the same ~7 requests. One round trip now. |
+| `punchItemAccess()` for the read check | The check paged **every** punch item to print a count in a sentence — 9 requests to answer yes/no. One request, with `Total` from the header. |
+| `cached()` with in-flight dedup | Two endpoints wanting the same thing at the same moment share one fetch. A result cache alone could not help: neither call had finished when the other started. |
+| Page size 1000 on the list reads | 190 trades and a 214-person directory were 5 requests at 100 a page. |
+| Discovery pages candidates directly | It used to probe with `per_page=1` and then re-fetch the winner — double cost for the common case. |
+
+Three rules that keep it honest:
+
+1. **A failure is never cached.** Caching one turns a transient 429 into a
+   guaranteed minute of failure — the same mistake the write chains make when
+   they record a rate limit as a broken contract. `ProjectPunchConfig.degraded`
+   exists for the harder version of this: the config never *rejects* (each lookup
+   softens to an empty list), so a rate-limited load looks like a good answer to
+   a cache and would be served for ten minutes.
+2. **⚠️ Never end pagination on `rows.length < perPage` alone.** That reads the
+   SERVER's page size as if it were ours: ask for 1000 from an endpoint capped at
+   100 and the first short page looks like the end, silently truncating an
+   800-item punch list to its first 100 — a wrong answer delivered as a complete
+   one. `paginateWithBudget` follows Procore's **`Total`** header when present
+   and only falls back to the row count when it is absent. That is what makes
+   asking for a big page safe.
+3. **`listPunchItems()` is the most expensive read in the app.** Only the
+   recovery sweep and the inspect survey need every row. Anything asking "can we
+   read this" wants `punchItemAccess()`.
+
+**A push is ~2 requests per item, or ~4 with send** (create, read-back, and for a
+send: the workflow write plus its read-back). That is deliberately NOT optimised.
+The read-backs are the safety property — Procore has answered 200 and stored
+nothing three times — and trading them for rate would reintroduce exactly the bug
+class this repo has already paid for. A 60-item list with send is ~240 requests,
+which is fine against 3,600/hour; the thing to avoid is running one during the
+Safety Dashboard's nightly ingest.
+
 ## Known gotchas
 
 - **SWA managed Functions are killed at 45 seconds**, with no error the app can

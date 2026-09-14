@@ -22,6 +22,8 @@
  * from memory (including in this comment) as a hypothesis until then.
  */
 
+import { bust, cached as memoized, CONFIG_TTL_MS, LIST_TTL_MS } from './cache';
+
 const LOGIN_BASE = process.env.PROCORE_LOGIN_BASE_URL || 'https://login.procore.com';
 const API_BASE = process.env.PROCORE_API_BASE_URL || 'https://api.procore.com';
 
@@ -153,6 +155,23 @@ async function readBody(res: Response): Promise<unknown> {
 
 // ── Request helpers ─────────────────────────────────────────────────────────
 
+/**
+ * How many requests this invocation has spent, so the cost is measurable.
+ *
+ * "Be efficient with the rate limit" is unfalsifiable without a number. Every
+ * request increments this, `/api/probe` and `/api/inspect` report it, and a
+ * change that claims to save calls can be checked rather than believed.
+ */
+let requestsMade = 0;
+
+export function procoreRequestCount(): number {
+  return requestsMade;
+}
+
+export function resetProcoreRequestCount(): void {
+  requestsMade = 0;
+}
+
 export interface RequestOptions {
   query?: Record<string, string | number | boolean | undefined>;
   body?: unknown;
@@ -166,6 +185,15 @@ export interface RequestOptions {
    * integration's service account.
    */
   headers?: Record<string, string>;
+  /**
+   * Called with the response headers on a successful reply.
+   *
+   * Exists for Procore's `Total` header, which is the only way to tell "this
+   * project has no punch items" from "this account is not allowed to see them" —
+   * a list endpoint answers 200 with an empty array for both. That distinction
+   * hid private Observations from the Safety Dashboard for weeks.
+   */
+  onHeaders?: (headers: Headers) => void;
 }
 
 export async function procoreRequest<T = unknown>(
@@ -203,6 +231,7 @@ export async function procoreRequest<T = unknown>(
 
     let res: Response;
     try {
+      requestsMade += 1;
       res = await fetch(url.toString(), { method, headers, body: payload });
     } catch (err) {
       // Network-level failure. Retry with backoff; a socket reset mid-run
@@ -212,7 +241,10 @@ export async function procoreRequest<T = unknown>(
       continue;
     }
 
-    if (res.ok) return (await readBody(res)) as T;
+    if (res.ok) {
+      opts.onHeaders?.(res.headers);
+      return (await readBody(res)) as T;
+    }
 
     const body = await readBody(res);
 
@@ -327,11 +359,19 @@ export async function paginateWithBudget<T = unknown>(
 ): Promise<{ rows: T[]; truncated: boolean }> {
   const out: T[] = [];
   const started = Date.now();
+  let total: number | null = null;
 
   for (let page = 1; page <= 100; page++) {
     const body = await procoreRequest<unknown>('GET', path, {
       ...opts,
       query: { ...opts.query, page, per_page: perPage },
+      onHeaders: (h) => {
+        opts.onHeaders?.(h);
+        if (total === null) {
+          const raw = Number(h.get('Total') ?? h.get('total'));
+          if (Number.isFinite(raw) && raw >= 0) total = raw;
+        }
+      },
     });
     const rows: T[] = Array.isArray(body)
       ? (body as T[])
@@ -339,7 +379,21 @@ export async function paginateWithBudget<T = unknown>(
         ? ((body as { data: T[] }).data)
         : [];
     out.push(...rows);
-    if (rows.length < perPage) return { rows: out, truncated: false };
+
+    // An empty page is the end, whatever anything else claims.
+    if (rows.length === 0) return { rows: out, truncated: false };
+
+    // ⚠️ Do NOT decide "that was the last page" from `rows.length < perPage`
+    // alone. That reads the SERVER's page size as if it were ours: ask for 1000
+    // from an endpoint capped at 100 and the first short page looks like the
+    // end, silently truncating an 800-item punch list to its first 100 — a
+    // wrong answer delivered as a complete one, which is this integration's
+    // recurring failure shape. Procore's `Total` header is the authority when
+    // it is present; the row count is only the fallback when it is not.
+    if (total !== null ? out.length >= total : rows.length < perPage) {
+      return { rows: out, truncated: false };
+    }
+
     if (budgetMs && Date.now() - started > budgetMs) {
       return { rows: out, truncated: true };
     }
@@ -372,6 +426,10 @@ export interface ProcoreProject {
  * closed job ever genuinely needs an import.
  */
 export async function listProjects(): Promise<{ projects: ProcoreProject[]; truncated: boolean }> {
+  return memoized('projects', CONFIG_TTL_MS, loadProjects);
+}
+
+async function loadProjects(): Promise<{ projects: ProcoreProject[]; truncated: boolean }> {
   const status = process.env.PUNCH_PROJECT_STATUS || 'Active';
   const { rows, truncated } = await paginateWithBudget<ProcoreProject>(
     '/rest/v1.1/projects',
@@ -523,6 +581,16 @@ export interface ListResolution {
 const LIST_BUDGET_MS = 12_000;
 
 /**
+ * Requested page size for the review-screen lookups.
+ *
+ * 190 trades and a 214-person directory are three requests at 100 a page and one
+ * each at 1000. Asking for more than Procore serves is safe now that pagination
+ * follows the `Total` header rather than inferring the end from a short page —
+ * if the endpoint caps lower, the loop simply continues as it did before.
+ */
+const CONFIG_PAGE = 1000;
+
+/**
  * Remember what answered, for the same reason the write chains do.
  *
  * A config load is one request, but the review screen reloads it per project and
@@ -574,7 +642,7 @@ export async function resolveList<T extends NamedRef>(
    * run of the probe drew a 429 on two other lookups.
    */
   const read = (candidate: ListCandidate) =>
-    paginateWithBudget<T>(candidate.path, { query: candidate.query }, 100, remaining());
+    paginateWithBudget<T>(candidate.path, { query: candidate.query }, CONFIG_PAGE, remaining());
 
   const remembered = listMemo.get(key);
 
@@ -658,6 +726,16 @@ export interface ProjectPunchConfig {
    * a wrong path reported as missing data.
    */
   sources: Record<string, string>;
+  /**
+   * True when a lookup failed for a reason that will pass — a 429, a 5xx.
+   *
+   * This exists to keep such a result OUT of the cache. `getProjectPunchConfig`
+   * never rejects (each lookup degrades to an empty list), so a rate-limited
+   * load looks like a perfectly good answer to a cache and would be served for
+   * ten minutes — turning one busy moment into a dropdown that stays empty long
+   * after Procore recovered. Reloading has to be able to fix it.
+   */
+  degraded: boolean;
 }
 
 interface DirectoryUser {
@@ -739,8 +817,33 @@ export function mergeVendors(
   return out;
 }
 
+/**
+ * Everything the review dropdowns need, fetched once per project.
+ *
+ * This is ~7 requests (types, locations, trades over two pages, vendors, and the
+ * project directory over several), and selecting a project used to pay for it
+ * **twice**: the dashboard fired `/api/projects/{id}/config` and `/api/probe` in
+ * parallel, and the probe built its own copy. Two of those requests came back
+ * 429 on the first live run.
+ *
+ * The cache deduplicates both the repeat and the race — parallel callers join
+ * one in-flight fetch rather than starting two. The dashboard now makes a single
+ * call as well, so this is belt and braces; the belt matters because SWA can run
+ * the two on different instances.
+ */
 export async function getProjectPunchConfig(projectId: number): Promise<ProjectPunchConfig> {
+  const key = `punch-config:${projectId}`;
+  const config = await memoized(key, CONFIG_TTL_MS, () => loadProjectPunchConfig(projectId));
+  // Concurrent callers still shared the one fetch — that is the expensive part —
+  // but the next reload must go back to Procore rather than being handed the
+  // same rate-limited answer for the rest of the TTL.
+  if (config.degraded) bust(key);
+  return config;
+}
+
+async function loadProjectPunchConfig(projectId: number): Promise<ProjectPunchConfig> {
   const warnings: string[] = [];
+  let degraded = false;
   const sources: Record<string, string> = {};
 
   const soft = async <T>(label: string, fn: () => Promise<T[]>): Promise<T[]> => {
@@ -754,6 +857,7 @@ export async function getProjectPunchConfig(projectId: number): Promise<ProjectP
       // reported both as unavailable — on a project where the probe's own
       // control call had just read a location successfully.
       if (err instanceof ProcoreError && isTransient(err)) {
+        degraded = true;
         warnings.push(
           `${label}: Procore was busy (HTTP ${err.status}) — this is a rate limit, not a missing list. Reload to retry.`,
         );
@@ -806,6 +910,7 @@ export async function getProjectPunchConfig(projectId: number): Promise<ProjectP
       };
     } catch (err) {
       // Transient only — discovery rethrows those rather than recording a verdict.
+      degraded = true;
       return {
         rows: [],
         scope: null,
@@ -816,15 +921,19 @@ export async function getProjectPunchConfig(projectId: number): Promise<ProjectP
 
   const [punchItemTypes, locations, trades, companyVendors, users] = await Promise.all([
     soft('Punch item types', () =>
-      procorePaginate<NamedRef>('/rest/v1.0/punch_item_types', { query: { project_id: projectId } }),
+      procorePaginate<NamedRef>(
+        '/rest/v1.0/punch_item_types',
+        { query: { project_id: projectId } },
+        CONFIG_PAGE,
+      ),
     ),
     soft('Locations', () =>
-      procorePaginate<NamedRef>('/rest/v1.0/locations', { query: { project_id: projectId } }),
+      procorePaginate<NamedRef>('/rest/v1.0/locations', { query: { project_id: projectId } }, CONFIG_PAGE),
     ),
     discovered('trades', 'Trades'),
     discovered('vendors', 'Vendors'),
     soft('Project users', () =>
-      procorePaginate<DirectoryUser>(`/rest/v1.0/projects/${projectId}/users`, {}),
+      procorePaginate<DirectoryUser>(`/rest/v1.0/projects/${projectId}/users`, {}, CONFIG_PAGE),
     ),
   ]);
 
@@ -862,6 +971,7 @@ export async function getProjectPunchConfig(projectId: number): Promise<ProjectP
     })),
     warnings,
     sources,
+    degraded,
   };
 }
 
@@ -1638,8 +1748,63 @@ export function isUnsentImport(
 }
 
 /** Read punch items back — used by the probe and by duplicate detection. */
+/**
+ * Every punch item on a project.
+ *
+ * ⚠️ This is the most expensive read in the app and the easiest to reach for. A
+ * project with 800 punch items is 8 requests, and the unbudgeted version could
+ * walk 100 pages. Only the callers that genuinely need every row should use it —
+ * the recovery sweep, which has to find OUR unsent drafts among everyone's, and
+ * the inspect survey, whose whole job is reading many rows.
+ *
+ * Cached briefly: selecting a project used to fetch this twice in one page load,
+ * once for the connection check and once for the unsent-imports sweep.
+ *
+ * If you only need to know whether the tool is READABLE, call
+ * `punchItemAccess()` — one request instead of N.
+ */
 export async function listPunchItems(projectId: number): Promise<Array<Record<string, unknown>>> {
-  return procorePaginate<Record<string, unknown>>('/rest/v1.1/punch_items', {
-    query: { project_id: projectId },
+  return memoized(`punch-items:${projectId}`, LIST_TTL_MS, () =>
+    procorePaginate<Record<string, unknown>>(
+      '/rest/v1.1/punch_items',
+      { query: { project_id: projectId } },
+      // Ask for a big page. If Procore caps it lower, the `Total` header keeps
+      // pagination going correctly — which is what makes asking safe at all.
+      PUNCH_LIST_PAGE,
+      PUNCH_LIST_BUDGET_MS,
+    ),
+  );
+}
+
+/** A punch list long enough to outlast this is truncated rather than killing the Function. */
+const PUNCH_LIST_BUDGET_MS = 15_000;
+/** Requested page size for the full punch list; the server may serve less. */
+const PUNCH_LIST_PAGE = 1000;
+
+/**
+ * Can this account read the project's punch list, and how many items are there?
+ *
+ * The connection check used `listPunchItems` — paging every item on the project
+ * to print a count in a sentence. One request answers both questions instead,
+ * because Procore returns the row count in the **`Total`** header.
+ *
+ * That header is also the only way to tell an empty tool from a filtered one:
+ * `total > 0` with no rows back means the account is being denied rows, not that
+ * the project has none. A list endpoint answers 200 either way, and reading that
+ * zero as "nothing here" is how private Observations hid from the Safety
+ * Dashboard.
+ */
+export async function punchItemAccess(
+  projectId: number,
+): Promise<{ readable: true; total: number | null; returned: number; withheld: boolean }> {
+  let total: number | null = null;
+  const rows = await procoreRequest<unknown>('GET', '/rest/v1.1/punch_items', {
+    query: { project_id: projectId, per_page: 1 },
+    onHeaders: (h) => {
+      const raw = Number(h.get('Total') ?? h.get('total'));
+      total = Number.isFinite(raw) ? raw : null;
+    },
   });
+  const returned = Array.isArray(rows) ? rows.length : 0;
+  return { readable: true, total, returned, withheld: (total ?? 0) > 0 && returned === 0 };
 }
