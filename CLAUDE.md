@@ -200,6 +200,34 @@ key, proven. `looksLikeProcoreId` rules a column **out**; it never rules one in 
 a five-digit sequence from another system is indistinguishable by shape and
 points at the wrong company.
 
+## The name / company picker
+
+The assignee and company fields are a type-ahead over the project directory, and
+it has had two bugs, both invisible to a syntax check and both now covered by
+`tools/dashboard-test/combo.test.mjs`.
+
+**It matches on the COMPANY as well as the name.** On a punch list you usually
+know which sub owns the item before you know which of their people to name, so
+typing "Zeta Roofing" narrows to Zeta's crew. Every term must hit somewhere
+across name + company, so "zeta mike" finds Mike at Zeta Roofing. A row matching
+on its **name** is ranked above one matching only through its company — typing
+"smith" offers Dave Smith before the six people at Smith Electric — and the
+company line is highlighted too, so a row that matched on company does not read
+as a stray result.
+
+⚠️ **The scroll listener is in the CAPTURE phase**, which means it sees scroll
+events from every element — including the popup itself, which is
+`max-height: 300px; overflow-y: auto`. Closing unconditionally meant the list
+shut the moment you tried to scroll it, so on a 200-person directory everything
+past the first dozen names was unreachable. A scroll **inside** the popup is
+someone reading it; the handler ignores those, follows the input on any other
+scroll, and gives up only once the input has left the screen.
+
+Two smaller things worth not breaking: the "— None —" row carries `data-id=""`
+(which is why the keyboard handler treats index 0 as the clear row), and
+`highlight()` wraps matches in `<mark>`, so the name is several text nodes —
+reading it with `firstChild` returns only the part before the first match.
+
 ## The Procore rate budget
 
 Procore allows ~3,600 requests/hour and the limit is **company-wide**. This app's
@@ -287,6 +315,22 @@ Safety Dashboard's nightly ingest.
 cd api && npx tsc --noEmit && npm test    # pretest runs tsc
 node --check dashboard/app.js
 ```
+
+⚠️ **`node --check` only proves the file parses.** It cannot catch a handler that
+does the wrong thing — the sibling Safety Dashboard shipped a page that threw
+before a single handler bound, with a clean syntax check. For anything touching
+dashboard behaviour, run the browser checks too:
+
+```bash
+cd tools/dashboard-test && npm install && npm test
+```
+
+They drive the real `dashboard/` files in headless Chromium. `tools/` is outside
+`app_location`, so none of it deploys or counts against the file cap. `app.js`
+exports one test seam (`__test.setConfig`) for them and nothing else.
+
+**And re-introduce the bug to prove the test catches it.** Both picker bugs below
+were put back and confirmed failing before their fixes were committed.
 
 Commit messages end with:
 

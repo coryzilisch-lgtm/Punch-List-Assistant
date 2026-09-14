@@ -766,13 +766,26 @@ function sortedCompanies(list) {
   });
 }
 
+/** Everything about an option that a typed term may match, lowercased once. */
+function comboHaystack(option) {
+  return `${option.name || ''} ${option.company || ''}`.toLowerCase();
+}
+
+/** 0 when every term is in the name itself, 1 when the company carried the match. */
+function nameMatchRank(option, terms) {
+  const name = String(option.name || '').toLowerCase();
+  return terms.every((t) => name.includes(t)) ? 0 : 1;
+}
+
 /**
  * The grey second line under an option. For a person it is their company; for a
  * company it is whether they are on this job, which is the only thing that
  * distinguishes two otherwise identical vendor names in a long list.
  */
-function comboSub(option) {
-  if (option.company) return `<span class="combo-sub">${esc(option.company)}</span>`;
+function comboSub(option, query = '') {
+  // Highlighted, because a row matched on company alone shows nothing marked in
+  // the name — which reads as a stray result rather than a hit.
+  if (option.company) return `<span class="combo-sub">${highlight(option.company, query)}</span>`;
   if (option.onProject) return '<span class="combo-sub">on this project</span>';
   return '';
 }
@@ -838,11 +851,18 @@ function openNameCombo(input) {
   // Typing filters; opening on the current selection should still show everyone,
   // otherwise the list collapses to the one name already chosen.
   const terms = typed && typed !== selectedLabel.toLowerCase() ? typed.split(/\s+/) : [];
+
+  // Match the COMPANY too, not just the person's name. On a punch list you
+  // usually know which sub owns the item before you know which of their people
+  // to name, so typing "Zeta Roofing" has to narrow the picker to Zeta's crew.
+  // Every term must hit somewhere, so "zeta mike" finds Mike at Zeta Roofing.
   const matches = terms.length
-    ? all.filter((o) => {
-        const hay = o.name.toLowerCase();
-        return terms.every((t) => hay.includes(t));
-      })
+    ? all
+        .filter((o) => terms.every((t) => comboHaystack(o).includes(t)))
+        // A person whose NAME matches outranks one who merely works somewhere
+        // matching: typing "smith" should offer Dave Smith before the six people
+        // at Smith Electric.
+        .sort((a, b) => nameMatchRank(a, terms) - nameMatchRank(b, terms))
     : all;
 
   nameComboState = { input, matches, index: -1 };
@@ -856,17 +876,23 @@ function openNameCombo(input) {
             `<li role="option" id="name-opt-${i}" data-id="${o.id}" aria-selected="false">${highlight(
               o.name,
               terms.join(' '),
-            )}${comboSub(o)}</li>`,
+            )}${comboSub(o, terms.join(' '))}</li>`,
         )
         .join('')
     : `<li class="combo-empty">No match for “${esc(input.value)}”</li>`;
 
+  positionNameCombo(input);
+  popup.hidden = false;
+  input.setAttribute('aria-expanded', 'true');
+}
+
+/** Park the popup under its input, in document coordinates (the popup is absolute). */
+function positionNameCombo(input) {
+  const popup = namePopup();
   const rect = input.getBoundingClientRect();
   popup.style.left = `${rect.left + window.scrollX}px`;
   popup.style.top = `${rect.bottom + window.scrollY + 4}px`;
   popup.style.width = `${rect.width}px`;
-  popup.hidden = false;
-  input.setAttribute('aria-expanded', 'true');
 }
 
 function moveNameCombo(delta) {
@@ -932,8 +958,29 @@ function wireNameCombos() {
     if (li) { e.preventDefault(); commitName(li.dataset.id); }
   });
 
-  // Anchored to the viewport, so it has to follow or be dismissed.
-  window.addEventListener('scroll', () => closeNameCombo(), true);
+  // ⚠️ This listener is in the CAPTURE phase, so it sees scroll events from
+  // every element — including the popup itself, which is `max-height: 300px;
+  // overflow-y: auto`. Closing unconditionally meant the list shut the moment
+  // you tried to scroll it, which on a 200-person directory made everything past
+  // the first dozen names unreachable. A scroll INSIDE the popup is the user
+  // reading it, not leaving it.
+  window.addEventListener(
+    'scroll',
+    (e) => {
+      const { input } = nameComboState;
+      if (!input || namePopup().hidden) return;
+      if (e.target instanceof Node && namePopup().contains(e.target)) return;
+
+      // The popup is positioned in document coordinates, so it rides page scroll
+      // on its own. Any other scrolling container it sits inside does move it out
+      // of line, so follow the input — and give up only once the input itself has
+      // left the screen, where there is nothing left to anchor to.
+      const rect = input.getBoundingClientRect();
+      if (rect.bottom < 0 || rect.top > window.innerHeight) closeNameCombo();
+      else positionNameCombo(input);
+    },
+    true,
+  );
   window.addEventListener('resize', () => closeNameCombo());
 }
 
@@ -1711,5 +1758,23 @@ function preselectFromUrl() {
   if (!S.projects.some((p) => p.id === id)) return;
   chooseProject(id);
 }
+
+/**
+ * Test seam — the smallest thing that makes the name picker drivable.
+ *
+ * The picker has now had two bugs a syntax check cannot see: a filter that only
+ * looked at the person's name, and a capture-phase scroll listener that closed
+ * the very list you were scrolling. Both need a real browser to catch, and a
+ * test that reimplements the picker to test it proves nothing about this file.
+ *
+ * So the page exposes exactly one thing — the ability to seed the config the
+ * picker reads. Everything else the test drives through the real UI.
+ * See `tools/dashboard-test/combo.test.mjs`.
+ */
+export const __test = {
+  setConfig(config) {
+    S.config = config;
+  },
+};
 
 init();
