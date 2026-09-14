@@ -56,7 +56,9 @@ header {
   flex-wrap: wrap;
 }
 
-header .mark { width: 34px; height: 34px; flex: none; }
+/* Height-driven so the logo keeps its 1.45:1 ratio. The brand rules forbid
+   squishing or stretching the mark, and a fixed square would do exactly that. */
+header .mark { height: 30px; width: auto; flex: none; display: block; }
 header h1 { font-size: 17px; color: #fff; }
 header .sub {
   font-size: 12px;
@@ -67,6 +69,35 @@ header .sub {
 }
 header .spacer { flex: 1; }
 header .who { font-size: 12px; color: #cbd5e0; }
+
+/* ── Beta notice ────────────────────────────────────────────────────────── */
+
+.beta {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 9px 20px;
+  background: #fdf5e7;
+  border-bottom: 1px solid #f0dcb4;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--buf-black);
+}
+
+.beta-tag {
+  flex: none;
+  background: var(--buf-orange);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+
+.beta p { margin: 0; }
+.beta a { color: var(--buf-info); font-weight: 600; }
 
 /* ── Step rail ──────────────────────────────────────────────────────────── */
 

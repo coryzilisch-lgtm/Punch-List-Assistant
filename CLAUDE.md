@@ -275,6 +275,29 @@ class this repo has already paid for. A 60-item list with send is ~240 requests,
 which is fine against 3,600/hour; the thing to avoid is running one during the
 Safety Dashboard's nightly ingest.
 
+## Beta notice and branding
+
+A **Beta** strip sits between the header and the step rail, on every screen. It
+says the tool can get things wrong, points at the Review step, and carries a
+`mailto:` to Cory for bug reports.
+
+It is deliberately **not dismissible**. What it asks for — check the items before
+they are written into a live Procore project — applies on every import, not just
+the first one. It is a plain `<p>` with a `<span>` tag, so it still reads
+correctly if `styles.css` is served from cache after a deploy (there is no
+cache-busting on the asset URLs here, unlike the sibling intranet).
+
+The header mark is Buffalo's **Roman Mark** in orange, which is the correct
+colour on a navy background. Two brand rules apply and both are easy to break:
+the mark is **1.45:1 and must never be squished** — hence `height` with
+`width: auto` rather than a square — and it **always faces left**.
+
+`dashboard/buffalo-orange.png` is resized to 240×165 from the 6250px master. That
+is not premature optimisation: the original decodes to roughly **107 MB of
+bitmap** for a 34px slot, which is a real cost on the jobsite LTE these are opened
+on. `width`/`height` are set on the tag so the header cannot reflow while it
+loads.
+
 ## Known gotchas
 
 - **SWA managed Functions are killed at 45 seconds**, with no error the app can
