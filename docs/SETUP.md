@@ -497,56 +497,24 @@ Two bugs made one throttled item look like a whole failed push, both fixed:
   reported the same stale error. Transient failures (429, 5xx, network) now stop
   the chain without recording a verdict.
 
-## Opening the app inside Procore
+## Opening the app inside Procore — not pursued
 
-Two separate URLs in the Procore app manifest, and they are easy to swap by
-mistake:
+Decided against, September 2026. Recorded so the reasoning is here if it comes
+back up.
 
-| Field | Value |
-|---|---|
-| Embedded Full Screen **app URL** | `https://<swa-host>/` — the app itself |
-| OAuth **redirect URI** | `https://<swa-host>/api/procore/callback` |
+Procore renders an installed app in an iframe. This app is gated by Microsoft
+Entra, and Microsoft's sign-in page refuses to be framed exactly as Procore's
+does — so an unauthenticated frame navigates to the login and dies as a browser
+error page. Making it work means either giving up the single Entra gate (letting
+the app shell load anonymously and having the API accept a Procore token
+instead), or embedding a launcher page that opens the real app in a tab.
 
-Pointing the Full Screen component at the callback path produces a browser error
-page inside the Procore frame ("might be temporarily down or moved permanently"),
-because that route is the OAuth landing spot, not the application — and it does
-not exist until the OAuth flow is built.
+Both were built far enough to be sure of the shape; neither is in the tree. The
+launcher and the `frame-ancestors` allowance were reverted once the decision was
+made, rather than left as inert code that only works under a CSP we tightened
+back. Both are one commit away in history if wanted.
 
-The CSP also has to permit the frame. `frame-ancestors` was `'none'`, which
-blocks the embed outright; it now names Procore's origins explicitly rather than
-being removed, so nothing else may frame the app.
-
-**The open question is identity.** The app is gated by Entra, and Microsoft's
-login page refuses to render in an iframe just as Procore's does — so if the
-browser does not already carry a valid Static Web Apps auth cookie into the
-frame, the embed will show a blank panel rather than the sign-in screen. Whether
-it does depends on that cookie surviving as third-party in the frame, which is
-worth testing before building anything: point the Full Screen URL at the app root
-and open it in Procore while signed in.
-
-- **It renders** → the embed works on Entra today, and per-user Procore OAuth is
-  then only about attribution (who created the item), not about getting the app
-  on screen.
-- **It is blank, or shows a browser error page** → the Entra redirect is dying in
-  the frame, as expected.
-
-### The launcher — working inside Procore without weakening the gate
-
-Point the Full Screen component at **`/procore-launch`** instead of the app root.
-
-That page is served anonymously and holds nothing worth gating: no data, no API
-calls, no identity — a Buffalo-branded card with one button that opens the real
-app in a top-level tab, where Microsoft sign-in behaves normally. It forwards the
-project id Procore passes on the embedded URL, so the super lands on the right
-job with the picker already filled in.
-
-The alternative was to make the app itself reachable without Entra so a frame
-could render it, which trades a real security boundary for a cosmetic one. The
-launcher keeps one front door and one identity provider, and the only cost is
-that the app opens in a tab rather than inside the panel.
-
-The fuller build — the app running *in* the panel, as the signed-in Procore user
-— is still worth doing, and is unchanged by this: `/api/procore/connect`,
-`/api/procore/callback`, the popup flow via `procore-iframe-helpers`, and an API
-that accepts either a Static Web Apps principal or a verified Procore token. The
-launcher is what works today, not a replacement for that.
+**Worth separating if this returns:** *opening inside Procore* and *acting on
+behalf of a user* are independent. The iframe was never in the way of per-user
+OAuth — that is about who Procore records as the creator, and works the same in a
+tab. The write-up of that build is in `docs/procore-oauth.md` and still stands.

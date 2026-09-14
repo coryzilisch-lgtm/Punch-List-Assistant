@@ -1213,6 +1213,49 @@ export async function createPunchItem(
   };
 }
 
+/**
+ * Which Procore user this integration authenticates as.
+ *
+ * Needed to tell apart the items this app created from the ones people created
+ * in Procore, so a recovery sweep can offer to finish ours without ever touching
+ * somebody else's draft. Memoized for the life of the process — it is a property
+ * of the credentials, and it cannot change while they do not.
+ */
+let serviceAccountIdPromise: Promise<number | null> | null = null;
+
+export function serviceAccountId(): Promise<number | null> {
+  if (!serviceAccountIdPromise) {
+    serviceAccountIdPromise = procoreRequest<{ id?: number }>('GET', '/rest/v1.0/me')
+      .then((me) => (typeof me?.id === 'number' ? me.id : null))
+      .catch(() => {
+        // Never cache a failure: the next call should try again rather than
+        // spend the rest of the process believing it has no identity.
+        serviceAccountIdPromise = null;
+        return null;
+      });
+  }
+  return serviceAccountIdPromise;
+}
+
+/**
+ * A punch item this integration created and never sent.
+ *
+ * Both halves matter. `workflow_status === 'draft'` alone would sweep up drafts a
+ * superintendent is deliberately still working on in Procore, and offering to
+ * send those would be the app reaching past what it was asked to do. Ownership
+ * alone would sweep up items that already went out.
+ */
+export function isUnsentImport(
+  row: Record<string, unknown>,
+  ourUserId: number | null,
+): boolean {
+  if (!ourUserId) return false;
+  const workflow = typeof row.workflow_status === 'string' ? row.workflow_status.toLowerCase() : '';
+  if (workflow !== 'draft') return false;
+  const createdBy = row.created_by as { id?: number } | null | undefined;
+  return createdBy?.id === ourUserId;
+}
+
 /** Read punch items back — used by the probe and by duplicate detection. */
 export async function listPunchItems(projectId: number): Promise<Array<Record<string, unknown>>> {
   return procorePaginate<Record<string, unknown>>('/rest/v1.1/punch_items', {

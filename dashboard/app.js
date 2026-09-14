@@ -21,6 +21,8 @@ const S = {
   projects: [],
   project: null,
   config: null,
+  /** Imports on this project that were created but never sent. */
+  drafts: [],
   fileName: null,
   pdf: null,
   pageStatus: [], // 'pending' | 'busy' | 'done' | 'skip' | 'fail'
@@ -401,6 +403,108 @@ async function selectProject(id) {
 
   $('readiness').innerHTML = html;
   renderBar();
+  loadUnsentDrafts();
+}
+
+/**
+ * Surface imports that were created but never sent.
+ *
+ * The results screen can already retry a send, but only while that push is still
+ * on screen. Close the tab after a push Procore rate limited partway through and
+ * the unsent items vanish from the app — complete, in Draft, in the service
+ * account's court where nobody is looking. Asking Procore on project select
+ * means the app never depends on someone remembering.
+ *
+ * Failure is deliberately silent. This is a safety net beside the main task; a
+ * red banner here would read as a problem with the project the super just
+ * picked, which it is not.
+ */
+async function loadUnsentDrafts() {
+  const card = $('drafts-card');
+  card.style.display = 'none';
+  const project = S.project;
+
+  let data;
+  try {
+    data = await api(`/api/drafts?project_id=${project.id}`);
+  } catch {
+    return;
+  }
+
+  // A project switch mid-request must not paint another job's drafts here.
+  if (S.project?.id !== project.id) return;
+  if (data.unknown || !data.drafts?.length) return;
+
+  S.drafts = data.drafts;
+  card.style.display = 'block';
+  renderUnsentDrafts();
+}
+
+function renderUnsentDrafts() {
+  const n = S.drafts.length;
+  $('drafts').innerHTML =
+    `<p class="hint">These were created on this project by a previous import and never sent, ` +
+    `usually because Procore rate limited the push partway through. They are complete — ` +
+    `photos and assignees included — and sending them is one call each. ` +
+    `<strong>Do not re-import them</strong>, that would create duplicates.</p>` +
+    S.drafts
+      .map(
+        (d) =>
+          `<div class="result-row"><span class="ic">•</span><span>${esc(d.name)}${
+            d.number ? ` <span class="muted">(#${esc(d.number)})</span>` : ''
+          }</span></div>`,
+      )
+      .join('') +
+    `<div style="margin-top:12px"><button class="btn-secondary" id="send-drafts">Send ${n} item${
+      n === 1 ? '' : 's'
+    }</button></div><div id="drafts-status"></div>`;
+  $('send-drafts').addEventListener('click', sendUnsentDrafts);
+}
+
+async function sendUnsentDrafts() {
+  const btn = $('send-drafts');
+  const status = $('drafts-status');
+  btn.disabled = true;
+  btn.textContent = 'Sending…';
+
+  const ids = S.drafts.map((d) => d.id);
+  let sent = 0;
+  const failures = [];
+
+  try {
+    // Batched and sequential: this runs precisely when the quota has already
+    // been exhausted once, so firing everything at once would recreate the
+    // failure it is recovering from.
+    for (let i = 0; i < ids.length; i += 8) {
+      const batch = ids.slice(i, i + 8);
+      status.innerHTML = `<span class="muted">Sending ${i + 1}-${i + batch.length} of ${ids.length}…</span>`;
+      const data = await api('/api/resend', {
+        method: 'POST',
+        body: JSON.stringify({ projectId: S.project.id, punchItemIds: batch }),
+      });
+      for (const r of data.results || []) {
+        if (r.ok) {
+          sent += 1;
+          S.drafts = S.drafts.filter((d) => d.id !== r.punchItemId);
+        } else {
+          failures.push(`#${r.punchItemId}: ${(r.errors || ['failed']).join('; ')}`);
+        }
+      }
+    }
+  } catch (err) {
+    failures.push(err.message || String(err));
+  }
+
+  if (!S.drafts.length && !failures.length) {
+    $('drafts').innerHTML = `<p class="hint">Sent ${sent} item${sent === 1 ? '' : 's'}. Nothing is left in Draft.</p>`;
+    return;
+  }
+
+  // Re-render off what is still stuck, so a second attempt only covers those.
+  renderUnsentDrafts();
+  $('drafts-status').innerHTML = failures.length
+    ? `<span class="muted">Sent ${sent}. Still stuck: ${esc(failures.join(' · '))}</span>`
+    : `<span class="muted">Sent ${sent}.</span>`;
 }
 
 // ── Step 2: upload and read ─────────────────────────────────────────────────
