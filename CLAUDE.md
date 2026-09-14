@@ -24,7 +24,9 @@ Procore punch list
 ```
 
 Deployed to Azure Static Web Apps on push to `main`:
-**nice-grass-0ac50c20f.6.azurestaticapps.net**. Entra sign-in gates the whole app.
+**nice-grass-0ac50c20f.6.azurestaticapps.net**. Entra sign-in gates the whole app —
+see **Who can open this** below, including the reason that sentence was false for
+the app's whole life until 2026-09-14.
 
 ---
 
@@ -72,6 +74,43 @@ nightly sync.
 
 ---
 
+## Who can open this
+
+Single-tenant Entra sign-in, enforced two ways on purpose.
+
+1. **`dashboard/staticwebapp.config.json`** requires `allowedRoles: ["authenticated"]`
+   on `/*` and `/api/*`, and redirects a 401 to `/.auth/login/aad`. The
+   `openIdIssuer` names the Buffalo tenant, so only a Buffalo account can
+   complete sign-in.
+2. **`guarded()` refuses a request with no SWA principal**, in code.
+
+🛑 **The config file must live in the `app_location` folder — `dashboard/`, not
+the repo root.** It sat at the root for the app's entire life while the workflow
+deployed `app_location: ./dashboard`, so SWA never read it and **nothing was
+gated**: the dashboard and every `/api/*` route, including the ones that create
+punch items in live Procore projects, were reachable by anyone with the URL.
+
+Nothing failed, nothing logged, and this very file said the app was gated. That
+is the whole reason for the second enforcement point: a platform rule nobody has
+watched enforce anything is a hypothesis, not a gate. The app's own code now
+refuses anonymous callers regardless of where a config file ends up.
+
+⚠️ **The gate depends on two app settings.** `AAD_CLIENT_ID` and
+`AAD_CLIENT_SECRET` must be present in the Static Web App's **Production**
+environment variables. Without them the Entra redirect cannot complete, and
+because the routes now require an identity, the result is a locked door rather
+than an open one. Check them before wondering why nobody can get in — including
+you.
+
+⚠️ **Every Buffalo account can sign in.** There is no per-person allowlist here,
+unlike the Safety Dashboard's `ADMIN_EMAILS`. Anyone in the tenant who has the
+link can import punch items. If that needs narrowing, an allowlist checked in
+`guarded()` is the place.
+
+A local `func start` has no SWA principal to inject, so it 401s. That is
+deliberate: an environment flag that bypasses an auth check is how auth checks
+get bypassed in production.
+
 ## Repo layout
 
 ```
@@ -83,7 +122,8 @@ api/                            SWA managed Azure Functions (v4 node, TypeScript
   src/lib/model.ts              Anthropic API or Claude on Foundry; reasoning params
   src/lib/http.ts               guarded(), json(), errorResponse()
   src/functions/                one route per file
-dashboard/                      vanilla JS SPA, no build
+dashboard/                      vanilla JS SPA, no build — this is `app_location`
+  staticwebapp.config.json      auth, routes, CSP. MUST be here, not the repo root
   app.js                        state, review screen, name combos, push
   pdf-pipeline.js               pdf.js render + page dispatch
   photo-detect.js               finds and crops the jobsite photos
@@ -277,6 +317,10 @@ Safety Dashboard's nightly ingest.
 
 ## Known gotchas
 
+- **`staticwebapp.config.json` is read from the deployed app folder, not the
+  repo root.** Put it anywhere else and it is silently ignored — no warning, no
+  log, no failed deploy. Auth rules, CSP headers and route rules all quietly do
+  nothing. See **Who can open this**.
 - **SWA managed Functions are killed at 45 seconds**, with no error the app can
   catch — the browser just sees "Backend call failure". This shapes everything:
   one PDF page per request, `paginateWithBudget` on every list, a wall-clock
