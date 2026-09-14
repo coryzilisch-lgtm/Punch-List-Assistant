@@ -22,6 +22,8 @@
  * from memory (including in this comment) as a hypothesis until then.
  */
 
+import { bust, cached as memoized, CONFIG_TTL_MS, LIST_TTL_MS } from './cache';
+
 const LOGIN_BASE = process.env.PROCORE_LOGIN_BASE_URL || 'https://login.procore.com';
 const API_BASE = process.env.PROCORE_API_BASE_URL || 'https://api.procore.com';
 
@@ -153,6 +155,23 @@ async function readBody(res: Response): Promise<unknown> {
 
 // ── Request helpers ─────────────────────────────────────────────────────────
 
+/**
+ * How many requests this invocation has spent, so the cost is measurable.
+ *
+ * "Be efficient with the rate limit" is unfalsifiable without a number. Every
+ * request increments this, `/api/probe` and `/api/inspect` report it, and a
+ * change that claims to save calls can be checked rather than believed.
+ */
+let requestsMade = 0;
+
+export function procoreRequestCount(): number {
+  return requestsMade;
+}
+
+export function resetProcoreRequestCount(): void {
+  requestsMade = 0;
+}
+
 export interface RequestOptions {
   query?: Record<string, string | number | boolean | undefined>;
   body?: unknown;
@@ -166,6 +185,15 @@ export interface RequestOptions {
    * integration's service account.
    */
   headers?: Record<string, string>;
+  /**
+   * Called with the response headers on a successful reply.
+   *
+   * Exists for Procore's `Total` header, which is the only way to tell "this
+   * project has no punch items" from "this account is not allowed to see them" —
+   * a list endpoint answers 200 with an empty array for both. That distinction
+   * hid private Observations from the Safety Dashboard for weeks.
+   */
+  onHeaders?: (headers: Headers) => void;
 }
 
 export async function procoreRequest<T = unknown>(
@@ -203,6 +231,7 @@ export async function procoreRequest<T = unknown>(
 
     let res: Response;
     try {
+      requestsMade += 1;
       res = await fetch(url.toString(), { method, headers, body: payload });
     } catch (err) {
       // Network-level failure. Retry with backoff; a socket reset mid-run
@@ -212,7 +241,10 @@ export async function procoreRequest<T = unknown>(
       continue;
     }
 
-    if (res.ok) return (await readBody(res)) as T;
+    if (res.ok) {
+      opts.onHeaders?.(res.headers);
+      return (await readBody(res)) as T;
+    }
 
     const body = await readBody(res);
 
@@ -327,11 +359,19 @@ export async function paginateWithBudget<T = unknown>(
 ): Promise<{ rows: T[]; truncated: boolean }> {
   const out: T[] = [];
   const started = Date.now();
+  let total: number | null = null;
 
   for (let page = 1; page <= 100; page++) {
     const body = await procoreRequest<unknown>('GET', path, {
       ...opts,
       query: { ...opts.query, page, per_page: perPage },
+      onHeaders: (h) => {
+        opts.onHeaders?.(h);
+        if (total === null) {
+          const raw = Number(h.get('Total') ?? h.get('total'));
+          if (Number.isFinite(raw) && raw >= 0) total = raw;
+        }
+      },
     });
     const rows: T[] = Array.isArray(body)
       ? (body as T[])
@@ -339,7 +379,21 @@ export async function paginateWithBudget<T = unknown>(
         ? ((body as { data: T[] }).data)
         : [];
     out.push(...rows);
-    if (rows.length < perPage) return { rows: out, truncated: false };
+
+    // An empty page is the end, whatever anything else claims.
+    if (rows.length === 0) return { rows: out, truncated: false };
+
+    // ⚠️ Do NOT decide "that was the last page" from `rows.length < perPage`
+    // alone. That reads the SERVER's page size as if it were ours: ask for 1000
+    // from an endpoint capped at 100 and the first short page looks like the
+    // end, silently truncating an 800-item punch list to its first 100 — a
+    // wrong answer delivered as a complete one, which is this integration's
+    // recurring failure shape. Procore's `Total` header is the authority when
+    // it is present; the row count is only the fallback when it is not.
+    if (total !== null ? out.length >= total : rows.length < perPage) {
+      return { rows: out, truncated: false };
+    }
+
     if (budgetMs && Date.now() - started > budgetMs) {
       return { rows: out, truncated: true };
     }
@@ -372,6 +426,10 @@ export interface ProcoreProject {
  * closed job ever genuinely needs an import.
  */
 export async function listProjects(): Promise<{ projects: ProcoreProject[]; truncated: boolean }> {
+  return memoized('projects', CONFIG_TTL_MS, loadProjects);
+}
+
+async function loadProjects(): Promise<{ projects: ProcoreProject[]; truncated: boolean }> {
   const status = process.env.PUNCH_PROJECT_STATUS || 'Active';
   const { rows, truncated } = await paginateWithBudget<ProcoreProject>(
     '/rest/v1.1/projects',
@@ -448,6 +506,17 @@ export interface ListCandidate {
   label: string;
   path: string;
   query: Record<string, string | number>;
+  /**
+   * `project` means every row this path returns is already scoped to the job.
+   *
+   * This is what decides the `onProject` flag, and it matters more than it
+   * looks: `/projects/{id}/vendors` answers with the 30 subs on the job, where
+   * the company-wide list is every vendor Buffalo has ever contracted. Deriving
+   * "on this project" from the directory instead got it exactly backwards on the
+   * live tenant — the directory of project 603781 is Buffalo's own staff, so the
+   * GC floated to the top of the picker above the actual subs.
+   */
+  scope: 'project' | 'company';
 }
 
 /**
@@ -459,21 +528,28 @@ export interface ListCandidate {
  */
 export function listCandidates(group: 'trades' | 'vendors', projectId: number): ListCandidate[] {
   const company = companyId();
+  // Order matters: the first candidate is the one the tenant answered on
+  // 2026-09-14, so steady-state discovery costs one request, not five. The rest
+  // stay as the chain that finds the path again if Procore moves it.
   if (group === 'trades') {
     return [
-      { label: 'GET /rest/v1.0/companies/{company}/trades', path: `/rest/v1.0/companies/${company}/trades`, query: {} },
-      { label: 'GET /rest/v1.0/trades?company_id', path: '/rest/v1.0/trades', query: { company_id: company } },
-      { label: 'GET /rest/v1.0/projects/{project}/trades', path: `/rest/v1.0/projects/${projectId}/trades`, query: {} },
-      { label: 'GET /rest/v1.0/trades?project_id', path: '/rest/v1.0/trades', query: { project_id: projectId } },
-      { label: 'GET /rest/v1.1/companies/{company}/trades', path: `/rest/v1.1/companies/${company}/trades`, query: {} },
+      // ✅ confirmed: 190 trades. The flat forms all 404 for trades.
+      { label: 'GET /rest/v1.0/companies/{company}/trades', path: `/rest/v1.0/companies/${company}/trades`, query: {}, scope: 'company' },
+      { label: 'GET /rest/v1.0/trades?company_id', path: '/rest/v1.0/trades', query: { company_id: company }, scope: 'company' },
+      { label: 'GET /rest/v1.0/projects/{project}/trades', path: `/rest/v1.0/projects/${projectId}/trades`, query: {}, scope: 'project' },
+      { label: 'GET /rest/v1.0/trades?project_id', path: '/rest/v1.0/trades', query: { project_id: projectId }, scope: 'project' },
+      { label: 'GET /rest/v1.1/companies/{company}/trades', path: `/rest/v1.1/companies/${company}/trades`, query: {}, scope: 'company' },
     ];
   }
   return [
-    { label: 'GET /rest/v1.0/projects/{project}/vendors', path: `/rest/v1.0/projects/${projectId}/vendors`, query: {} },
-    { label: 'GET /rest/v1.0/vendors?project_id', path: '/rest/v1.0/vendors', query: { project_id: projectId } },
-    { label: 'GET /rest/v1.0/companies/{company}/vendors', path: `/rest/v1.0/companies/${company}/vendors`, query: {} },
-    { label: 'GET /rest/v1.0/vendors?company_id', path: '/rest/v1.0/vendors', query: { company_id: company } },
-    { label: 'GET /rest/v1.1/companies/{company}/vendors', path: `/rest/v1.1/companies/${company}/vendors`, query: {} },
+    // ✅ confirmed: 30 vendors, the subs on the job. Vendors is the mirror image
+    // of trades — the NESTED company form 404s and the flat one works, which is
+    // precisely why neither path could be reasoned out and both had to be asked.
+    { label: 'GET /rest/v1.0/projects/{project}/vendors', path: `/rest/v1.0/projects/${projectId}/vendors`, query: {}, scope: 'project' },
+    { label: 'GET /rest/v1.0/vendors?project_id', path: '/rest/v1.0/vendors', query: { project_id: projectId }, scope: 'project' },
+    { label: 'GET /rest/v1.0/vendors?company_id', path: '/rest/v1.0/vendors', query: { company_id: company }, scope: 'company' },
+    { label: 'GET /rest/v1.0/companies/{company}/vendors', path: `/rest/v1.0/companies/${company}/vendors`, query: {}, scope: 'company' },
+    { label: 'GET /rest/v1.1/companies/{company}/vendors', path: `/rest/v1.1/companies/${company}/vendors`, query: {}, scope: 'company' },
   ];
 }
 
@@ -503,6 +579,16 @@ export interface ListResolution {
  * truncated rather than taking the whole request down with it.
  */
 const LIST_BUDGET_MS = 12_000;
+
+/**
+ * Requested page size for the review-screen lookups.
+ *
+ * 190 trades and a 214-person directory are three requests at 100 a page and one
+ * each at 1000. Asking for more than Procore serves is safe now that pagination
+ * follows the `Total` header rather than inferring the end from a short page —
+ * if the endpoint caps lower, the loop simply continues as it did before.
+ */
+const CONFIG_PAGE = 1000;
 
 /**
  * Remember what answered, for the same reason the write chains do.
@@ -536,6 +622,28 @@ export async function resolveList<T extends NamedRef>(
   projectId: number,
 ): Promise<{ rows: T[]; resolution: ListResolution }> {
   const key = `${group}:${projectId}`;
+
+  // One deadline for the WHOLE chain, not one per candidate. Five candidates
+  // with twelve seconds each is sixty seconds, and the Function is killed at
+  // forty-five — a budget that can be exceeded by walking the chain is not a
+  // budget. A floor of one second keeps a nearly-spent budget from being passed
+  // as `0`, which `paginateWithBudget` reads as "unlimited".
+  const deadline = Date.now() + LIST_BUDGET_MS;
+  const remaining = () => Math.max(1_000, deadline - Date.now());
+
+  /**
+   * Page a candidate directly rather than probing it first.
+   *
+   * The first version asked each candidate for one row and then re-fetched the
+   * winner in full, which doubled the cost of the common case. A wrong path
+   * costs the same single request either way, and the right one hands back the
+   * rows on the same call — so the probe step bought nothing. That mattered:
+   * this quota is shared with the Safety Dashboard ingest, and the first live
+   * run of the probe drew a 429 on two other lookups.
+   */
+  const read = (candidate: ListCandidate) =>
+    paginateWithBudget<T>(candidate.path, { query: candidate.query }, CONFIG_PAGE, remaining());
+
   const remembered = listMemo.get(key);
 
   // A remembered candidate is re-read, not re-discovered: the path cannot change
@@ -543,12 +651,7 @@ export async function resolveList<T extends NamedRef>(
   // `empty` verdict — somebody defining the first Trade in Procore must not be
   // invisible until the Function instance recycles.
   if (remembered?.candidate) {
-    const page = await paginateWithBudget<T>(
-      remembered.candidate.path,
-      { query: remembered.candidate.query },
-      100,
-      LIST_BUDGET_MS,
-    );
+    const page = await read(remembered.candidate);
     return {
       rows: page.rows,
       resolution: {
@@ -569,15 +672,11 @@ export async function resolveList<T extends NamedRef>(
 
   for (const candidate of listCandidates(group, projectId)) {
     try {
-      const body = await procoreRequest<unknown>('GET', candidate.path, {
-        query: { ...candidate.query, per_page: 1 },
-      });
-      const rows = Array.isArray(body) ? body : [];
-      tried.push({ label: candidate.label, status: 200, rows: rows.length });
-      if (rows.length) {
+      const page = await read(candidate);
+      tried.push({ label: candidate.label, status: 200, rows: page.rows.length });
+      if (page.rows.length) {
         const resolution: ListResolution = { group, outcome: 'found', candidate, tried };
         listMemo.set(key, resolution);
-        const page = await paginateWithBudget<T>(candidate.path, { query: candidate.query }, 100, LIST_BUDGET_MS);
         return { rows: page.rows, resolution: { ...resolution, truncated: page.truncated } };
       }
       // 200 with no rows is not proof of the right path — keep looking, and fall
@@ -627,6 +726,16 @@ export interface ProjectPunchConfig {
    * a wrong path reported as missing data.
    */
   sources: Record<string, string>;
+  /**
+   * True when a lookup failed for a reason that will pass — a 429, a 5xx.
+   *
+   * This exists to keep such a result OUT of the cache. `getProjectPunchConfig`
+   * never rejects (each lookup degrades to an empty list), so a rate-limited
+   * load looks like a perfectly good answer to a cache and would be served for
+   * ten minutes — turning one busy moment into a dropdown that stays empty long
+   * after Procore recovered. Reloading has to be able to fix it.
+   */
+  degraded: boolean;
 }
 
 interface DirectoryUser {
@@ -667,34 +776,93 @@ export function vendorsFromDirectory(users: DirectoryUser[]): NamedRef[] {
 /**
  * Merge the two vendor sources without letting either hide a company.
  *
- * The subs on this job are what a super wants nine times in ten, so they are
- * flagged `onProject` and shown first. But the company-wide list is kept
- * alongside rather than replaced: a sub with no user in the project directory
- * would otherwise be unpickable, and "the company is not in the list" is a dead
- * end in the field, where "the list is long" is only an annoyance.
+ * `onProject` means "a sub on this job", and where that fact comes from is
+ * decided by which path served the list — NOT by the directory. The live tenant
+ * settled that: `/projects/{id}/vendors` returns the 30 subs on project 603781,
+ * while the project's user directory is Buffalo's own staff, so every row in it
+ * resolves to Buffalo Construction Inc. Flagging from the directory therefore
+ * floated **the general contractor** to the top of the picker, above the subs a
+ * punch item actually gets assigned to — the opposite of the intent.
+ *
+ * So the directory is now a supplement, not the source of truth: it can add a
+ * company the vendor list missed, and it can mark companies when the only list
+ * available is company-wide. When the list is already project-scoped it has
+ * nothing to add, and is not consulted for the flag.
  */
 export function mergeVendors(
-  onProject: NamedRef[],
-  companyWide: NamedRef[],
+  listed: NamedRef[],
+  listedScope: 'project' | 'company' | null,
+  fromDirectory: NamedRef[],
 ): Array<NamedRef & { onProject?: boolean }> {
-  const out: Array<NamedRef & { onProject?: boolean }> = onProject.map((v) => ({ ...v, onProject: true }));
-  const seen = new Set(onProject.map((v) => v.id));
-  for (const vendor of companyWide) {
+  const onProject = new Set(fromDirectory.map((v) => v.id));
+  const out: Array<NamedRef & { onProject?: boolean }> = [];
+  const seen = new Set<number>();
+
+  for (const vendor of listed) {
     if (!Number.isFinite(Number(vendor.id)) || seen.has(vendor.id)) continue;
     seen.add(vendor.id);
-    out.push(vendor);
+    const known = listedScope === 'project' || onProject.has(vendor.id);
+    out.push(known ? { ...vendor, onProject: true } : vendor);
   }
+
+  // A company with somebody in the directory but no row in the vendor list is
+  // still pickable. Losing one is a dead end in the field; carrying an extra is
+  // a longer type-ahead.
+  for (const vendor of fromDirectory) {
+    if (seen.has(vendor.id)) continue;
+    seen.add(vendor.id);
+    out.push({ ...vendor, onProject: true });
+  }
+
   return out;
 }
 
+/**
+ * Everything the review dropdowns need, fetched once per project.
+ *
+ * This is ~7 requests (types, locations, trades over two pages, vendors, and the
+ * project directory over several), and selecting a project used to pay for it
+ * **twice**: the dashboard fired `/api/projects/{id}/config` and `/api/probe` in
+ * parallel, and the probe built its own copy. Two of those requests came back
+ * 429 on the first live run.
+ *
+ * The cache deduplicates both the repeat and the race — parallel callers join
+ * one in-flight fetch rather than starting two. The dashboard now makes a single
+ * call as well, so this is belt and braces; the belt matters because SWA can run
+ * the two on different instances.
+ */
 export async function getProjectPunchConfig(projectId: number): Promise<ProjectPunchConfig> {
+  const key = `punch-config:${projectId}`;
+  const config = await memoized(key, CONFIG_TTL_MS, () => loadProjectPunchConfig(projectId));
+  // Concurrent callers still shared the one fetch — that is the expensive part —
+  // but the next reload must go back to Procore rather than being handed the
+  // same rate-limited answer for the rest of the TTL.
+  if (config.degraded) bust(key);
+  return config;
+}
+
+async function loadProjectPunchConfig(projectId: number): Promise<ProjectPunchConfig> {
   const warnings: string[] = [];
+  let degraded = false;
   const sources: Record<string, string> = {};
 
   const soft = async <T>(label: string, fn: () => Promise<T[]>): Promise<T[]> => {
     try {
       return await fn();
     } catch (err) {
+      // A rate limit is not a broken lookup, and saying "unavailable" about one
+      // is the same mistake the send chain made: it reads as a fact about the
+      // integration when it is a fact about the minute. The first live run of
+      // the lists probe drew a 429 on Locations and Project users, and the card
+      // reported both as unavailable — on a project where the probe's own
+      // control call had just read a location successfully.
+      if (err instanceof ProcoreError && isTransient(err)) {
+        degraded = true;
+        warnings.push(
+          `${label}: Procore was busy (HTTP ${err.status}) — this is a rate limit, not a missing list. Reload to retry.`,
+        );
+        return [];
+      }
       const msg = err instanceof ProcoreError ? `${err.status}` : String(err);
       warnings.push(`${label} unavailable (${msg})`);
       return [];
@@ -711,13 +879,14 @@ export async function getProjectPunchConfig(projectId: number): Promise<ProjectP
   const discovered = async (
     group: 'trades' | 'vendors',
     label: string,
-  ): Promise<{ rows: NamedRef[]; note: string | null }> => {
+  ): Promise<{ rows: NamedRef[]; note: string | null; scope: 'project' | 'company' | null }> => {
     try {
       const { rows, resolution } = await resolveList<NamedRef>(group, projectId);
       if (resolution.outcome === 'found' && resolution.candidate) {
         sources[group] = resolution.candidate.label;
         return {
           rows,
+          scope: resolution.candidate.scope,
           note: resolution.truncated
             ? `${label}: showing the first ${rows.length}. The full list was too long to read inside one request.`
             : null,
@@ -725,42 +894,60 @@ export async function getProjectPunchConfig(projectId: number): Promise<ProjectP
       }
       if (resolution.outcome === 'empty') {
         sources[group] = `${resolution.candidate?.label ?? 'reachable'} — none defined`;
-        return { rows: [], note: `${label}: none are defined in Procore for this project.` };
+        return {
+          rows: [],
+          scope: null,
+          note: `${label}: none are defined in Procore for this project.`,
+        };
       }
       sources[group] = 'no endpoint answered';
       return {
         rows: [],
+        scope: null,
         note:
           `${label} unavailable — none of ${resolution.tried.length} paths answered ` +
           `(${resolution.tried.map((t) => `${t.label} → ${t.status ?? 'error'}`).join(', ')}).`,
       };
     } catch (err) {
       // Transient only — discovery rethrows those rather than recording a verdict.
-      return { rows: [], note: `${label} could not be read right now (${describeError(err)}). Try again.` };
+      degraded = true;
+      return {
+        rows: [],
+        scope: null,
+        note: `${label} could not be read right now (${describeError(err)}). Try again.`,
+      };
     }
   };
 
   const [punchItemTypes, locations, trades, companyVendors, users] = await Promise.all([
     soft('Punch item types', () =>
-      procorePaginate<NamedRef>('/rest/v1.0/punch_item_types', { query: { project_id: projectId } }),
+      procorePaginate<NamedRef>(
+        '/rest/v1.0/punch_item_types',
+        { query: { project_id: projectId } },
+        CONFIG_PAGE,
+      ),
     ),
     soft('Locations', () =>
-      procorePaginate<NamedRef>('/rest/v1.0/locations', { query: { project_id: projectId } }),
+      procorePaginate<NamedRef>('/rest/v1.0/locations', { query: { project_id: projectId } }, CONFIG_PAGE),
     ),
     discovered('trades', 'Trades'),
     discovered('vendors', 'Vendors'),
     soft('Project users', () =>
-      procorePaginate<DirectoryUser>(`/rest/v1.0/projects/${projectId}/users`, {}),
+      procorePaginate<DirectoryUser>(`/rest/v1.0/projects/${projectId}/users`, {}, CONFIG_PAGE),
     ),
   ]);
 
   if (trades.note) warnings.push(trades.note);
 
   const directoryVendors = vendorsFromDirectory(users as DirectoryUser[]);
-  const vendors = mergeVendors(directoryVendors, companyVendors.rows);
+  const vendors = mergeVendors(companyVendors.rows, companyVendors.scope, directoryVendors);
+  const onProject = vendors.filter((v) => v.onProject).length;
 
-  if (directoryVendors.length) {
-    sources.vendorsOnProject = `${directoryVendors.length} from this project's directory`;
+  if (onProject) {
+    sources.vendorsOnProject =
+      companyVendors.scope === 'project'
+        ? `${onProject} scoped to this project by Procore`
+        : `${onProject} matched against this project's directory`;
   }
   // The company-wide lookup failing is only worth telling anyone about if the
   // picker ends up empty. When the project's own directory supplied the subs on
@@ -784,6 +971,7 @@ export async function getProjectPunchConfig(projectId: number): Promise<ProjectP
     })),
     warnings,
     sources,
+    degraded,
   };
 }
 
@@ -1560,8 +1748,63 @@ export function isUnsentImport(
 }
 
 /** Read punch items back — used by the probe and by duplicate detection. */
+/**
+ * Every punch item on a project.
+ *
+ * ⚠️ This is the most expensive read in the app and the easiest to reach for. A
+ * project with 800 punch items is 8 requests, and the unbudgeted version could
+ * walk 100 pages. Only the callers that genuinely need every row should use it —
+ * the recovery sweep, which has to find OUR unsent drafts among everyone's, and
+ * the inspect survey, whose whole job is reading many rows.
+ *
+ * Cached briefly: selecting a project used to fetch this twice in one page load,
+ * once for the connection check and once for the unsent-imports sweep.
+ *
+ * If you only need to know whether the tool is READABLE, call
+ * `punchItemAccess()` — one request instead of N.
+ */
 export async function listPunchItems(projectId: number): Promise<Array<Record<string, unknown>>> {
-  return procorePaginate<Record<string, unknown>>('/rest/v1.1/punch_items', {
-    query: { project_id: projectId },
+  return memoized(`punch-items:${projectId}`, LIST_TTL_MS, () =>
+    procorePaginate<Record<string, unknown>>(
+      '/rest/v1.1/punch_items',
+      { query: { project_id: projectId } },
+      // Ask for a big page. If Procore caps it lower, the `Total` header keeps
+      // pagination going correctly — which is what makes asking safe at all.
+      PUNCH_LIST_PAGE,
+      PUNCH_LIST_BUDGET_MS,
+    ),
+  );
+}
+
+/** A punch list long enough to outlast this is truncated rather than killing the Function. */
+const PUNCH_LIST_BUDGET_MS = 15_000;
+/** Requested page size for the full punch list; the server may serve less. */
+const PUNCH_LIST_PAGE = 1000;
+
+/**
+ * Can this account read the project's punch list, and how many items are there?
+ *
+ * The connection check used `listPunchItems` — paging every item on the project
+ * to print a count in a sentence. One request answers both questions instead,
+ * because Procore returns the row count in the **`Total`** header.
+ *
+ * That header is also the only way to tell an empty tool from a filtered one:
+ * `total > 0` with no rows back means the account is being denied rows, not that
+ * the project has none. A list endpoint answers 200 either way, and reading that
+ * zero as "nothing here" is how private Observations hid from the Safety
+ * Dashboard.
+ */
+export async function punchItemAccess(
+  projectId: number,
+): Promise<{ readable: true; total: number | null; returned: number; withheld: boolean }> {
+  let total: number | null = null;
+  const rows = await procoreRequest<unknown>('GET', '/rest/v1.1/punch_items', {
+    query: { project_id: projectId, per_page: 1 },
+    onHeaders: (h) => {
+      const raw = Number(h.get('Total') ?? h.get('total'));
+      total = Number.isFinite(raw) ? raw : null;
+    },
   });
+  const returned = Array.isArray(rows) ? rows.length : 0;
+  return { readable: true, total, returned, withheld: (total ?? 0) > 0 && returned === 0 };
 }

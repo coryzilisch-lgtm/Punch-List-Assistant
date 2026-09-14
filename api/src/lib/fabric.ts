@@ -277,19 +277,29 @@ export async function fabricSyncedAt(): Promise<string | null> {
  * two different things, and only a person who knows how Vendor Compliance keys
  * its rows can do the second.
  */
-export async function findVendorTables(): Promise<{
+export async function findVendorTables(knownProcoreVendorIds: number[] = []): Promise<{
   database: string;
+  comparedAgainst: number;
   tables: Array<{
     table: string;
     columns: string[];
     procoreIdColumns: string[];
-    idCandidates: Array<{ column: string; type: string; samples: unknown[]; looksLikeProcoreId: boolean }>;
+    idCandidates: Array<{
+      column: string;
+      type: string;
+      samples: unknown[];
+      looksLikeProcoreId: boolean;
+      /** Of the values sampled, how many are ids Procore just returned for this project. */
+      matchedProcoreVendorIds: number | null;
+      sampled: number;
+    }>;
     rows: number | null;
   }>;
 }> {
   const db = vendorDatabase();
   const server = process.env.PUNCH_VENDOR_SQL_SERVER || undefined;
   const ask = <T>(text: string) => query<T>(text, db, server);
+  const known = new Set(knownProcoreVendorIds.map((n) => String(n)));
 
   const rows = await ask<{
     TABLE_SCHEMA: string;
@@ -328,27 +338,43 @@ export async function findVendorTables(): Promise<{
 
     const idCandidates = [];
     for (const col of idish) {
-      let samples: unknown[] = [];
+      let values: unknown[] = [];
       try {
         const sampled = await ask<{ v: unknown }>(
-          `SELECT TOP 3 [${col.name}] AS v FROM ${table} WHERE [${col.name}] IS NOT NULL`,
+          `SELECT DISTINCT TOP ${SAMPLE_ROWS} [${col.name}] AS v FROM ${table} WHERE [${col.name}] IS NOT NULL`,
         );
-        samples = sampled.map((r) => r.v);
+        values = sampled.map((r) => r.v);
       } catch {
         // A column we cannot read tells us nothing, which is itself reportable.
       }
       idCandidates.push({
         column: col.name,
         type: col.type,
-        samples,
-        looksLikeProcoreId: samples.length > 0 && samples.every(isProcoreIdShaped),
+        samples: values.slice(0, 3),
+        looksLikeProcoreId: values.length > 0 && values.every(isProcoreIdShaped),
+        // The decisive test, and the reason this is worth a query rather than a
+        // judgement call: a column whose values ARE ids Procore just returned is
+        // Procore's key, proven. Shape cannot establish that — a five-digit
+        // sequence from another system looks identical and points at the wrong
+        // company. `null` means there was nothing to compare against.
+        matchedProcoreVendorIds: known.size
+          ? values.filter((v) => known.has(String(v).trim())).length
+          : null,
+        sampled: values.length,
       });
     }
 
     out.push({ table, columns: names.sort(), procoreIdColumns, idCandidates, rows: count });
   }
-  return { database: db, tables: out.sort((a, b) => a.table.localeCompare(b.table)) };
+  return {
+    database: db,
+    comparedAgainst: known.size,
+    tables: out.sort((a, b) => a.table.localeCompare(b.table)),
+  };
 }
+
+/** Distinct values pulled per candidate column when testing it against Procore's ids. */
+const SAMPLE_ROWS = 50;
 
 /**
  * Does this value have the shape of a Procore id?
