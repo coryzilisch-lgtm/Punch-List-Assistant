@@ -12,11 +12,13 @@
 <body>
 
 <header>
-  <!-- Buffalo mark, drawn in brand orange. Inline so it renders before any
-       network asset resolves — supers open this on jobsite LTE. -->
-  <svg class="mark" viewBox="0 0 48 48" aria-hidden="true">
-    <path fill="#FF5F00" d="M6 18c0-4 3-7 7-7h4l3-4h8l3 4h4c4 0 7 3 7 7v3l-3 2v6l3 3-2 4-5-3-2 5h-6l-1-4h-6l-1 4h-6l-2-5-5 3-2-4 3-3v-6l-3-2z"/>
-  </svg>
+  <!-- Buffalo Construction's Roman Mark, orange on navy per the brand rules.
+       Resized to 240x165 from the 6250px master: the original decodes to ~107 MB
+       of bitmap for a 34px slot, which is a real cost on jobsite LTE, not just
+       bytes on the wire. width/height are set so the ratio is fixed by the
+       markup and the header cannot reflow while it loads. -->
+  <img class="mark" src="./buffalo-orange.png" width="240" height="165"
+       alt="Buffalo Construction" />
   <div>
     <div class="sub">Buffalo Construction</div>
     <h1>Punch List Assistant</h1>
@@ -24,6 +26,21 @@
   <div class="spacer"></div>
   <div class="who" id="who"></div>
 </header>
+
+<!-- Beta notice.
+     Sits between the header and the step rail so it is on every screen, and is
+     deliberately not dismissible: the thing it asks for (check the items before
+     they are written into a live Procore project) applies on every import, not
+     just the first one. Plain text in a plain <p>, so it still reads correctly
+     if styles.css is served from cache after a deploy. -->
+<div class="beta" role="note">
+  <span class="beta-tag">Beta</span>
+  <p>
+    This tool reads scanned documents and can get things wrong. Check every item on the
+    <strong>Review</strong> step before sending to Procore.
+    Found a bug? <a href="mailto:Cory.zilisch@buffaloconstruction.com?subject=Punch%20List%20Assistant%20bug%20report">Email Cory Zilisch</a>.
+  </p>
+</div>
 
 <nav class="steps" aria-label="Progress">
   <div class="step active" data-step="project"><span class="n">1</span>Project</div>
