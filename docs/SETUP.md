@@ -521,95 +521,109 @@ behalf of a user* are independent. The iframe was never in the way of per-user
 OAuth — that is about who Procore records as the creator, and works the same in a
 tab. The write-up of that build is in `docs/procore-oauth.md` and still stands.
 
-## Vendors and Trades — how the paths are found now
+## Vendors and Trades — answered by the tenant, 2026-09-14
 
 A 404 on a list endpoint means the **path** is wrong, not that the data is
-missing. Procore is inconsistent about whether a company-scoped collection is
-nested (`/companies/{id}/thing`) or flat with a query parameter
-(`/thing?company_id=`) — the same inconsistency that hid the curated project team
-for two sessions in the sibling repo, where the nested form answered emptily and
-the flat one was correct.
+missing. Both are now resolved, against project 603781:
 
-**The app no longer holds an opinion about which is right. It asks.**
-`listCandidates()` in `api/src/lib/procore.ts` holds five candidate paths per
-list; `resolveList()` tries them in order and keeps the one that answers with
-rows. That is the same candidate-chain-with-memory pattern the write path already
-uses for photos, assignees and sending — applied to reads, where it is far
-cheaper, because every candidate is a GET that changes nothing and the answer
-verifies itself: a list of `{id, name}` rows *is* the contract.
+| List | The path that works | Rows |
+|---|---|---|
+| Trades | `GET /rest/v1.0/companies/{company}/trades` — **nested** | 190 |
+| Vendors | `GET /rest/v1.0/projects/{project}/vendors` — **project-scoped** | 30 |
 
-Three properties of that discovery are load-bearing:
+**They are mirror images.** Trades works nested and 404s in all three flat forms.
+Vendors 404s nested and works project-scoped (and flat with `company_id=`).
+Whichever rule you infer from one, the other breaks it — there was no reasoning
+available here, only asking. That is the case for the probe in one line.
+
+### The app asks rather than holding an opinion
+
+`listCandidates()` in `api/src/lib/procore.ts` holds five candidates per list;
+`resolveList()` pages them in order and keeps the one that answers **with rows**.
+The confirmed winners lead, so steady state is one request per list. It is the
+candidate-chain-with-memory pattern the write path already uses, applied to
+reads, where it is far cheaper: every candidate is a GET that changes nothing,
+and the answer verifies itself, because a list of `{id, name}` rows *is* the
+contract.
+
+Five properties are load-bearing:
 
 - **A 200 with an empty array does not win.** It is recorded and discovery keeps
-  going, and only becomes the answer if nothing else returns rows. Accepting the
-  first 200 is exactly how the nested project-team endpoint won in the sibling
-  repo and hid the real data.
+  going. Accepting the first 200 is exactly how the nested project-team endpoint
+  won in the sibling repo and hid the real data.
 - **"Reachable but empty" and "no path answered" are different facts** and are
-  reported differently. The first is a tenant that has no Trades defined, which
-  is a configuration choice; the second is a broken integration. The old wording
-  — "Vendors unavailable (404)" — could not tell them apart, and neither could
-  anyone reading it.
-- **A transient failure records no verdict.** A 429 or a 5xx aborts discovery and
-  is retried later rather than being written down as "this path does not exist",
-  which is the mistake the send chain already made once: a rate limit was
-  remembered as a broken contract and poisoned every later item.
+  reported differently — a configuration choice versus a broken integration.
+- **A transient failure records no verdict.** A 429 aborts discovery and is
+  retried rather than written down as a missing path.
+- **One deadline covers the whole chain**, not one per candidate. The remaining
+  budget never reaches `0`, which `paginateWithBudget` reads as *unlimited*.
+- **The probe imports the same candidates**, so it cannot pass while the app fails.
 
 The connection check prints which path won (`Resolved: trades via GET
 /rest/v1.0/companies/{company}/trades; …`). When a dropdown is unexpectedly
-empty, that line is the first thing to read.
+empty, read that line first.
 
-### Vendors come from this job first
+### Vendors are the subs on this job
 
-`/projects/{id}/users` already works, and every row carries the company that
-person works for. That is a better vendor list than the company-wide one: the
-subs actually on site, rather than every vendor the company has ever used. It is
-also the reliable half of the fix, because it needs no new endpoint.
+`/projects/{id}/vendors` returns the 30 companies on project 603781 rather than
+every vendor Buffalo has ever contracted, so `onProject` is read off the
+**winning path's scope**: a project-scoped list marks every row.
 
-`vendorsFromDirectory()` takes those companies, **keeping only the ones that
-carry a numeric Procore vendor id** — a name alone cannot be sent, and an id from
-another system would assign the item to the wrong company silently. They are
-merged with the company-wide list rather than replacing it (`mergeVendors`), and
-flagged `onProject` so the review screen floats them to the top of the picker
-with an "on this project" label. A vendor missing from the picker is a dead end
-in the field; a long picker is an annoyance, and that field is a type-ahead.
+⚠️ **Do not derive that flag from `/projects/{id}/users`.** The first version did,
+on the assumption that a project's directory holds its subs. It does not — the
+directory of 603781 is Buffalo's own staff, so every row resolved to Buffalo
+Construction Inc. and the **general contractor** was promoted to the top of the
+picker above the actual subs. The directory is a supplement now: it adds a
+company the vendor list missed, and it marks rows only when the list available is
+company-wide. Only companies carrying a numeric Procore vendor id are kept.
+
+### A 429 is not a missing list
+
+The first live probe run returned `Locations unavailable (429)` and
+`Project users unavailable (429)` — on a project where the probe's own control
+call read a location successfully in the same response. The probe fires its
+candidate sweep and a full config load at once, against a quota shared with the
+Safety Dashboard ingest, and that burst is enough. Two changes: discovery pages
+candidates directly instead of probing and then re-fetching (one request less per
+list), and a rate limit now reports as *"Procore was busy — this is a rate limit,
+not a missing list. Reload to retry."* Saying "unavailable" about a 429 is the
+same error as recording one as a broken contract.
 
 ### `GET /api/inspect?project_id=<id>&lists=1`
 
-Still the way to see the raw answers. It probes **the same candidate list the app
-uses** — imported from `listCandidates()`, not a private copy, so the probe
-cannot pass while the app still fails. Punch item types and locations are
-included as controls: they already work, so if they also 404 in the probe then
-the probe is wrong rather than the tenant.
+Still the way to see the raw answers, and it probes **the same candidate list the
+app uses** — imported, not a private copy. Punch item types and locations are
+included as controls: they already work, so if they also 404 then the probe is
+wrong rather than the tenant.
 
 It reports:
 
 - `resolved` — what the app concludes: which path served each list, how many rows,
-  how many vendors are on this project, and any warnings. This is the answer to
-  "will the dropdowns be populated"; the rest is the evidence behind it.
+  how many vendors are on this project. This is the answer to "will the dropdowns
+  be populated"; the rest is the evidence behind it.
 - `lists` — every candidate with its status **and its row count**, because a 200
   with no rows is not a working path.
 - `projectUsers` — the `vendor` object on the project's directory rows.
-- `fabricVendors` — vendor-shaped tables in the Fabric database, with the columns
-  that look like ids, their types, and **three sample values from each**.
+- `fabricVendors` — vendor-shaped tables in the Fabric database.
 
-### ⚠️ The Fabric vendor list is reported, not used
+### The Vendor Compliance list — reported, and not needed
 
-The Vendor Compliance tool keeps a vendor list, and it is deliberately **not**
-wired into the picker. A vendor list is only usable here if it carries
-**Procore's** vendor id; Procore will not accept the compliance tool's own key,
-and an id that looks plausible but belongs to another system is worse than no
-list at all — it would assign punch items to the wrong company, silently, which
-is the exact class of failure this integration has already shipped three times.
+Vendor lists are being maintained in the Vendor Compliance database. They are
+deliberately **not** wired into the picker, and after 2026-09-14 they do not need
+to be: Procore's own project vendor list carries Procore's ids by definition, is
+scoped to the job, and is live rather than a nightly mirror.
 
-A column *name* cannot settle that, so the probe prints sample *values*: a Procore
-vendor id is a plain integer in the same range as the ids already on the punch
-items, while the compliance tool's own key is a GUID, a normalized name, or a
-short sequence. `looksLikeProcoreId` rules a column **out**; it never rules one
-in. Only someone who knows how Vendor Compliance keys its rows can do that, and
-until they have, the directory-sourced list above is the honest source.
+The probe still reports them so the option stays open. Note the first run found
+no vendor tables at all, because **`FABRIC_SQL_DATABASE` points at
+`herd-intranet`** — the compliance roster lives in the **Safety-Dash** database.
+Set **`PUNCH_VENDOR_SQL_DATABASE`** to that catalog to see it (same server, same
+service principal), and `PUNCH_VENDOR_SQL_SERVER` only if it is also a different
+server.
 
-If Vendor Compliance lives in a different Fabric database from the project
-mirror, point the probe at it with **`PUNCH_VENDOR_SQL_DATABASE`** (and
-`PUNCH_VENDOR_SQL_SERVER` if it is also a different server). Same service
-principal, same server, different catalog is the common case — hence one optional
-setting rather than a second copy of all five.
+The probe does not ask whether a column *looks like* a Procore id. It intersects
+the column's values with the vendor ids Procore just returned for the project and
+reports `matchedProcoreVendorIds`. A column whose values **are** those ids is
+Procore's key, proven. `looksLikeProcoreId` rules a column **out**; it never rules
+one in — a short sequence from another system is indistinguishable by shape and
+points at the wrong company, which is the exact class of failure this integration
+has already shipped three times.

@@ -360,19 +360,28 @@ export async function inspectHandler(
     // a probe that reports a remembered answer is reporting the past.
     forgetListEndpoints();
 
-    const [lists, projectUsers, fabricVendors] = await Promise.all([
+    const [lists, projectUsers] = await Promise.all([
       probeLists(projectId),
       probeProjectUserVendor(projectId).catch((err) => ({ error: String(err) })),
-      fabricConfigured()
-        ? findVendorTables().catch((err) => ({ error: String(err) }))
-        : Promise.resolve({ error: 'Fabric is not configured on this deployment.' }),
     ]);
 
     // The candidate table above says what each path answered; this says what the
     // app concludes from it — which is the question actually being asked, since
     // the app picks its own path at runtime now.
-    const resolved = await getProjectPunchConfig(projectId)
-      .then((c) => ({
+    const config = await getProjectPunchConfig(projectId).catch(() => null);
+
+    // Ordered after the config deliberately: the vendor ids Procore just returned
+    // for this project are what turns the Fabric question from "does this column
+    // look like a Procore id" into "is this column the SAME id". A name cannot
+    // settle that; an intersection can.
+    const fabricVendors = fabricConfigured()
+      ? await findVendorTables((config?.vendors ?? []).map((v) => v.id)).catch((err) => ({
+          error: String(err),
+        }))
+      : { error: 'Fabric is not configured on this deployment.' };
+
+    const resolved = await Promise.resolve(config)
+      .then((c) => (c ? {
         sources: c.sources,
         warnings: c.warnings,
         counts: {
@@ -383,8 +392,7 @@ export async function inspectHandler(
           vendorsOnProject: c.vendors.filter((v) => v.onProject).length,
           users: c.users.length,
         },
-      }))
-      .catch((err) => ({ error: String(err) }));
+      } : { error: 'The project punch list configuration could not be read.' }));
 
     return json({ projectId, resolved, lists, projectUsers, fabricVendors });
   }

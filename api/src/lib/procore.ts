@@ -448,6 +448,17 @@ export interface ListCandidate {
   label: string;
   path: string;
   query: Record<string, string | number>;
+  /**
+   * `project` means every row this path returns is already scoped to the job.
+   *
+   * This is what decides the `onProject` flag, and it matters more than it
+   * looks: `/projects/{id}/vendors` answers with the 30 subs on the job, where
+   * the company-wide list is every vendor Buffalo has ever contracted. Deriving
+   * "on this project" from the directory instead got it exactly backwards on the
+   * live tenant — the directory of project 603781 is Buffalo's own staff, so the
+   * GC floated to the top of the picker above the actual subs.
+   */
+  scope: 'project' | 'company';
 }
 
 /**
@@ -459,21 +470,28 @@ export interface ListCandidate {
  */
 export function listCandidates(group: 'trades' | 'vendors', projectId: number): ListCandidate[] {
   const company = companyId();
+  // Order matters: the first candidate is the one the tenant answered on
+  // 2026-09-14, so steady-state discovery costs one request, not five. The rest
+  // stay as the chain that finds the path again if Procore moves it.
   if (group === 'trades') {
     return [
-      { label: 'GET /rest/v1.0/companies/{company}/trades', path: `/rest/v1.0/companies/${company}/trades`, query: {} },
-      { label: 'GET /rest/v1.0/trades?company_id', path: '/rest/v1.0/trades', query: { company_id: company } },
-      { label: 'GET /rest/v1.0/projects/{project}/trades', path: `/rest/v1.0/projects/${projectId}/trades`, query: {} },
-      { label: 'GET /rest/v1.0/trades?project_id', path: '/rest/v1.0/trades', query: { project_id: projectId } },
-      { label: 'GET /rest/v1.1/companies/{company}/trades', path: `/rest/v1.1/companies/${company}/trades`, query: {} },
+      // ✅ confirmed: 190 trades. The flat forms all 404 for trades.
+      { label: 'GET /rest/v1.0/companies/{company}/trades', path: `/rest/v1.0/companies/${company}/trades`, query: {}, scope: 'company' },
+      { label: 'GET /rest/v1.0/trades?company_id', path: '/rest/v1.0/trades', query: { company_id: company }, scope: 'company' },
+      { label: 'GET /rest/v1.0/projects/{project}/trades', path: `/rest/v1.0/projects/${projectId}/trades`, query: {}, scope: 'project' },
+      { label: 'GET /rest/v1.0/trades?project_id', path: '/rest/v1.0/trades', query: { project_id: projectId }, scope: 'project' },
+      { label: 'GET /rest/v1.1/companies/{company}/trades', path: `/rest/v1.1/companies/${company}/trades`, query: {}, scope: 'company' },
     ];
   }
   return [
-    { label: 'GET /rest/v1.0/projects/{project}/vendors', path: `/rest/v1.0/projects/${projectId}/vendors`, query: {} },
-    { label: 'GET /rest/v1.0/vendors?project_id', path: '/rest/v1.0/vendors', query: { project_id: projectId } },
-    { label: 'GET /rest/v1.0/companies/{company}/vendors', path: `/rest/v1.0/companies/${company}/vendors`, query: {} },
-    { label: 'GET /rest/v1.0/vendors?company_id', path: '/rest/v1.0/vendors', query: { company_id: company } },
-    { label: 'GET /rest/v1.1/companies/{company}/vendors', path: `/rest/v1.1/companies/${company}/vendors`, query: {} },
+    // ✅ confirmed: 30 vendors, the subs on the job. Vendors is the mirror image
+    // of trades — the NESTED company form 404s and the flat one works, which is
+    // precisely why neither path could be reasoned out and both had to be asked.
+    { label: 'GET /rest/v1.0/projects/{project}/vendors', path: `/rest/v1.0/projects/${projectId}/vendors`, query: {}, scope: 'project' },
+    { label: 'GET /rest/v1.0/vendors?project_id', path: '/rest/v1.0/vendors', query: { project_id: projectId }, scope: 'project' },
+    { label: 'GET /rest/v1.0/vendors?company_id', path: '/rest/v1.0/vendors', query: { company_id: company }, scope: 'company' },
+    { label: 'GET /rest/v1.0/companies/{company}/vendors', path: `/rest/v1.0/companies/${company}/vendors`, query: {}, scope: 'company' },
+    { label: 'GET /rest/v1.1/companies/{company}/vendors', path: `/rest/v1.1/companies/${company}/vendors`, query: {}, scope: 'company' },
   ];
 }
 
@@ -536,6 +554,28 @@ export async function resolveList<T extends NamedRef>(
   projectId: number,
 ): Promise<{ rows: T[]; resolution: ListResolution }> {
   const key = `${group}:${projectId}`;
+
+  // One deadline for the WHOLE chain, not one per candidate. Five candidates
+  // with twelve seconds each is sixty seconds, and the Function is killed at
+  // forty-five — a budget that can be exceeded by walking the chain is not a
+  // budget. A floor of one second keeps a nearly-spent budget from being passed
+  // as `0`, which `paginateWithBudget` reads as "unlimited".
+  const deadline = Date.now() + LIST_BUDGET_MS;
+  const remaining = () => Math.max(1_000, deadline - Date.now());
+
+  /**
+   * Page a candidate directly rather than probing it first.
+   *
+   * The first version asked each candidate for one row and then re-fetched the
+   * winner in full, which doubled the cost of the common case. A wrong path
+   * costs the same single request either way, and the right one hands back the
+   * rows on the same call — so the probe step bought nothing. That mattered:
+   * this quota is shared with the Safety Dashboard ingest, and the first live
+   * run of the probe drew a 429 on two other lookups.
+   */
+  const read = (candidate: ListCandidate) =>
+    paginateWithBudget<T>(candidate.path, { query: candidate.query }, 100, remaining());
+
   const remembered = listMemo.get(key);
 
   // A remembered candidate is re-read, not re-discovered: the path cannot change
@@ -543,12 +583,7 @@ export async function resolveList<T extends NamedRef>(
   // `empty` verdict — somebody defining the first Trade in Procore must not be
   // invisible until the Function instance recycles.
   if (remembered?.candidate) {
-    const page = await paginateWithBudget<T>(
-      remembered.candidate.path,
-      { query: remembered.candidate.query },
-      100,
-      LIST_BUDGET_MS,
-    );
+    const page = await read(remembered.candidate);
     return {
       rows: page.rows,
       resolution: {
@@ -569,15 +604,11 @@ export async function resolveList<T extends NamedRef>(
 
   for (const candidate of listCandidates(group, projectId)) {
     try {
-      const body = await procoreRequest<unknown>('GET', candidate.path, {
-        query: { ...candidate.query, per_page: 1 },
-      });
-      const rows = Array.isArray(body) ? body : [];
-      tried.push({ label: candidate.label, status: 200, rows: rows.length });
-      if (rows.length) {
+      const page = await read(candidate);
+      tried.push({ label: candidate.label, status: 200, rows: page.rows.length });
+      if (page.rows.length) {
         const resolution: ListResolution = { group, outcome: 'found', candidate, tried };
         listMemo.set(key, resolution);
-        const page = await paginateWithBudget<T>(candidate.path, { query: candidate.query }, 100, LIST_BUDGET_MS);
         return { rows: page.rows, resolution: { ...resolution, truncated: page.truncated } };
       }
       // 200 with no rows is not proof of the right path — keep looking, and fall
@@ -667,23 +698,44 @@ export function vendorsFromDirectory(users: DirectoryUser[]): NamedRef[] {
 /**
  * Merge the two vendor sources without letting either hide a company.
  *
- * The subs on this job are what a super wants nine times in ten, so they are
- * flagged `onProject` and shown first. But the company-wide list is kept
- * alongside rather than replaced: a sub with no user in the project directory
- * would otherwise be unpickable, and "the company is not in the list" is a dead
- * end in the field, where "the list is long" is only an annoyance.
+ * `onProject` means "a sub on this job", and where that fact comes from is
+ * decided by which path served the list — NOT by the directory. The live tenant
+ * settled that: `/projects/{id}/vendors` returns the 30 subs on project 603781,
+ * while the project's user directory is Buffalo's own staff, so every row in it
+ * resolves to Buffalo Construction Inc. Flagging from the directory therefore
+ * floated **the general contractor** to the top of the picker, above the subs a
+ * punch item actually gets assigned to — the opposite of the intent.
+ *
+ * So the directory is now a supplement, not the source of truth: it can add a
+ * company the vendor list missed, and it can mark companies when the only list
+ * available is company-wide. When the list is already project-scoped it has
+ * nothing to add, and is not consulted for the flag.
  */
 export function mergeVendors(
-  onProject: NamedRef[],
-  companyWide: NamedRef[],
+  listed: NamedRef[],
+  listedScope: 'project' | 'company' | null,
+  fromDirectory: NamedRef[],
 ): Array<NamedRef & { onProject?: boolean }> {
-  const out: Array<NamedRef & { onProject?: boolean }> = onProject.map((v) => ({ ...v, onProject: true }));
-  const seen = new Set(onProject.map((v) => v.id));
-  for (const vendor of companyWide) {
+  const onProject = new Set(fromDirectory.map((v) => v.id));
+  const out: Array<NamedRef & { onProject?: boolean }> = [];
+  const seen = new Set<number>();
+
+  for (const vendor of listed) {
     if (!Number.isFinite(Number(vendor.id)) || seen.has(vendor.id)) continue;
     seen.add(vendor.id);
-    out.push(vendor);
+    const known = listedScope === 'project' || onProject.has(vendor.id);
+    out.push(known ? { ...vendor, onProject: true } : vendor);
   }
+
+  // A company with somebody in the directory but no row in the vendor list is
+  // still pickable. Losing one is a dead end in the field; carrying an extra is
+  // a longer type-ahead.
+  for (const vendor of fromDirectory) {
+    if (seen.has(vendor.id)) continue;
+    seen.add(vendor.id);
+    out.push({ ...vendor, onProject: true });
+  }
+
   return out;
 }
 
@@ -695,6 +747,18 @@ export async function getProjectPunchConfig(projectId: number): Promise<ProjectP
     try {
       return await fn();
     } catch (err) {
+      // A rate limit is not a broken lookup, and saying "unavailable" about one
+      // is the same mistake the send chain made: it reads as a fact about the
+      // integration when it is a fact about the minute. The first live run of
+      // the lists probe drew a 429 on Locations and Project users, and the card
+      // reported both as unavailable — on a project where the probe's own
+      // control call had just read a location successfully.
+      if (err instanceof ProcoreError && isTransient(err)) {
+        warnings.push(
+          `${label}: Procore was busy (HTTP ${err.status}) — this is a rate limit, not a missing list. Reload to retry.`,
+        );
+        return [];
+      }
       const msg = err instanceof ProcoreError ? `${err.status}` : String(err);
       warnings.push(`${label} unavailable (${msg})`);
       return [];
@@ -711,13 +775,14 @@ export async function getProjectPunchConfig(projectId: number): Promise<ProjectP
   const discovered = async (
     group: 'trades' | 'vendors',
     label: string,
-  ): Promise<{ rows: NamedRef[]; note: string | null }> => {
+  ): Promise<{ rows: NamedRef[]; note: string | null; scope: 'project' | 'company' | null }> => {
     try {
       const { rows, resolution } = await resolveList<NamedRef>(group, projectId);
       if (resolution.outcome === 'found' && resolution.candidate) {
         sources[group] = resolution.candidate.label;
         return {
           rows,
+          scope: resolution.candidate.scope,
           note: resolution.truncated
             ? `${label}: showing the first ${rows.length}. The full list was too long to read inside one request.`
             : null,
@@ -725,18 +790,27 @@ export async function getProjectPunchConfig(projectId: number): Promise<ProjectP
       }
       if (resolution.outcome === 'empty') {
         sources[group] = `${resolution.candidate?.label ?? 'reachable'} — none defined`;
-        return { rows: [], note: `${label}: none are defined in Procore for this project.` };
+        return {
+          rows: [],
+          scope: null,
+          note: `${label}: none are defined in Procore for this project.`,
+        };
       }
       sources[group] = 'no endpoint answered';
       return {
         rows: [],
+        scope: null,
         note:
           `${label} unavailable — none of ${resolution.tried.length} paths answered ` +
           `(${resolution.tried.map((t) => `${t.label} → ${t.status ?? 'error'}`).join(', ')}).`,
       };
     } catch (err) {
       // Transient only — discovery rethrows those rather than recording a verdict.
-      return { rows: [], note: `${label} could not be read right now (${describeError(err)}). Try again.` };
+      return {
+        rows: [],
+        scope: null,
+        note: `${label} could not be read right now (${describeError(err)}). Try again.`,
+      };
     }
   };
 
@@ -757,10 +831,14 @@ export async function getProjectPunchConfig(projectId: number): Promise<ProjectP
   if (trades.note) warnings.push(trades.note);
 
   const directoryVendors = vendorsFromDirectory(users as DirectoryUser[]);
-  const vendors = mergeVendors(directoryVendors, companyVendors.rows);
+  const vendors = mergeVendors(companyVendors.rows, companyVendors.scope, directoryVendors);
+  const onProject = vendors.filter((v) => v.onProject).length;
 
-  if (directoryVendors.length) {
-    sources.vendorsOnProject = `${directoryVendors.length} from this project's directory`;
+  if (onProject) {
+    sources.vendorsOnProject =
+      companyVendors.scope === 'project'
+        ? `${onProject} scoped to this project by Procore`
+        : `${onProject} matched against this project's directory`;
   }
   // The company-wide lookup failing is only worth telling anyone about if the
   // picker ends up empty. When the project's own directory supplied the subs on
