@@ -41,9 +41,23 @@ export function fabricConfigured(): boolean {
   );
 }
 
-const config = (): sql.config => ({
-  server: process.env.FABRIC_SQL_SERVER as string,
-  database: process.env.FABRIC_SQL_DATABASE as string,
+/**
+ * The database holding the Vendor Compliance tool's roster, when it is not the
+ * one the project mirror lives in.
+ *
+ * Cory's vendor list is kept by a different app, and two Fabric SQL databases in
+ * the same workspace are reached with the same service principal and the same
+ * server — only the catalog name differs. So this is one optional setting rather
+ * than a second copy of all five, and leaving it unset means "same database",
+ * which is the common case.
+ */
+function vendorDatabase(): string {
+  return process.env.PUNCH_VENDOR_SQL_DATABASE || (process.env.FABRIC_SQL_DATABASE as string);
+}
+
+const config = (database: string, server?: string): sql.config => ({
+  server: server || (process.env.FABRIC_SQL_SERVER as string),
+  database,
   authentication: {
     type: 'azure-active-directory-service-principal-secret',
     options: {
@@ -58,30 +72,36 @@ const config = (): sql.config => ({
   requestTimeout: 20_000,
 });
 
-let pool: sql.ConnectionPool | null = null;
+/** One pool per database — the vendor roster may live in a different catalog. */
+const pools = new Map<string, sql.ConnectionPool>();
 
-async function getPool(): Promise<sql.ConnectionPool> {
-  if (pool?.connected) return pool;
-  pool = await new sql.ConnectionPool(config()).connect();
-  pool.on('error', () => {
+async function getPool(database: string, server?: string): Promise<sql.ConnectionPool> {
+  const key = `${server ?? ''}/${database}`;
+  const existing = pools.get(key);
+  if (existing?.connected) return existing;
+  const created = await new sql.ConnectionPool(config(database, server)).connect();
+  created.on('error', () => {
     // A dead pooled socket must not be reused. Both sibling apps learned this
     // as "Connection lost - socket hang up" after an idle period.
-    pool = null;
+    pools.delete(key);
   });
-  return pool;
+  pools.set(key, created);
+  return created;
 }
 
-async function query<T>(text: string): Promise<T[]> {
+async function query<T>(text: string, database?: string, server?: string): Promise<T[]> {
+  const db = database || (process.env.FABRIC_SQL_DATABASE as string);
+  const key = `${server ?? ''}/${db}`;
   try {
-    const result = await (await getPool()).request().query(text);
+    const result = await (await getPool(db, server)).request().query(text);
     return result.recordset as T[];
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (/socket hang up|Connection lost|ECONNCLOSED|ECONNRESET|ETIMEOUT|ESOCKET/i.test(message)) {
       // One retry on a connection-shaped failure: the pool can hold a socket the
       // server has already dropped, and the first use after an idle spell fails.
-      pool = null;
-      const result = await (await getPool()).request().query(text);
+      pools.delete(key);
+      const result = await (await getPool(db, server)).request().query(text);
       return result.recordset as T[];
     }
     throw err;
@@ -246,34 +266,100 @@ export async function fabricSyncedAt(): Promise<string | null> {
  * wrong company silently.
  *
  * So this reports what exists rather than assuming a schema — which table, which
- * columns, and whether any column looks like a Procore id.
+ * columns, which of those columns look like an id, and **what values they
+ * actually hold**. The samples are the point: a Procore vendor id is a plain
+ * integer in the same range as the ones already on the punch items, while the
+ * compliance tool's own key is a GUID, a normalized name, or a small sequence.
+ * That difference is visible in three sample rows and invisible in a column
+ * name, and this integration has been burned by plausible-looking names before.
+ *
+ * Nothing here is wired into the picker. Reading a column and believing it is
+ * two different things, and only a person who knows how Vendor Compliance keys
+ * its rows can do the second.
  */
-export async function findVendorTables(): Promise<
-  Array<{ table: string; columns: string[]; procoreIdColumns: string[]; rows: number | null }>
-> {
-  const rows = await query<{ TABLE_SCHEMA: string; TABLE_NAME: string; COLUMN_NAME: string }>(
-    `SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS ` +
+export async function findVendorTables(): Promise<{
+  database: string;
+  tables: Array<{
+    table: string;
+    columns: string[];
+    procoreIdColumns: string[];
+    idCandidates: Array<{ column: string; type: string; samples: unknown[]; looksLikeProcoreId: boolean }>;
+    rows: number | null;
+  }>;
+}> {
+  const db = vendorDatabase();
+  const server = process.env.PUNCH_VENDOR_SQL_SERVER || undefined;
+  const ask = <T>(text: string) => query<T>(text, db, server);
+
+  const rows = await ask<{
+    TABLE_SCHEMA: string;
+    TABLE_NAME: string;
+    COLUMN_NAME: string;
+    DATA_TYPE: string;
+  }>(
+    `SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS ` +
       `WHERE TABLE_NAME LIKE '%vendor%' OR TABLE_NAME LIKE '%subcontractor%' ` +
       `OR TABLE_NAME LIKE '%compan%'`,
   );
 
-  const byTable = new Map<string, string[]>();
+  const byTable = new Map<string, Array<{ name: string; type: string }>>();
   for (const r of rows) {
     const key = `${r.TABLE_SCHEMA}.${r.TABLE_NAME}`;
-    byTable.set(key, [...(byTable.get(key) ?? []), r.COLUMN_NAME]);
+    byTable.set(key, [...(byTable.get(key) ?? []), { name: r.COLUMN_NAME, type: r.DATA_TYPE }]);
   }
 
   const out = [];
   for (const [table, columns] of byTable) {
-    const procoreIdColumns = columns.filter((c) => /procore/i.test(c) && /id$/i.test(c));
+    const names = columns.map((c) => c.name);
+    const procoreIdColumns = names.filter((c) => /procore/i.test(c) && /id$/i.test(c));
+
+    // Cast a wider net than the name filter: a Procore id can sit in a column
+    // called plainly `id`, and the whole point is to look rather than to trust
+    // the naming.
+    const idish = columns.filter((c) => /(^id$|_id$|id$|number|key)/i.test(c.name)).slice(0, 8);
+
     let count: number | null = null;
     try {
-      const [row] = await query<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`);
+      const [row] = await ask<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`);
       count = row?.n ?? null;
     } catch {
       // A table we cannot count is still worth reporting by name and shape.
     }
-    out.push({ table, columns: columns.sort(), procoreIdColumns, rows: count });
+
+    const idCandidates = [];
+    for (const col of idish) {
+      let samples: unknown[] = [];
+      try {
+        const sampled = await ask<{ v: unknown }>(
+          `SELECT TOP 3 [${col.name}] AS v FROM ${table} WHERE [${col.name}] IS NOT NULL`,
+        );
+        samples = sampled.map((r) => r.v);
+      } catch {
+        // A column we cannot read tells us nothing, which is itself reportable.
+      }
+      idCandidates.push({
+        column: col.name,
+        type: col.type,
+        samples,
+        looksLikeProcoreId: samples.length > 0 && samples.every(isProcoreIdShaped),
+      });
+    }
+
+    out.push({ table, columns: names.sort(), procoreIdColumns, idCandidates, rows: count });
   }
-  return out.sort((a, b) => a.table.localeCompare(b.table));
+  return { database: db, tables: out.sort((a, b) => a.table.localeCompare(b.table)) };
+}
+
+/**
+ * Does this value have the shape of a Procore id?
+ *
+ * Procore ids are positive integers, and the ones in this tenant run to seven
+ * and eight digits (project 603781, punch item 275). This is a shape test and
+ * nothing more — it rules a column OUT, it never rules one IN. A five-digit
+ * sequence from another system passes this and is still the wrong number.
+ */
+export function isProcoreIdShaped(value: unknown): boolean {
+  if (typeof value === 'number') return Number.isInteger(value) && value > 0;
+  if (typeof value !== 'string') return false;
+  return /^\d{3,12}$/.test(value.trim());
 }
