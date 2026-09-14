@@ -395,9 +395,13 @@ async function selectProject(id) {
   }
 
   if (S.config?.warnings?.length) {
+    // The old wording said "Some dropdowns will be empty" and nothing else, so a
+    // wrong endpoint path and a tenant that simply has no Trades defined read
+    // identically — and the first is a bug while the second is a choice. The API
+    // now distinguishes them and names the paths it tried, so print that.
     html += note(
       'warn',
-      `<strong>Some dropdowns will be empty.</strong> ${esc(S.config.warnings.join('; '))}`,
+      `<strong>Not everything could be listed.</strong> ${esc(S.config.warnings.join(' '))}`,
     );
   }
 
@@ -744,8 +748,32 @@ function renderReadNotes() {
 function sortedPeople(list) {
   return (list || []).slice().sort(byLastName);
 }
+/**
+ * Subs on this job first, then everybody else, each half alphabetical.
+ *
+ * `onProject` marks a company with somebody in this project's Procore
+ * directory — the sub actually on site. Those are the right answer nine times in
+ * ten, and the company-wide list can run to hundreds, so they lead. The rest are
+ * kept below rather than dropped: a vendor missing from the picker is a dead end
+ * in the field, where a long picker is only an annoyance, and this field is a
+ * type-ahead anyway.
+ */
 function sortedCompanies(list) {
-  return (list || []).slice().sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  return (list || []).slice().sort((a, b) => {
+    if (Boolean(a.onProject) !== Boolean(b.onProject)) return a.onProject ? -1 : 1;
+    return String(a.name).localeCompare(String(b.name));
+  });
+}
+
+/**
+ * The grey second line under an option. For a person it is their company; for a
+ * company it is whether they are on this job, which is the only thing that
+ * distinguishes two otherwise identical vendor names in a long list.
+ */
+function comboSub(option) {
+  if (option.company) return `<span class="combo-sub">${esc(option.company)}</span>`;
+  if (option.onProject) return '<span class="combo-sub">on this project</span>';
+  return '';
 }
 
 function optionLabel(list, id) {
@@ -827,7 +855,7 @@ function openNameCombo(input) {
             `<li role="option" id="name-opt-${i}" data-id="${o.id}" aria-selected="false">${highlight(
               o.name,
               terms.join(' '),
-            )}${o.company ? `<span class="combo-sub">${esc(o.company)}</span>` : ''}</li>`,
+            )}${comboSub(o)}</li>`,
         )
         .join('')
     : `<li class="combo-empty">No match for “${esc(input.value)}”</li>`;

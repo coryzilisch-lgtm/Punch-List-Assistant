@@ -102,17 +102,31 @@ export async function probeHandler(
   // 3. Which dropdowns will actually have values?
   try {
     const config = await getProjectPunchConfig(projectId);
+    const onProject = config.vendors.filter((v) => v.onProject).length;
     const parts = [
       `${config.punchItemTypes.length} type(s)`,
       `${config.locations.length} location(s)`,
       `${config.trades.length} trade(s)`,
       `${config.users.length} project user(s)`,
-      `${config.vendors.length} vendor(s)`,
+      // Which vendors are on THIS job is the number worth seeing: a picker of
+      // 900 company-wide vendors and one of 12 subs on site are very different
+      // experiences behind the same total.
+      `${config.vendors.length} vendor(s)${onProject ? ` (${onProject} on this project)` : ''}`,
     ].join(', ');
+    // Naming the path that served each list is the single most useful line here.
+    // Trades and Vendors both 404'd because the PATH was wrong, and the app now
+    // discovers it at runtime — so which one won is the thing to read when a
+    // dropdown is unexpectedly empty.
+    const via = Object.entries(config.sources)
+      .map(([group, source]) => `${group} via ${source}`)
+      .join('; ');
     checks.push({
       name: 'Punch list configuration',
       ok: true,
-      detail: config.warnings.length ? `${parts}. Warnings: ${config.warnings.join('; ')}` : parts,
+      detail: [parts, via && `Resolved: ${via}.`, config.warnings.join(' ')]
+        .filter(Boolean)
+        .join('. ')
+        .replace(/\.\./g, '.'),
     });
   } catch (err) {
     checks.push({

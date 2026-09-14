@@ -1,6 +1,15 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
 import { errorResponse, guarded, json } from '../lib/http';
-import { companyId, listPunchItems, ProcoreError, procoreConfigured, procoreRequest } from '../lib/procore';
+import {
+  companyId,
+  forgetListEndpoints,
+  getProjectPunchConfig,
+  listCandidates,
+  listPunchItems,
+  ProcoreError,
+  procoreConfigured,
+  procoreRequest,
+} from '../lib/procore';
 import { fabricConfigured, findVendorTables } from '../lib/fabric';
 
 /**
@@ -244,28 +253,26 @@ async function probeImpersonation(userId: string) {
 /**
  * Which list endpoints this tenant actually serves.
  *
- * Vendors and Trades both come back 404, which means the paths are wrong rather
+ * Vendors and Trades both came back 404, which means the paths were wrong rather
  * than the data missing — Procore is inconsistent about whether a company-scoped
  * collection is nested (`/companies/{id}/thing`) or flat with a query parameter
  * (`/thing?company_id=`), and this integration has already paid three times for
- * guessing at that. The two that work are included as controls: if a known-good
- * path also 404s here, the probe itself is wrong, not the tenant.
+ * guessing at that.
+ *
+ * The candidates come from `listCandidates()` in the client, so this probes
+ * **exactly** what the app will try at runtime. A probe with its own private
+ * list answers a question nobody asked: it can pass while the app still fails,
+ * or blame the tenant for a path the app never uses.
+ *
+ * Punch item types and locations are included as controls: they already work, so
+ * if they also 404 here then the probe is wrong rather than the tenant.
  *
  * Read-only. Each call asks for a single row.
  */
 async function probeLists(projectId: number) {
-  const company = companyId();
   const candidates: Array<{ group: string; path: string; query: Record<string, string | number> }> = [
-    { group: 'trades', path: `/rest/v1.0/companies/${company}/trades`, query: {} },
-    { group: 'trades', path: '/rest/v1.0/trades', query: { company_id: company } },
-    { group: 'trades', path: '/rest/v1.0/trades', query: { project_id: projectId } },
-    { group: 'trades', path: `/rest/v1.0/projects/${projectId}/trades`, query: {} },
-    { group: 'trades', path: `/rest/v1.1/companies/${company}/trades`, query: {} },
-
-    { group: 'vendors', path: '/rest/v1.0/vendors', query: { company_id: company } },
-    { group: 'vendors', path: `/rest/v1.0/companies/${company}/vendors`, query: {} },
-    { group: 'vendors', path: `/rest/v1.1/companies/${company}/vendors`, query: {} },
-    { group: 'vendors', path: `/rest/v1.0/projects/${projectId}/vendors`, query: {} },
+    ...listCandidates('trades', projectId).map((c) => ({ group: 'trades', path: c.path, query: c.query })),
+    ...listCandidates('vendors', projectId).map((c) => ({ group: 'vendors', path: c.path, query: c.query })),
 
     // Controls — these already work.
     { group: 'control', path: '/rest/v1.0/punch_item_types', query: { project_id: projectId } },
@@ -283,6 +290,11 @@ async function probeLists(projectId: number) {
         ...c,
         ok: true,
         isArray: Array.isArray(rows),
+        // ⚠️ A 200 with no rows is NOT the same as a working path — that is how
+        // the curated project team hid for two sessions in the sibling repo.
+        // Runtime discovery only accepts a candidate that returns rows, so this
+        // has to report emptiness as loudly as it reports an error.
+        rowsReturned: Array.isArray(rows) ? rows.length : null,
         sampleKeys: first && typeof first === 'object' ? Object.keys(first).sort() : null,
         sample: first ?? null,
       });
@@ -344,6 +356,10 @@ export async function inspectHandler(
   const punchItemId = Number(request.query.get('punch_item_id') || 0);
 
   if (request.query.get('lists')) {
+    // Discovery memoizes its verdict for the life of the Function instance, and
+    // a probe that reports a remembered answer is reporting the past.
+    forgetListEndpoints();
+
     const [lists, projectUsers, fabricVendors] = await Promise.all([
       probeLists(projectId),
       probeProjectUserVendor(projectId).catch((err) => ({ error: String(err) })),
@@ -351,7 +367,26 @@ export async function inspectHandler(
         ? findVendorTables().catch((err) => ({ error: String(err) }))
         : Promise.resolve({ error: 'Fabric is not configured on this deployment.' }),
     ]);
-    return json({ projectId, lists, projectUsers, fabricVendors });
+
+    // The candidate table above says what each path answered; this says what the
+    // app concludes from it — which is the question actually being asked, since
+    // the app picks its own path at runtime now.
+    const resolved = await getProjectPunchConfig(projectId)
+      .then((c) => ({
+        sources: c.sources,
+        warnings: c.warnings,
+        counts: {
+          punchItemTypes: c.punchItemTypes.length,
+          locations: c.locations.length,
+          trades: c.trades.length,
+          vendors: c.vendors.length,
+          vendorsOnProject: c.vendors.filter((v) => v.onProject).length,
+          users: c.users.length,
+        },
+      }))
+      .catch((err) => ({ error: String(err) }));
+
+    return json({ projectId, resolved, lists, projectUsers, fabricVendors });
   }
 
   if (request.query.get('uploads')) {

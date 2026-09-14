@@ -420,6 +420,187 @@ export interface NamedRef {
 }
 
 /**
+ * ── Where a company-scoped list actually lives ──────────────────────────────
+ *
+ * Trades and Vendors both answered 404, and a 404 on a list endpoint means the
+ * PATH is wrong, not that the data is missing. Procore is inconsistent about
+ * whether a company-scoped collection is nested (`/companies/{id}/thing`) or
+ * flat with a query parameter (`/thing?company_id=`), and the reference that
+ * would settle it is unreachable from this build environment — the egress proxy
+ * answers CONNECT for `developers.procore.com` and its `procore.github.io`
+ * mirror with a 403.
+ *
+ * Guessing again is the move that has already cost this integration three
+ * silent failures. So the app asks the tenant instead: try the candidates and
+ * keep the one that answers. Unlike the write chains this is free to do at
+ * runtime — every candidate is a GET, so a wrong guess costs one request and
+ * changes nothing — and the answer verifies itself, because a list of
+ * `{id, name}` rows IS the contract.
+ *
+ * ⚠️ **A 200 with an empty array does not win.** That is precisely how the
+ * curated project team hid for two sessions in the sibling repo: the nested form
+ * answered `200 []` and the flat form was the correct one. So discovery prefers
+ * a candidate with ROWS, and only reports "reachable but empty" once every
+ * candidate has been tried. Empty-but-reachable and 404-everywhere are different
+ * facts about the tenant and are reported differently.
+ */
+export interface ListCandidate {
+  label: string;
+  path: string;
+  query: Record<string, string | number>;
+}
+
+/**
+ * The candidates, defined once.
+ *
+ * `/api/inspect?lists=1` probes this same list, so what the probe reports is
+ * exactly what the app will try. A probe that tests different paths from the
+ * ones the code uses answers a question nobody asked.
+ */
+export function listCandidates(group: 'trades' | 'vendors', projectId: number): ListCandidate[] {
+  const company = companyId();
+  if (group === 'trades') {
+    return [
+      { label: 'GET /rest/v1.0/companies/{company}/trades', path: `/rest/v1.0/companies/${company}/trades`, query: {} },
+      { label: 'GET /rest/v1.0/trades?company_id', path: '/rest/v1.0/trades', query: { company_id: company } },
+      { label: 'GET /rest/v1.0/projects/{project}/trades', path: `/rest/v1.0/projects/${projectId}/trades`, query: {} },
+      { label: 'GET /rest/v1.0/trades?project_id', path: '/rest/v1.0/trades', query: { project_id: projectId } },
+      { label: 'GET /rest/v1.1/companies/{company}/trades', path: `/rest/v1.1/companies/${company}/trades`, query: {} },
+    ];
+  }
+  return [
+    { label: 'GET /rest/v1.0/projects/{project}/vendors', path: `/rest/v1.0/projects/${projectId}/vendors`, query: {} },
+    { label: 'GET /rest/v1.0/vendors?project_id', path: '/rest/v1.0/vendors', query: { project_id: projectId } },
+    { label: 'GET /rest/v1.0/companies/{company}/vendors', path: `/rest/v1.0/companies/${company}/vendors`, query: {} },
+    { label: 'GET /rest/v1.0/vendors?company_id', path: '/rest/v1.0/vendors', query: { company_id: company } },
+    { label: 'GET /rest/v1.1/companies/{company}/vendors', path: `/rest/v1.1/companies/${company}/vendors`, query: {} },
+  ];
+}
+
+/**
+ * What discovery concluded about one group.
+ *
+ * `found` — this candidate returned rows; use it.
+ * `empty` — something answered, with no rows. The tenant has none defined.
+ * `missing` — every candidate 404'd. The paths are all wrong, or the tool is off.
+ */
+export interface ListResolution {
+  group: string;
+  outcome: 'found' | 'empty' | 'missing';
+  candidate: ListCandidate | null;
+  tried: Array<{ label: string; status: number | null; rows: number | null }>;
+  /** Set when the page budget ran out before the list did. */
+  truncated?: boolean;
+}
+
+/**
+ * How long one discovered list may spend paging.
+ *
+ * A company-wide vendor list is the first thing in this app that can be genuinely
+ * large — a GC of this size has hundreds of vendors — and it now runs on every
+ * config load, where before it 404'd instantly. SWA kills the Function at 45
+ * seconds with an error the app cannot catch, so this stops early and says it was
+ * truncated rather than taking the whole request down with it.
+ */
+const LIST_BUDGET_MS = 12_000;
+
+/**
+ * Remember what answered, for the same reason the write chains do.
+ *
+ * A config load is one request, but the review screen reloads it per project and
+ * a super picks several projects a day. Re-proving a five-candidate chain each
+ * time spends the Procore quota this app shares with the Safety Dashboard ingest
+ * on an answer that cannot change between two calls a minute apart.
+ *
+ * Keyed by group and project, because the project-scoped candidates can
+ * legitimately differ per project — a tool can be enabled on one job and not
+ * another.
+ */
+const listMemo = new Map<string, ListResolution>();
+
+/** Exposed so a probe can force fresh discovery rather than reading the memory. */
+export function forgetListEndpoints(): void {
+  listMemo.clear();
+}
+
+/**
+ * Ask the tenant which candidate serves this list, then page it in full.
+ *
+ * Transient failures (429, 5xx, network) abort discovery WITHOUT recording a
+ * verdict — the same rule the write chains learned the hard way. A rate limit
+ * recorded as "this path does not exist" would poison every later call with a
+ * fact about the clock.
+ */
+export async function resolveList<T extends NamedRef>(
+  group: 'trades' | 'vendors',
+  projectId: number,
+): Promise<{ rows: T[]; resolution: ListResolution }> {
+  const key = `${group}:${projectId}`;
+  const remembered = listMemo.get(key);
+
+  // A remembered candidate is re-read, not re-discovered: the path cannot change
+  // between two calls, but its CONTENTS can. That distinction matters for the
+  // `empty` verdict — somebody defining the first Trade in Procore must not be
+  // invisible until the Function instance recycles.
+  if (remembered?.candidate) {
+    const page = await paginateWithBudget<T>(
+      remembered.candidate.path,
+      { query: remembered.candidate.query },
+      100,
+      LIST_BUDGET_MS,
+    );
+    return {
+      rows: page.rows,
+      resolution: {
+        ...remembered,
+        outcome: page.rows.length ? 'found' : remembered.outcome,
+        truncated: page.truncated,
+      },
+    };
+  }
+
+  // `missing` is the one verdict worth not re-proving: five 404s is a fact about
+  // the contract, and re-checking it on every config load spends a quota shared
+  // with the Safety Dashboard ingest on an answer that will not have changed.
+  if (remembered) return { rows: [], resolution: remembered };
+
+  const tried: ListResolution['tried'] = [];
+  let reachableButEmpty: ListCandidate | null = null;
+
+  for (const candidate of listCandidates(group, projectId)) {
+    try {
+      const body = await procoreRequest<unknown>('GET', candidate.path, {
+        query: { ...candidate.query, per_page: 1 },
+      });
+      const rows = Array.isArray(body) ? body : [];
+      tried.push({ label: candidate.label, status: 200, rows: rows.length });
+      if (rows.length) {
+        const resolution: ListResolution = { group, outcome: 'found', candidate, tried };
+        listMemo.set(key, resolution);
+        const page = await paginateWithBudget<T>(candidate.path, { query: candidate.query }, 100, LIST_BUDGET_MS);
+        return { rows: page.rows, resolution: { ...resolution, truncated: page.truncated } };
+      }
+      // 200 with no rows is not proof of the right path — keep looking, and fall
+      // back to this only if nothing else has any.
+      reachableButEmpty ??= candidate;
+    } catch (err) {
+      if (isTransient(err)) throw err; // no verdict from a bad moment
+      tried.push({
+        label: candidate.label,
+        status: err instanceof ProcoreError ? err.status : null,
+        rows: null,
+      });
+    }
+  }
+
+  const resolution: ListResolution = reachableButEmpty
+    ? { group, outcome: 'empty', candidate: reachableButEmpty, tried }
+    : { group, outcome: 'missing', candidate: null, tried };
+  listMemo.set(key, resolution);
+  return { rows: [], resolution };
+}
+
+/**
  * Everything the review UI needs to offer real Procore values in its dropdowns
  * instead of free text. Each lookup is independent and individually optional —
  * a tenant that does not use Trades, or a project with no Locations defined,
@@ -431,14 +612,84 @@ export interface ProjectPunchConfig {
   punchItemTypes: NamedRef[];
   locations: NamedRef[];
   trades: NamedRef[];
-  vendors: NamedRef[];
+  /**
+   * `onProject` marks a company that has somebody in THIS project's directory —
+   * a sub actually on this job, rather than one of the hundreds the company has
+   * ever contracted. The review screen floats those to the top of the picker.
+   */
+  vendors: Array<NamedRef & { onProject?: boolean }>;
   users: Array<NamedRef & { email?: string | null; company?: string | null }>;
   /** Lookups that failed, so the UI can say which dropdown is empty and why. */
   warnings: string[];
+  /**
+   * Where each list came from, for the connection check. Which path served a
+   * list is the single most useful diagnostic here — the failure being fixed was
+   * a wrong path reported as missing data.
+   */
+  sources: Record<string, string>;
+}
+
+interface DirectoryUser {
+  id: number;
+  name: string;
+  email_address?: string;
+  vendor?: { id?: unknown; name?: unknown } | null;
+}
+
+/**
+ * The subs on THIS job, taken from the project's own directory.
+ *
+ * Every row in `/projects/{id}/users` carries the company that person works for,
+ * and that is a better vendor list than the company-wide one for the job at
+ * hand: it is who is actually on site, not every vendor the company has ever
+ * used. It also needs no new endpoint — the directory call already succeeds
+ * today, which is what makes this the reliable half of the fix.
+ *
+ * ⚠️ Only rows whose vendor carries a numeric **Procore** id are used. A name
+ * without an id cannot be sent, and an id from another system would assign the
+ * item to the wrong company silently — the exact class of failure this
+ * integration has already shipped three times. So this checks, it does not
+ * assume.
+ */
+export function vendorsFromDirectory(users: DirectoryUser[]): NamedRef[] {
+  const byId = new Map<number, NamedRef>();
+  for (const user of users) {
+    const vendor = user.vendor;
+    if (!vendor || typeof vendor !== 'object') continue;
+    const id = Number(vendor.id);
+    const name = typeof vendor.name === 'string' ? vendor.name.trim() : '';
+    if (!Number.isFinite(id) || id <= 0 || !name) continue;
+    if (!byId.has(id)) byId.set(id, { id, name });
+  }
+  return [...byId.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Merge the two vendor sources without letting either hide a company.
+ *
+ * The subs on this job are what a super wants nine times in ten, so they are
+ * flagged `onProject` and shown first. But the company-wide list is kept
+ * alongside rather than replaced: a sub with no user in the project directory
+ * would otherwise be unpickable, and "the company is not in the list" is a dead
+ * end in the field, where "the list is long" is only an annoyance.
+ */
+export function mergeVendors(
+  onProject: NamedRef[],
+  companyWide: NamedRef[],
+): Array<NamedRef & { onProject?: boolean }> {
+  const out: Array<NamedRef & { onProject?: boolean }> = onProject.map((v) => ({ ...v, onProject: true }));
+  const seen = new Set(onProject.map((v) => v.id));
+  for (const vendor of companyWide) {
+    if (!Number.isFinite(Number(vendor.id)) || seen.has(vendor.id)) continue;
+    seen.add(vendor.id);
+    out.push(vendor);
+  }
+  return out;
 }
 
 export async function getProjectPunchConfig(projectId: number): Promise<ProjectPunchConfig> {
   const warnings: string[] = [];
+  const sources: Record<string, string> = {};
 
   const soft = async <T>(label: string, fn: () => Promise<T[]>): Promise<T[]> => {
     try {
@@ -450,37 +701,89 @@ export async function getProjectPunchConfig(projectId: number): Promise<ProjectP
     }
   };
 
-  const [punchItemTypes, locations, trades, vendors, users] = await Promise.all([
+  /**
+   * Run a discovered list and turn its outcome into something a super can act
+   * on. "Vendors unavailable (404)" told nobody what to do next; naming the
+   * paths that were tried at least says where to look, and separating "the
+   * tenant has none" from "no path answered" stops a configuration choice being
+   * reported as a broken integration.
+   */
+  const discovered = async (
+    group: 'trades' | 'vendors',
+    label: string,
+  ): Promise<{ rows: NamedRef[]; note: string | null }> => {
+    try {
+      const { rows, resolution } = await resolveList<NamedRef>(group, projectId);
+      if (resolution.outcome === 'found' && resolution.candidate) {
+        sources[group] = resolution.candidate.label;
+        return {
+          rows,
+          note: resolution.truncated
+            ? `${label}: showing the first ${rows.length}. The full list was too long to read inside one request.`
+            : null,
+        };
+      }
+      if (resolution.outcome === 'empty') {
+        sources[group] = `${resolution.candidate?.label ?? 'reachable'} — none defined`;
+        return { rows: [], note: `${label}: none are defined in Procore for this project.` };
+      }
+      sources[group] = 'no endpoint answered';
+      return {
+        rows: [],
+        note:
+          `${label} unavailable — none of ${resolution.tried.length} paths answered ` +
+          `(${resolution.tried.map((t) => `${t.label} → ${t.status ?? 'error'}`).join(', ')}).`,
+      };
+    } catch (err) {
+      // Transient only — discovery rethrows those rather than recording a verdict.
+      return { rows: [], note: `${label} could not be read right now (${describeError(err)}). Try again.` };
+    }
+  };
+
+  const [punchItemTypes, locations, trades, companyVendors, users] = await Promise.all([
     soft('Punch item types', () =>
       procorePaginate<NamedRef>('/rest/v1.0/punch_item_types', { query: { project_id: projectId } }),
     ),
     soft('Locations', () =>
       procorePaginate<NamedRef>('/rest/v1.0/locations', { query: { project_id: projectId } }),
     ),
-    soft('Trades', () =>
-      procorePaginate<NamedRef>('/rest/v1.0/trades', { query: { project_id: projectId } }),
-    ),
-    soft('Vendors', () =>
-      procorePaginate<NamedRef>(`/rest/v1.0/companies/${companyId()}/vendors`, {}),
-    ),
+    discovered('trades', 'Trades'),
+    discovered('vendors', 'Vendors'),
     soft('Project users', () =>
-      procorePaginate<{ id: number; name: string; email_address?: string; vendor?: { name?: string } }>(
-        `/rest/v1.0/projects/${projectId}/users`,
-        {},
-      ),
+      procorePaginate<DirectoryUser>(`/rest/v1.0/projects/${projectId}/users`, {}),
     ),
   ]);
+
+  if (trades.note) warnings.push(trades.note);
+
+  const directoryVendors = vendorsFromDirectory(users as DirectoryUser[]);
+  const vendors = mergeVendors(directoryVendors, companyVendors.rows);
+
+  if (directoryVendors.length) {
+    sources.vendorsOnProject = `${directoryVendors.length} from this project's directory`;
+  }
+  // The company-wide lookup failing is only worth telling anyone about if the
+  // picker ends up empty. When the project's own directory supplied the subs on
+  // this job, the field works, and reporting a path that did not answer would be
+  // crying wolf on the one card a super is meant to read before starting.
+  if (companyVendors.note && (!vendors.length || companyVendors.rows.length)) {
+    warnings.push(companyVendors.note);
+  }
 
   return {
     projectId,
     punchItemTypes,
     locations,
-    trades,
+    trades: trades.rows,
     vendors,
-    users: (users as Array<{ id: number; name: string; email_address?: string; vendor?: { name?: string } }>).map(
-      (u) => ({ id: u.id, name: u.name, email: u.email_address ?? null, company: u.vendor?.name ?? null }),
-    ),
+    users: (users as DirectoryUser[]).map((u) => ({
+      id: u.id,
+      name: u.name,
+      email: u.email_address ?? null,
+      company: (typeof u.vendor?.name === 'string' ? u.vendor.name : null) ?? null,
+    })),
     warnings,
+    sources,
   };
 }
 
