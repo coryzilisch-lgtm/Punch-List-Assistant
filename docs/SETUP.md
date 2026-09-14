@@ -667,3 +667,46 @@ complete.
 A push is ~2 requests per item, ~4 with send, and is deliberately left alone: the
 read-backs after each write are the only thing standing between this app and the
 silent-failure mode it has already hit three times.
+
+
+## ⚠️ `staticwebapp.config.json` must live in `dashboard/`
+
+Found the hard way on 2026-09-14, after "nothing is asking me to sign in".
+
+The file requires `allowedRoles: ["authenticated"]` on `/*` and `/api/*` and
+redirects a 401 to `/.auth/login/aad`. It was at the **repo root**, while this
+workflow deploys `app_location: "./dashboard"`. **SWA reads that file from the
+deployed app folder**, so it was never applied — and the failure is completely
+silent. No warning, no log line, no failed deploy. The app simply had no auth,
+no CSP and no route rules, and both the README and CLAUDE.md said otherwise.
+
+The consequence was not cosmetic: the dashboard **and every `/api/*` route** —
+including `POST /api/push`, which creates punch items in live Procore projects —
+were reachable by anyone with the URL.
+
+Two changes:
+
+- The file now lives at `dashboard/staticwebapp.config.json`. **Do not move it
+  back**, and if `app_location` ever changes, move it with it.
+- `guarded()` refuses any request without an SWA principal, in code. The platform
+  rule is the front door; this is the deadbolt. A config file in the wrong folder
+  can no longer switch the gate off.
+
+### Before you merge a change that turns the gate on
+
+`AAD_CLIENT_ID` and `AAD_CLIENT_SECRET` must exist in the Static Web App's
+**Production** environment variables (step 4), the app registration needs **ID
+tokens** ticked (step 3.1), and its redirect URI must be
+`https://<swa-host>/.auth/login/aad/callback` (step 3).
+
+If any of those is missing, the Entra redirect cannot complete — and now that the
+routes require an identity, that reads as a locked door rather than an open one.
+Nobody gets in, including you. It is recoverable in a minute from the portal, but
+check first rather than discovering it from a superintendent.
+
+### How to tell whether the gate is actually on
+
+Open the site in a **private / incognito window**. Being already signed in is the
+one thing that makes an ungated app look gated, which is exactly what hid this
+for so long. A prompt from Microsoft means it works; the app loading straight
+into the project picker means it does not.

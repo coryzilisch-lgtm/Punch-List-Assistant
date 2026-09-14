@@ -27,9 +27,21 @@ export interface ClientPrincipal {
 }
 
 /**
- * Parse the SWA-injected principal. The route config already requires
- * `authenticated`, so this is identity for attribution (who imported what),
- * not an access gate.
+ * Parse the SWA-injected principal.
+ *
+ * ⚠️ This used to be described as "identity for attribution, not an access
+ * gate", on the grounds that the route config already required `authenticated`.
+ * That was true of the file and false of the deployment: `staticwebapp.config.json`
+ * sat at the repo root while the workflow deploys `app_location: ./dashboard`,
+ * so SWA never read it and **nothing was gated at all** — the dashboard and
+ * every `/api/*` route, including the ones that write into live Procore
+ * projects, were reachable by anyone with the URL.
+ *
+ * The file is in the right place now. It is also no longer the only thing
+ * standing between an anonymous request and a punch item: `guarded()` refuses a
+ * request with no principal, in code, where a misplaced config cannot silently
+ * switch it off. This repo's whole discipline is that a 2xx is not evidence —
+ * the same applies to a platform setting nobody has watched enforce anything.
  */
 export function getPrincipal(request: HttpRequest): ClientPrincipal | null {
   const header = request.headers.get('x-ms-client-principal');
@@ -71,6 +83,24 @@ export function guarded(
   handler: (request: HttpRequest, context: InvocationContext) => Promise<HttpResponseInit>,
 ) {
   return async (request: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> => {
+    // Defence in depth, and the lesson of this bug: the SWA route rules are the
+    // front door, but they live in a file that was in the wrong folder for the
+    // life of this app without anyone noticing. A request that arrives without
+    // an identity does not get to create punch items, whatever the platform
+    // thinks.
+    //
+    // Note this also 401s a local `func start`, which has no SWA principal to
+    // inject. That is deliberate — an env flag to bypass an auth check is how
+    // auth checks get bypassed in production.
+    if (!getPrincipal(request)) {
+      context.warn(`${name} refused an unauthenticated request`);
+      return errorResponse(
+        401,
+        'You are not signed in. Reload the page to sign in with your Buffalo account.',
+        { signInUrl: '/.auth/login/aad' },
+      );
+    }
+
     try {
       return await handler(request, context);
     } catch (err) {

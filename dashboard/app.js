@@ -70,12 +70,49 @@ async function api(path, options) {
     body = { error: text.slice(0, 400) };
   }
   if (!res.ok) {
+    // A 401 means the sign-in expired, or the tab has been open since before
+    // the Entra gate was switched on. Neither is a problem with the request the
+    // super just made, and "Request failed (HTTP 401)" sends people hunting for
+    // one — the same reason a bodyless 404 is reported as a deploy problem.
+    if (res.status === 401) {
+      showSignInRequired(body?.signInUrl || '/.auth/login/aad');
+      const err = new Error('You are signed out. Sign in with your Buffalo account to continue.');
+      err.status = 401;
+      throw err;
+    }
     const err = new Error(body?.error || `Request failed (HTTP ${res.status})`);
     err.status = res.status;
     err.body = body;
     throw err;
   }
   return body;
+}
+
+/**
+ * Cover the app with a sign-in prompt rather than letting it look broken.
+ *
+ * Deliberately not an automatic redirect: a super mid-review has unsaved work on
+ * screen, and navigating away without asking would lose it. Signing in opens in
+ * this tab only when they choose to.
+ */
+let signInShown = false;
+function showSignInRequired(signInUrl) {
+  if (signInShown) return;
+  signInShown = true;
+  const cover = document.createElement('div');
+  cover.id = 'signin-required';
+  cover.style.cssText =
+    'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;' +
+    'background:rgba(23,28,38,.92);color:#fff;font-size:15px;line-height:1.5;padding:24px;text-align:center';
+  cover.innerHTML =
+    '<div style="max-width:420px">' +
+    '<div style="font-size:19px;font-weight:600;margin-bottom:10px">Please sign in</div>' +
+    '<p style="margin:0 0 18px;color:#cbd5e0">This tool is for Buffalo Construction employees. ' +
+    'Your session has expired or you are not signed in.</p>' +
+    `<a href="${signInUrl}" style="display:inline-block;background:#FF5F00;color:#fff;` +
+    'text-decoration:none;padding:10px 20px;border-radius:6px;font-weight:600">' +
+    'Sign in with Microsoft</a></div>';
+  document.body.appendChild(cover);
 }
 
 function note(kind, html) {
