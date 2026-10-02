@@ -74,6 +74,30 @@ nightly sync.
 
 ---
 
+## 🛑 Sending is OFF by default — 2026-10-01 incident
+
+One import put **~350 emails** in front of every sub on a project, and they kept
+arriving until the items were deleted in Procore. The app has no timer, queue or
+background trigger, so nothing sends without a button press, but three things in
+the code could each multiply one send:
+
+1. `procoreRequest` retried **writes** on a 5xx or a dropped socket, though
+   Procore may already have performed them. Writes now retry only on 401/429,
+   which Procore answers before doing anything.
+2. The send chain tried **up to three different send writes per item** whenever
+   the read-back could not prove the first one worked. It now stops at the first
+   write Procore accepts and reports "unverified" instead.
+3. A batch killed at 45s was shown as "rejected, still selected so you can
+   resend", although some of it had been created **and sent**. The dashboard now
+   marks such a batch "may already be in Procore", unticks it, and says not to push
+   it again until the punch list has been checked.
+
+**`PUNCH_SEND_ENABLED=true`** must be set in the SWA app settings for the app to
+send at all (`/api/push` with `send`, and `/api/resend`). Without it the app
+creates Drafts and the super sends from Procore. Do not turn it back on until
+the incident's root cause has been read out of the function logs (`push ok …
+send=<strategy>` lines, by time and by user) rather than inferred.
+
 ## Who can open this
 
 Single-tenant Entra sign-in, enforced two ways on purpose.

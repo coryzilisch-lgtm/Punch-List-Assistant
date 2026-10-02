@@ -41,6 +41,12 @@ const S = {
   sending: false,
   /** Move created items out of Draft. Off by default — sending notifies people. */
   sendOnPush: false,
+  /**
+   * Whether the server will send at all (PUNCH_SEND_ENABLED). Assumed false until
+   * /api/health says otherwise: a send is what emails every sub on the job, and
+   * one push put ~350 of those in front of them.
+   */
+  sendEnabled: false,
 };
 
 let nextItemId = 1;
@@ -465,6 +471,10 @@ async function loadUnsentDrafts() {
   const card = $('drafts-card');
   card.style.display = 'none';
   const project = S.project;
+  // With sending off there is nothing this card can do: it exists to offer a
+  // send, and listing every punch item to find drafts is the app's most
+  // expensive read.
+  if (!S.sendEnabled) return;
 
   let data;
   try {
@@ -748,6 +758,15 @@ function renderReadNotes() {
     .filter(Boolean);
 
   let html = '';
+  if (uncertain.length) {
+    html += note(
+      'error',
+      `<strong>${uncertain.length} item${uncertain.length === 1 ? '' : 's'} may already be in Procore.</strong> ` +
+        `The server stopped answering partway through, so it cannot say what it finished. ` +
+        `<strong>Do not push these again</strong> until you have checked the project's punch list in Procore — ` +
+        `pushing them again creates duplicates and can email the same subs twice. They have been unticked.`,
+    );
+  }
   if (failed.length) {
     html += note(
       'error',
@@ -1405,7 +1424,13 @@ function renderSendSummary() {
         'press <strong>Apply to selected items</strong>.',
     );
   }
-  html += `
+  if (!S.sendEnabled) {
+    html += note(
+      'info',
+      '<strong>Items are created as Drafts.</strong> Sending from this app is switched off, so nothing here ' +
+        'emails anyone. Review the items in Procore and send them from there.',
+    );
+  } else html += `
     <label class="sendopt">
       <input type="checkbox" id="send-opt" ${S.sendOnPush ? 'checked' : ''} />
       <span>
@@ -1471,8 +1496,20 @@ async function doPush(dryRun) {
       S.results.push(...res.results);
       if (dryRun) payloads.push(...res.results.map((r) => r.payload));
     } catch (err) {
+      // A 4xx from our own API is a refusal before anything was written, so the
+      // items are safe to fix and push again. Anything else — the 45-second kill
+      // ("Backend call failure"), a 5xx, a dropped connection — means the server
+      // may have created and SENT some of this batch before it died. Treating
+      // those as "rejected, still selected" is how a super pushes the same items
+      // again and emails every sub on the job a second and third time.
+      const refused = !dryRun && err.status >= 400 && err.status < 500;
       for (const item of batch) {
-        S.results.push({ clientId: String(item.id), ok: false, error: err.message });
+        S.results.push({
+          clientId: String(item.id),
+          ok: false,
+          uncertain: !dryRun && !refused,
+          error: err.message,
+        });
       }
     }
 
@@ -1491,7 +1528,7 @@ async function doPush(dryRun) {
     // duplicates — the most damaging mistake this tool could make, since a
     // duplicate punch item means two subs dispatched for one defect.
     for (const r of S.results) {
-      if (r.ok) {
+      if (r.ok || r.uncertain) {
         const item = S.items.find((i) => String(i.id) === r.clientId);
         if (item) item.include = false;
       }
@@ -1504,7 +1541,8 @@ async function doPush(dryRun) {
 
 function renderResults() {
   const created = S.results.filter((r) => r.ok);
-  const failed = S.results.filter((r) => !r.ok);
+  const uncertain = S.results.filter((r) => !r.ok && r.uncertain);
+  const failed = S.results.filter((r) => !r.ok && !r.uncertain);
 
   let html = '';
   if (created.length) {
@@ -1589,6 +1627,11 @@ function renderResults() {
       const fields = r.fieldErrors?.length
         ? `<br><span class="muted">Procore said: ${esc(r.fieldErrors.join('; '))}</span>`
         : '';
+      if (r.uncertain) {
+        return `<div class="result-row fail"><span class="ic">?</span><span>${label}<br><span class="muted">Unknown — check Procore before pushing again. ${esc(
+          r.error || '',
+        )}</span></span></div>`;
+      }
       return `<div class="result-row fail"><span class="ic">✕</span><span>${label}<br><span class="muted">${esc(
         r.error || 'Failed',
       )}</span>${fields}</span></div>`;
@@ -1597,7 +1640,9 @@ function renderResults() {
 
   // Items that exist in Procore but never left Draft can be finished without
   // creating anything — pushing the list again would duplicate every row.
-  const unsent = S.results.filter((r) => r.ok && r.punchItemId && r.sendErrors?.length);
+  const unsent = S.sendEnabled
+    ? S.results.filter((r) => r.ok && r.punchItemId && r.sendErrors?.length)
+    : [];
   if (unsent.length) {
     html +=
       `<div class="note warn" style="margin-top:14px">` +
@@ -1775,6 +1820,14 @@ async function init() {
   } catch {
     // Identity is for attribution only; the app still works without it.
   }
+
+  try {
+    const health = await api('/api/health');
+    S.sendEnabled = health?.sendEnabled === true;
+  } catch {
+    S.sendEnabled = false;
+  }
+  if (!S.sendEnabled) S.sendOnPush = false;
 
   await loadProjects();
   preselectFromUrl();

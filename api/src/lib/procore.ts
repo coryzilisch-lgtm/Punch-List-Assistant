@@ -96,6 +96,20 @@ export function procoreConfigured(): boolean {
   );
 }
 
+/**
+ * Whether this deployment may move items out of Draft at all.
+ *
+ * Sending is the only thing this app does that emails people outside Buffalo:
+ * the punch item manager, the assignees and their companies. A push on
+ * 2026-10-01 put ~350 emails in front of every sub on one project, so sending
+ * is now OFF unless `PUNCH_SEND_ENABLED=true` is set in the app settings. The
+ * default being off is the point: a missing setting creates Drafts, which the
+ * super sends from Procore, rather than emailing thirty companies.
+ */
+export function sendEnabled(): boolean {
+  return (process.env.PUNCH_SEND_ENABLED || '').trim().toLowerCase() === 'true';
+}
+
 export function companyId(): string {
   const id = process.env.PROCORE_COMPANY_ID;
   if (!id) throw new Error('PROCORE_COMPANY_ID is not set');
@@ -208,6 +222,13 @@ export async function procoreRequest<T = unknown>(
 
   let forceRefresh = false;
 
+  // A write that failed with a 5xx or a dropped connection may still have been
+  // performed — Procore can store the item, send the notifications, and then
+  // fail to answer. Retrying it is how one send becomes several emails to the
+  // same subs. Only GETs retry on those; a write retries only on 401 and 429,
+  // which Procore answers BEFORE doing anything.
+  const idempotent = method.toUpperCase() === 'GET';
+
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     const token = await getToken(forceRefresh);
     forceRefresh = false;
@@ -236,7 +257,7 @@ export async function procoreRequest<T = unknown>(
     } catch (err) {
       // Network-level failure. Retry with backoff; a socket reset mid-run
       // should not lose a whole import.
-      if (attempt === MAX_RETRIES) throw err;
+      if (!idempotent || attempt === MAX_RETRIES) throw err;
       await sleep(backoffMs(attempt));
       continue;
     }
@@ -277,7 +298,7 @@ export async function procoreRequest<T = unknown>(
       });
     }
 
-    if (res.status >= 500 && attempt < MAX_RETRIES) {
+    if (res.status >= 500 && idempotent && attempt < MAX_RETRIES) {
       await sleep(backoffMs(attempt));
       continue;
     }
@@ -1355,6 +1376,13 @@ async function runChain<A extends unknown[]>(
   args: A,
   worked: (after: ObservedPunchItem | null) => boolean,
   rejected: string,
+  /**
+   * End the chain at the first write Procore ACCEPTS, proven or not. For a write
+   * that notifies people, a second guess is not free: if the first one did send
+   * and the read-back simply could not see it, every further strategy is another
+   * round of emails to the same subs.
+   */
+  stopOnAccepted = false,
 ): Promise<{
   strategy: string | null;
   errors: string[];
@@ -1368,6 +1396,7 @@ async function runChain<A extends unknown[]>(
       const after = await observePunchItem(projectId, punchItemId);
       if (worked(after)) return { strategy: strategy.label, errors, observed: after, transient: false };
       errors.push(`${strategy.label}: ${rejected}`);
+      if (stopOnAccepted) return { strategy: null, errors, observed: after, transient: false };
     } catch (err) {
       errors.push(`${strategy.label}: ${describeError(err)}`);
       if (isTransient(err)) return { strategy: null, errors, observed: null, transient: true };
@@ -1494,7 +1523,9 @@ export async function sendPunchItem(
     punchItemId,
     [],
     (after) => Boolean(after) && (after!.isDraft === false || workflowSignature(after) !== baseline),
-    'accepted, but nothing about the item changed',
+    'accepted, but the read-back shows no change. Not retried with another method, because the ' +
+      'first may have sent anyway — check the item in Procore before sending it again',
+    true,
   );
 
   if (run.strategy) {

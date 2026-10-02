@@ -1,6 +1,6 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
 import { errorResponse, guarded, json, readJson, userEmail } from '../lib/http';
-import { observePunchItem, procoreConfigured, sendPunchItem } from '../lib/procore';
+import { observePunchItem, procoreConfigured, sendEnabled, sendPunchItem } from '../lib/procore';
 
 /**
  * POST /api/resend — send punch items that were created but never left Draft.
@@ -34,6 +34,12 @@ export async function resendHandler(
 ): Promise<HttpResponseInit> {
   if (!procoreConfigured()) {
     return errorResponse(503, 'Procore is not configured on this deployment.');
+  }
+  if (!sendEnabled()) {
+    return errorResponse(
+      403,
+      'Sending from this app is switched off (PUNCH_SEND_ENABLED). Send these items from Procore instead.',
+    );
   }
 
   const body = await readJson<ResendBody>(request);

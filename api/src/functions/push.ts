@@ -6,6 +6,7 @@ import {
   ProcoreError,
   procoreConfigured,
   PunchItemInput,
+  sendEnabled,
   PunchPhoto,
 } from '../lib/procore';
 
@@ -107,6 +108,16 @@ export async function pushHandler(
   }
 
   const dryRun = Boolean(body.dryRun);
+
+  // Refuse the whole request rather than quietly creating Drafts: the super
+  // asked for a send, and half-honouring that is how nobody notices it did not
+  // happen. Nothing is created, so pressing again with send off is safe.
+  if (body.send && !sendEnabled()) {
+    return errorResponse(
+      403,
+      'Sending from this app is switched off (PUNCH_SEND_ENABLED). Untick "Send items" to create them as Drafts, then send them from Procore.',
+    );
+  }
 
   if (!dryRun && !procoreConfigured()) {
     return errorResponse(
