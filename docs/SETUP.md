@@ -337,17 +337,18 @@ Environment variables blade has an environment selector at the top.
 3. **Review.** Set **Punch item manager** and **Final approver** in the "Apply to
    every selected item" card — most Procore configurations require both. Fix any
    row badged **Check this**.
-4. **Preview payloads.** Press it on the send step. Nothing is created; it shows
-   exactly what would be sent. Sanity-check one item.
-5. **Send exactly one item.** Clear the selection, tick a single row, send.
+4. **Preview payloads.** Press it on the last step. Nothing is created; it shows
+   exactly what would be written. Sanity-check one item.
+5. **Create exactly one item.** Clear the selection, tick a single row, create.
    - Created → the contract is proven, go to step 6.
    - Rejected → the error row carries Procore's own message
      (`punch_item_manager_id can't be blank`). Set that field on the review step
-     and send the same one item again.
-6. **Send the rest.** Items that succeeded are unticked automatically, so you
-   cannot double-create by pressing send twice.
-7. **Check Procore.** Open the project's punch list and confirm the items are
-   there with their photos attached.
+     and create the same one item again.
+6. **Create the rest.** Items that succeeded are unticked automatically, so you
+   cannot double-create by pressing twice.
+7. **Check Procore, then send from there.** Open the project's punch list and
+   confirm the items are there as Drafts with their photos attached. Sending them
+   — which notifies the manager and assignees — is done in Procore.
 
 ---
 
@@ -417,12 +418,11 @@ use.
 ### Why `status` is not the workflow state
 
 `status` is **open / closed**. An item Procore's UI labels `Draft` reads back as
-`status: "open"`. The first version of the send step gated on
+`status: "open"`. The first version of the (since removed) send step gated on
 `status === 'draft'`, so it never ran, and because nothing errored the app
-reported nothing — a super ticked "send to the punch item manager" and silently
-got no send at all. Draft detection now checks the plausible workflow fields and
-returns **unknown** rather than `false` when none resolve, so unknown falls
-through to attempting the send instead of being read as "already sent".
+reported nothing. Draft detection reads `workflow_status` and returns **unknown**
+rather than `false` when it cannot, which is what lets the results screen flag an
+item that came back out of Draft.
 
 ### What item #275 settled
 
@@ -476,14 +476,17 @@ integration and relying on the punch item manager instead.
 
 Procore's rate limit is company-wide and this app's service account is **shared
 with the Safety Dashboard ingest**, so a push that overlaps a large sync can be
-throttled partway through. That is not a failure of the import: the items are in
-Procore, with their photos and assignees. Only the send did not happen, and they
-sit in Draft.
+throttled partway through, and a slow batch can hit the 45-second kill. Neither
+is a failed import: the items that landed are in Procore, as Drafts, with their
+photos and assignees.
 
-**Do not push the list again** — that creates duplicates of everything that
-already landed. The results screen offers **Retry sending N items**, which calls
-`POST /api/resend` with the ids that already exist and finishes them in place. It
-creates nothing, and it skips any item someone has since sent from Procore.
+**Do not push the list again** until you have checked the punch list in Procore —
+that creates duplicates of everything that already landed. A batch that died
+mid-request is shown as "may already be in Procore" and unticked for exactly
+this reason.
+
+There used to be a **Retry sending** button here (`POST /api/resend`). It went
+with sending itself after the 2026-10-01 incident — see CLAUDE.md.
 
 Two bugs made one throttled item look like a whole failed push, both fixed:
 
@@ -494,8 +497,8 @@ Two bugs made one throttled item look like a whole failed push, both fixed:
   in about 0s". The wait now never drops below the normal backoff whatever the
   header contains.
 - **A rate limit poisoned the strategy memory.** The chains remember what does
-  not work so sixty items do not re-prove it; a 429 was being recorded as "sending
-  is broken in this tenant", after which every remaining item skipped sending and
+  not work so sixty items do not re-prove it; a 429 was being recorded as "this
+  write is broken in this tenant", after which every remaining item skipped it and
   reported the same stale error. Transient failures (429, 5xx, network) now stop
   the chain without recording a verdict.
 
@@ -664,7 +667,7 @@ for 1000 from an endpoint capped at 100 makes the first page look short, which
 would silently truncate an 800-item punch list to its first 100 and present it as
 complete.
 
-A push is ~2 requests per item, ~4 with send, and is deliberately left alone: the
+A push is ~2 requests per item, and is deliberately left alone: the
 read-backs after each write are the only thing standing between this app and the
 silent-failure mode it has already hit three times.
 

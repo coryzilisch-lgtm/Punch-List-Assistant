@@ -21,8 +21,6 @@ const S = {
   projects: [],
   project: null,
   config: null,
-  /** Imports on this project that were created but never sent. */
-  drafts: [],
   fileName: null,
   pdf: null,
   pageStatus: [], // 'pending' | 'busy' | 'done' | 'skip' | 'fail'
@@ -39,8 +37,6 @@ const S = {
   },
   results: [],
   sending: false,
-  /** Move created items out of Draft. Off by default — sending notifies people. */
-  sendOnPush: false,
 };
 
 let nextItemId = 1;
@@ -187,9 +183,9 @@ function renderBar() {
   } else {
     const n = S.items.filter((i) => i.include).length;
     dry.style.display = 'inline-block';
-    next.textContent = S.sending ? 'Sending…' : `Create ${n} punch items`;
+    next.textContent = S.sending ? 'Creating…' : `Create ${n} punch items`;
     next.disabled = S.sending || n === 0;
-    summary.innerHTML = `Sending to <b>${esc(S.project?.name || '')}</b>`;
+    summary.innerHTML = `Creating Drafts in <b>${esc(S.project?.name || '')}</b>`;
   }
 }
 
@@ -445,108 +441,6 @@ async function selectProject(id) {
 
   $('readiness').innerHTML = html;
   renderBar();
-  loadUnsentDrafts();
-}
-
-/**
- * Surface imports that were created but never sent.
- *
- * The results screen can already retry a send, but only while that push is still
- * on screen. Close the tab after a push Procore rate limited partway through and
- * the unsent items vanish from the app — complete, in Draft, in the service
- * account's court where nobody is looking. Asking Procore on project select
- * means the app never depends on someone remembering.
- *
- * Failure is deliberately silent. This is a safety net beside the main task; a
- * red banner here would read as a problem with the project the super just
- * picked, which it is not.
- */
-async function loadUnsentDrafts() {
-  const card = $('drafts-card');
-  card.style.display = 'none';
-  const project = S.project;
-
-  let data;
-  try {
-    data = await api(`/api/drafts?project_id=${project.id}`);
-  } catch {
-    return;
-  }
-
-  // A project switch mid-request must not paint another job's drafts here.
-  if (S.project?.id !== project.id) return;
-  if (data.unknown || !data.drafts?.length) return;
-
-  S.drafts = data.drafts;
-  card.style.display = 'block';
-  renderUnsentDrafts();
-}
-
-function renderUnsentDrafts() {
-  const n = S.drafts.length;
-  $('drafts').innerHTML =
-    `<p class="hint">These were created on this project by a previous import and never sent, ` +
-    `usually because Procore rate limited the push partway through. They are complete — ` +
-    `photos and assignees included — and sending them is one call each. ` +
-    `<strong>Do not re-import them</strong>, that would create duplicates.</p>` +
-    S.drafts
-      .map(
-        (d) =>
-          `<div class="result-row"><span class="ic">•</span><span>${esc(d.name)}${
-            d.number ? ` <span class="muted">(#${esc(d.number)})</span>` : ''
-          }</span></div>`,
-      )
-      .join('') +
-    `<div style="margin-top:12px"><button class="btn-secondary" id="send-drafts">Send ${n} item${
-      n === 1 ? '' : 's'
-    }</button></div><div id="drafts-status"></div>`;
-  $('send-drafts').addEventListener('click', sendUnsentDrafts);
-}
-
-async function sendUnsentDrafts() {
-  const btn = $('send-drafts');
-  const status = $('drafts-status');
-  btn.disabled = true;
-  btn.textContent = 'Sending…';
-
-  const ids = S.drafts.map((d) => d.id);
-  let sent = 0;
-  const failures = [];
-
-  try {
-    // Batched and sequential: this runs precisely when the quota has already
-    // been exhausted once, so firing everything at once would recreate the
-    // failure it is recovering from.
-    for (let i = 0; i < ids.length; i += 8) {
-      const batch = ids.slice(i, i + 8);
-      status.innerHTML = `<span class="muted">Sending ${i + 1}-${i + batch.length} of ${ids.length}…</span>`;
-      const data = await api('/api/resend', {
-        method: 'POST',
-        body: JSON.stringify({ projectId: S.project.id, punchItemIds: batch }),
-      });
-      for (const r of data.results || []) {
-        if (r.ok) {
-          sent += 1;
-          S.drafts = S.drafts.filter((d) => d.id !== r.punchItemId);
-        } else {
-          failures.push(`#${r.punchItemId}: ${(r.errors || ['failed']).join('; ')}`);
-        }
-      }
-    }
-  } catch (err) {
-    failures.push(err.message || String(err));
-  }
-
-  if (!S.drafts.length && !failures.length) {
-    $('drafts').innerHTML = `<p class="hint">Sent ${sent} item${sent === 1 ? '' : 's'}. Nothing is left in Draft.</p>`;
-    return;
-  }
-
-  // Re-render off what is still stuck, so a second attempt only covers those.
-  renderUnsentDrafts();
-  $('drafts-status').innerHTML = failures.length
-    ? `<span class="muted">Sent ${sent}. Still stuck: ${esc(failures.join(' · '))}</span>`
-    : `<span class="muted">Sent ${sent}.</span>`;
 }
 
 // ── Step 2: upload and read ─────────────────────────────────────────────────
@@ -748,6 +642,15 @@ function renderReadNotes() {
     .filter(Boolean);
 
   let html = '';
+  if (uncertain.length) {
+    html += note(
+      'error',
+      `<strong>${uncertain.length} item${uncertain.length === 1 ? '' : 's'} may already be in Procore.</strong> ` +
+        `The server stopped answering partway through, so it cannot say what it finished. ` +
+        `<strong>Do not push these again</strong> until you have checked the project's punch list in Procore — ` +
+        `pushing them again creates duplicates and can email the same subs twice. They have been unticked.`,
+    );
+  }
   if (failed.length) {
     html += note(
       'error',
@@ -1405,29 +1308,23 @@ function renderSendSummary() {
         'press <strong>Apply to selected items</strong>.',
     );
   }
-  html += `
-    <label class="sendopt">
-      <input type="checkbox" id="send-opt" ${S.sendOnPush ? 'checked' : ''} />
-      <span>
-        <strong>Send items to the punch item manager</strong> (moves them out of Draft)
-        <span class="muted">
-          Procore creates API items as <em>Draft</em>, held by the account that created them — which is why
-          imported items show ball-in-court on the API service account. Sending starts the workflow and moves
-          the item to its manager and assignees. It also <strong>notifies them by email</strong>, so leave this
-          off if you would rather review in Procore and press Send there.
-        </span>
-      </span>
-    </label>`;
+  // Always Drafts. This app used to offer to send items out of Draft, which is
+  // what emails the manager, the assignees and their companies — and one import
+  // that ticked it put ~350 emails in front of every sub on a project
+  // (2026-10-01). Sending is a decision the super makes in Procore, item by item.
+  html += note(
+    'info',
+    '<strong>Items are created as Drafts.</strong> This app does not send them to the punch item manager or ' +
+      'the assignees. Review them in Procore and send them from there when they are right.',
+  );
 
   html += note(
     'info',
-    'Send one item first if this is a new project — the result will tell you exactly what Procore requires ' +
+    'Create one item first if this is a new project — the result will tell you exactly what Procore requires ' +
       'before you commit the rest.',
   );
 
   $('send-summary').innerHTML = html;
-  const opt = $('send-opt');
-  if (opt) opt.addEventListener('change', (e) => { S.sendOnPush = e.target.checked; });
 }
 
 async function doPush(dryRun) {
@@ -1460,7 +1357,6 @@ async function doPush(dryRun) {
         body: JSON.stringify({
           projectId: S.project.id,
           dryRun,
-          send: S.sendOnPush,
           // Dry runs never carry photo bytes — the payload preview only needs the count.
           items: batch.map((i) => {
             const p = toPayload(i);
@@ -1471,8 +1367,20 @@ async function doPush(dryRun) {
       S.results.push(...res.results);
       if (dryRun) payloads.push(...res.results.map((r) => r.payload));
     } catch (err) {
+      // A 4xx from our own API is a refusal before anything was written, so the
+      // items are safe to fix and push again. Anything else — the 45-second kill
+      // ("Backend call failure"), a 5xx, a dropped connection — means the server
+      // may have created and SENT some of this batch before it died. Treating
+      // those as "rejected, still selected" is how a super pushes the same items
+      // again and emails every sub on the job a second and third time.
+      const refused = !dryRun && err.status >= 400 && err.status < 500;
       for (const item of batch) {
-        S.results.push({ clientId: String(item.id), ok: false, error: err.message });
+        S.results.push({
+          clientId: String(item.id),
+          ok: false,
+          uncertain: !dryRun && !refused,
+          error: err.message,
+        });
       }
     }
 
@@ -1491,7 +1399,7 @@ async function doPush(dryRun) {
     // duplicates — the most damaging mistake this tool could make, since a
     // duplicate punch item means two subs dispatched for one defect.
     for (const r of S.results) {
-      if (r.ok) {
+      if (r.ok || r.uncertain) {
         const item = S.items.find((i) => String(i.id) === r.clientId);
         if (item) item.include = false;
       }
@@ -1504,7 +1412,8 @@ async function doPush(dryRun) {
 
 function renderResults() {
   const created = S.results.filter((r) => r.ok);
-  const failed = S.results.filter((r) => !r.ok);
+  const uncertain = S.results.filter((r) => !r.ok && r.uncertain);
+  const failed = S.results.filter((r) => !r.ok && !r.uncertain);
 
   let html = '';
   if (created.length) {
@@ -1552,16 +1461,16 @@ function renderResults() {
         const isDraft = r.observed?.isDraft ?? null;
         const workflow = r.observed?.workflowLabel || '';
         if (isDraft === true) {
-          bits.push('<span class="badge flat">Draft — not yet sent</span>');
+          bits.push('<span class="badge flat">Draft — send it from Procore</span>');
         } else if (isDraft === false) {
-          bits.push(`<span class="badge ok">${esc(workflow || status || 'Sent')}</span>`);
+          // This app never sends, so an item that read back out of Draft got there
+          // some other way — and leaving Draft is what notifies people. Say so.
+          bits.push(
+            `<span class="badge err">Not a Draft: ${esc(workflow || status || 'unknown')}</span>` +
+              '<span class="muted"> Procore may already have notified the assignees. Check this item in Procore.</span>',
+          );
         } else if (status) {
           bits.push(`<span class="badge flat">${esc(status)}</span>`);
-        }
-        if (r.sendErrors?.length) {
-          bits.push(`<span class="badge err">Send failed</span><span class="muted">${esc(
-            r.sendErrors.join('; '),
-          )}</span>`);
         }
 
         const bic = r.observed?.ballInCourt || [];
@@ -1589,83 +1498,18 @@ function renderResults() {
       const fields = r.fieldErrors?.length
         ? `<br><span class="muted">Procore said: ${esc(r.fieldErrors.join('; '))}</span>`
         : '';
+      if (r.uncertain) {
+        return `<div class="result-row fail"><span class="ic">?</span><span>${label}<br><span class="muted">Unknown — check Procore before pushing again. ${esc(
+          r.error || '',
+        )}</span></span></div>`;
+      }
       return `<div class="result-row fail"><span class="ic">✕</span><span>${label}<br><span class="muted">${esc(
         r.error || 'Failed',
       )}</span>${fields}</span></div>`;
     })
     .join('');
 
-  // Items that exist in Procore but never left Draft can be finished without
-  // creating anything — pushing the list again would duplicate every row.
-  const unsent = S.results.filter((r) => r.ok && r.punchItemId && r.sendErrors?.length);
-  if (unsent.length) {
-    html +=
-      `<div class="note warn" style="margin-top:14px">` +
-      `<strong>${unsent.length} item${unsent.length === 1 ? '' : 's'} ${
-        unsent.length === 1 ? 'was' : 'were'
-      } created but not sent.</strong> ` +
-      `The items are in Procore with their photos and assignees — only the send failed, ` +
-      `usually because Procore rate limited us partway through. ` +
-      `Retrying finishes them in place; it does not create anything new.` +
-      `<div style="margin-top:10px"><button class="btn-secondary" id="retry-send">Retry sending ${
-        unsent.length
-      } item${unsent.length === 1 ? '' : 's'}</button></div>` +
-      `<div id="retry-send-status"></div></div>`;
-  }
-
   $('results').innerHTML = html;
-  const retry = $('retry-send');
-  if (retry) retry.addEventListener('click', () => retrySend(unsent));
-}
-
-/**
- * Finish items that were created but never sent.
- *
- * Batched and sequential for the same reason the push is: this runs precisely
- * when Procore's quota is already under pressure, so firing everything at once
- * would recreate the failure it is recovering from.
- */
-async function retrySend(unsent) {
-  const btn = $('retry-send');
-  const status = $('retry-send-status');
-  btn.disabled = true;
-  btn.textContent = 'Sending…';
-
-  const ids = unsent.map((r) => r.punchItemId);
-  let sent = 0;
-  const failures = [];
-
-  try {
-    for (let i = 0; i < ids.length; i += 8) {
-      const batch = ids.slice(i, i + 8);
-      status.innerHTML = `<span class="muted">Sending ${i + 1}-${i + batch.length} of ${ids.length}…</span>`;
-      const data = await api('/api/resend', {
-        method: 'POST',
-        body: JSON.stringify({ projectId: S.project.id, punchItemIds: batch }),
-      });
-      for (const r of data.results || []) {
-        const row = S.results.find((x) => x.punchItemId === r.punchItemId);
-        if (r.ok) {
-          sent += 1;
-          // Clear the failure so a second retry only covers what is still stuck.
-          if (row) { row.sendErrors = undefined; row.observed = r.observed || row.observed; }
-        } else {
-          failures.push(`#${r.punchItemId}: ${(r.errors || ['failed']).join('; ')}`);
-        }
-      }
-    }
-  } catch (err) {
-    failures.push(err.message || String(err));
-  }
-
-  // Re-render off the updated results so the badges match Procore, then report.
-  renderResults();
-  const after = $('retry-send-status');
-  if (after) {
-    after.innerHTML = failures.length
-      ? `<span class="muted">Sent ${sent}. Still stuck: ${esc(failures.join(' · '))}</span>`
-      : `<span class="muted">Sent ${sent}.</span>`;
-  }
 }
 
 // ── Wiring ──────────────────────────────────────────────────────────────────

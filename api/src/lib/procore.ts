@@ -208,6 +208,12 @@ export async function procoreRequest<T = unknown>(
 
   let forceRefresh = false;
 
+  // A write that failed with a 5xx or a dropped connection may still have been
+  // performed — Procore can store the item and then fail to answer. Retrying it
+  // is how one create becomes two punch items, and two subs sent to one defect. Only GETs retry on those; a write retries only on 401 and 429,
+  // which Procore answers BEFORE doing anything.
+  const idempotent = method.toUpperCase() === 'GET';
+
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     const token = await getToken(forceRefresh);
     forceRefresh = false;
@@ -236,7 +242,7 @@ export async function procoreRequest<T = unknown>(
     } catch (err) {
       // Network-level failure. Retry with backoff; a socket reset mid-run
       // should not lose a whole import.
-      if (attempt === MAX_RETRIES) throw err;
+      if (!idempotent || attempt === MAX_RETRIES) throw err;
       await sleep(backoffMs(attempt));
       continue;
     }
@@ -277,7 +283,7 @@ export async function procoreRequest<T = unknown>(
       });
     }
 
-    if (res.status >= 500 && attempt < MAX_RETRIES) {
+    if (res.status >= 500 && idempotent && attempt < MAX_RETRIES) {
       await sleep(backoffMs(attempt));
       continue;
     }
@@ -1241,65 +1247,13 @@ async function createWithPhotos(
 }
 
 /**
- * Move a Draft item to Initiated.
- *
- * Procore's rule: an item is Draft when its creator is not its Punch Item
- * Manager, and Initiated once it has been sent to that manager. Everything this
- * app creates is therefore Draft — the API service account creates it, a real
- * person is the manager — and a Draft item sits in its CREATOR's court. That is
- * why every imported item showed ball-in-court on the service account: not a bug
- * in the payload, the workflow simply had not started.
- *
- * This is opt-in per push, because sending is what notifies the manager and
- * assignees. Sending sixty items silently would put sixty emails in front of
- * people who never agreed to receive them.
+ * One way of making a write stick. Procore answers 200 for writes it discards,
+ * so each is judged by the read-back, never by its response.
  */
 interface WriteStrategy<A extends unknown[]> {
   label: string;
   run: (projectId: number, punchItemId: number, ...args: A) => Promise<void>;
 }
-
-/**
- * A signature of everything a workflow change is expected to move.
- *
- * Verification cannot rely on one field, because the field that carries the
- * workflow state has not been identified yet. Comparing a snapshot before and
- * after means "something Procore shows the super actually changed" counts as
- * evidence even when the specific field name is still unknown — and, just as
- * importantly, "nothing changed" is reported as a failure instead of being
- * announced as a success, which is how the first three write bugs got shipped.
- */
-function workflowSignature(o: ObservedPunchItem | null): string {
-  if (!o) return '';
-  return JSON.stringify([o.status, o.workflowLabel, o.isDraft, o.ballInCourt, o.assignees]);
-}
-
-const SEND_STRATEGIES: Array<WriteStrategy<[]>> = [
-  {
-    label: 'PATCH draft=false',
-    run: (projectId, id) =>
-      procoreRequest('PATCH', `/rest/v1.1/punch_items/${id}`, {
-        query: { project_id: projectId },
-        body: { project_id: projectId, punch_item: { draft: false } },
-      }).then(() => undefined),
-  },
-  {
-    label: 'PATCH workflow_status=initiated',
-    run: (projectId, id) =>
-      procoreRequest('PATCH', `/rest/v1.1/punch_items/${id}`, {
-        query: { project_id: projectId },
-        body: { project_id: projectId, punch_item: { workflow_status: 'initiated' } },
-      }).then(() => undefined),
-  },
-  {
-    label: 'POST send',
-    run: (projectId, id) =>
-      procoreRequest('POST', `/rest/v1.1/punch_items/${id}/send`, {
-        query: { project_id: projectId },
-        body: { project_id: projectId },
-      }).then(() => undefined),
-  },
-];
 
 /**
  * Remember what worked, and what could not be made to work.
@@ -1313,15 +1267,11 @@ const SEND_STRATEGIES: Array<WriteStrategy<[]>> = [
  * been shown not to work and re-proving it just burns the quota.
  */
 const memo: {
-  send: string | null;
-  sendFailure: string[] | null;
   assign: string | null;
   assignFailure: string[] | null;
   attach: string | null;
   attachFailure: string[] | null;
 } = {
-  send: null,
-  sendFailure: null,
   assign: null,
   assignFailure: null,
   attach: null,
@@ -1463,48 +1413,6 @@ async function ensurePhotos(
   return { errors: run.errors, observed };
 }
 
-/**
- * Move a Draft item out of the creator's court.
- *
- * Procore's rule: an item is Draft until it is sent to its Punch Item Manager,
- * and a Draft item sits in its CREATOR's court. Everything this app creates is
- * therefore Draft — the API service account creates it, a real person is the
- * manager — which is why every imported item showed ball-in-court on
- * "ABS abs-api-export". That is the workflow behaving correctly, not a bad
- * payload; the item simply had not been sent.
- *
- * Sending is opt-in per push because it is what emails the manager and the
- * assignees. Sending sixty items silently would put sixty notifications in front
- * of people who never agreed to receive them.
- */
-export async function sendPunchItem(
-  projectId: number,
-  punchItemId: number,
-  before: ObservedPunchItem | null,
-): Promise<{ sent: boolean; strategy: string | null; errors: string[]; observed: ObservedPunchItem | null }> {
-  if (memo.sendFailure) {
-    return { sent: false, strategy: null, errors: memo.sendFailure, observed: before };
-  }
-
-  const baseline = workflowSignature(before);
-  const run = await runChain(
-    SEND_STRATEGIES,
-    memo.send,
-    projectId,
-    punchItemId,
-    [],
-    (after) => Boolean(after) && (after!.isDraft === false || workflowSignature(after) !== baseline),
-    'accepted, but nothing about the item changed',
-  );
-
-  if (run.strategy) {
-    memo.send = run.strategy;
-    return { sent: true, strategy: run.strategy, errors: [], observed: run.observed };
-  }
-  if (!run.transient) memo.sendFailure = run.errors;
-  return { sent: false, strategy: null, errors: run.errors, observed: before };
-}
-
 const ASSIGN_STRATEGIES: Array<WriteStrategy<[number[], number | null]>> = [
   {
     // Rails nested attributes. The plain `assignments` array on create was
@@ -1606,8 +1514,6 @@ export interface CreatePunchItemResult {
   photosAttached: number;
   assignErrors: string[];
   assignStrategy: string | null;
-  sendErrors: string[];
-  sendStrategy: string | null;
   observed: ObservedPunchItem | null;
 }
 
@@ -1624,7 +1530,6 @@ export async function createPunchItem(
   projectId: number,
   input: PunchItemInput,
   photos: PunchPhoto[] = [],
-  options: { send?: boolean } = {},
 ): Promise<CreatePunchItemResult> {
   const photoErrors: string[] = [];
   let created: CreatedPunchItem;
@@ -1679,72 +1584,14 @@ export async function createPunchItem(
     observed = assigned.observed ?? observed;
   }
 
-  // Attempt the send whenever it was asked for and the item is not already known
-  // to have left Draft. `isDraft === null` means the workflow field could not be
-  // identified, and unknown must fall through to trying — reading unknown as
-  // "already sent" is exactly the bug that made the send silently do nothing.
-  let sendErrors: string[] = [];
-  let sendStrategy: string | null = null;
-  if (options.send && created?.id && observed?.isDraft !== false) {
-    const sent = await sendPunchItem(projectId, created.id, observed);
-    sendErrors = sent.sent ? [] : sent.errors;
-    sendStrategy = sent.strategy;
-    observed = sent.observed ?? observed;
-  }
-
   return {
     item: created,
     photoErrors,
     photosAttached,
     assignErrors,
     assignStrategy,
-    sendErrors,
-    sendStrategy,
     observed,
   };
-}
-
-/**
- * Which Procore user this integration authenticates as.
- *
- * Needed to tell apart the items this app created from the ones people created
- * in Procore, so a recovery sweep can offer to finish ours without ever touching
- * somebody else's draft. Memoized for the life of the process — it is a property
- * of the credentials, and it cannot change while they do not.
- */
-let serviceAccountIdPromise: Promise<number | null> | null = null;
-
-export function serviceAccountId(): Promise<number | null> {
-  if (!serviceAccountIdPromise) {
-    serviceAccountIdPromise = procoreRequest<{ id?: number }>('GET', '/rest/v1.0/me')
-      .then((me) => (typeof me?.id === 'number' ? me.id : null))
-      .catch(() => {
-        // Never cache a failure: the next call should try again rather than
-        // spend the rest of the process believing it has no identity.
-        serviceAccountIdPromise = null;
-        return null;
-      });
-  }
-  return serviceAccountIdPromise;
-}
-
-/**
- * A punch item this integration created and never sent.
- *
- * Both halves matter. `workflow_status === 'draft'` alone would sweep up drafts a
- * superintendent is deliberately still working on in Procore, and offering to
- * send those would be the app reaching past what it was asked to do. Ownership
- * alone would sweep up items that already went out.
- */
-export function isUnsentImport(
-  row: Record<string, unknown>,
-  ourUserId: number | null,
-): boolean {
-  if (!ourUserId) return false;
-  const workflow = typeof row.workflow_status === 'string' ? row.workflow_status.toLowerCase() : '';
-  if (workflow !== 'draft') return false;
-  const createdBy = row.created_by as { id?: number } | null | undefined;
-  return createdBy?.id === ourUserId;
 }
 
 /** Read punch items back — used by the probe and by duplicate detection. */
@@ -1754,7 +1601,6 @@ export function isUnsentImport(
  * ⚠️ This is the most expensive read in the app and the easiest to reach for. A
  * project with 800 punch items is 8 requests, and the unbudgeted version could
  * walk 100 pages. Only the callers that genuinely need every row should use it —
- * the recovery sweep, which has to find OUR unsent drafts among everyone's, and
  * the inspect survey, whose whole job is reading many rows.
  *
  * Cached briefly: selecting a project used to fetch this twice in one page load,
