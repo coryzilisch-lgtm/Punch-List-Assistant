@@ -6,8 +6,9 @@
 ## What this is
 
 A superintendent picks a Procore project, uploads the punch list PDF the owner
-sent, reviews what was read off it, and presses send. The app creates the punch
-items in Procore with their photos attached. The work it replaces is retyping
+sent, reviews what was read off it, and presses create. The app creates the punch
+items in Procore as **Drafts** with their photos attached; the super sends them
+from Procore. The work it replaces is retyping
 59 items by hand — an afternoon per list.
 
 ```
@@ -18,7 +19,7 @@ POST /api/extract   one page per request — Claude reads it, returns structured
   ▼
 the superintendent reviews and corrects every row        ← the point of the app
   ▼
-POST /api/push      creates punch items, attaches photos, optionally sends them
+POST /api/push      creates punch items as Drafts, attaches photos — never sends
   ▼
 Procore punch list
 ```
@@ -74,29 +75,38 @@ nightly sync.
 
 ---
 
-## 🛑 Sending is OFF by default — 2026-10-01 incident
+## 🛑 This app never sends — 2026-10-01 incident
 
 One import put **~350 emails** in front of every sub on a project, and they kept
-arriving until the items were deleted in Procore. The app has no timer, queue or
-background trigger, so nothing sends without a button press, but three things in
-the code could each multiply one send:
+arriving until the items were deleted in Procore. The super had ticked **"Send
+items to the punch item manager"**. Sending is what moves an item out of Draft,
+and leaving Draft is what notifies the manager, the assignees and their
+companies. Two things in the code made one tick worse than one email per item:
 
 1. `procoreRequest` retried **writes** on a 5xx or a dropped socket, though
    Procore may already have performed them. Writes now retry only on 401/429,
-   which Procore answers before doing anything.
-2. The send chain tried **up to three different send writes per item** whenever
-   the read-back could not prove the first one worked. It now stops at the first
-   write Procore accepts and reports "unverified" instead.
-3. A batch killed at 45s was shown as "rejected, still selected so you can
-   resend", although some of it had been created **and sent**. The dashboard now
-   marks such a batch "may already be in Procore", unticks it, and says not to push
-   it again until the punch list has been checked.
+   which Procore answers before doing anything. (Still in force: it is what
+   stops a retried create from making duplicate items.)
+2. The send step tried **up to three different send writes per item**
+   (`PATCH draft=false`, `PATCH workflow_status=initiated`, `POST /send`)
+   whenever the read-back could not prove the first had worked.
 
-**`PUNCH_SEND_ENABLED=true`** must be set in the SWA app settings for the app to
-send at all (`/api/push` with `send`, and `/api/resend`). Without it the app
-creates Drafts and the super sends from Procore. Do not turn it back on until
-the incident's root cause has been read out of the function logs (`push ok …
-send=<strategy>` lines, by time and by user) rather than inferred.
+**So sending was removed, not switched off.** The checkbox, the send chain,
+`POST /api/resend`, `GET /api/drafts` and the Retry sending / unsent-drafts UI
+are gone. Every item is created as a **Draft** and the super sends it from
+Procore. `/api/push` refuses a body with `send: true` (400, before any write),
+because the dashboard has no cache-busting and a tab opened before the deploy
+can still post it. If an item ever reads back **out** of Draft, the results
+screen flags it in red: something notified people, and it was not this app.
+
+`api/test/send-safety.test.mjs` asserts that a push makes exactly one write
+(`POST /punch_items`) and never touches `/send` or `workflow_status`. Do not add
+sending back without a decision from Cory: it is the one thing this app could do
+that reaches people outside Buffalo.
+
+A batch killed at 45s is also no longer shown as "rejected, still selected so
+you can resend": some of it may have been created. It is marked "may already be
+in Procore" and unticked, so a re-press cannot duplicate it.
 
 ## Who can open this
 
@@ -164,9 +174,7 @@ docs/procore-oauth.md           acting as the superintendent instead of the robo
 | `GET /api/me` | signed-in identity from the SWA principal |
 | `GET /api/projects` · `/{id}` · `/{id}/config` | the picker, and everything the review dropdowns need |
 | `POST /api/extract` | one page → structured items |
-| `POST /api/push` | create items (+ photos, assignees, optional send). `dryRun` previews payloads |
-| `POST /api/resend` | finish items that were created but never sent — **creates nothing** |
-| `GET /api/drafts` | imports that were created and never sent |
+| `POST /api/push` | create items as **Drafts** (+ photos, assignees). Never sends. `dryRun` previews payloads |
 | `GET /api/probe?project_id=` | the connection check the app shows on step 1 |
 | `GET /api/inspect` | the read-only truth probe — see below |
 
@@ -331,11 +339,10 @@ Three rules that keep it honest:
    recovery sweep and the inspect survey need every row. Anything asking "can we
    read this" wants `punchItemAccess()`.
 
-**A push is ~2 requests per item, or ~4 with send** (create, read-back, and for a
-send: the workflow write plus its read-back). That is deliberately NOT optimised.
+**A push is ~2 requests per item** (create, read-back). That is deliberately NOT optimised.
 The read-backs are the safety property — Procore has answered 200 and stored
 nothing three times — and trading them for rate would reintroduce exactly the bug
-class this repo has already paid for. A 60-item list with send is ~240 requests,
+class this repo has already paid for. A 60-item list is ~120 requests,
 which is fine against 3,600/hour; the thing to avoid is running one during the
 Safety Dashboard's nightly ingest.
 
@@ -391,9 +398,9 @@ loads.
   seconds-from-now value as one gives a negative wait clamped to zero, and the
   retry fires immediately against a limit still in force. `rateLimitWaitMs` never
   returns less than the normal backoff.
-- **A throttled push is not a failed import.** The items are in Procore with
-  their photos. Use **Retry sending** (`POST /api/resend`) — pushing the list
-  again duplicates everything that already landed.
+- **A throttled or timed-out push is not a failed import.** Items that landed
+  are in Procore with their photos. Check the punch list before pushing anything
+  again — re-pushing duplicates everything that already landed.
 - **Procore's punch list is one of the most tenant-configurable tools in the
   product.** Which fields are required is set per company, not by the API schema.
   Do not hardcode a required-field set; surface Procore's own error body.
@@ -444,7 +451,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
   directory is a two-minute fix with no code — but that account is **shared with
   the Safety Dashboard ingest**, so change it knowing that.
 - **Items are created by the integration, not the superintendent**, so a Draft
-  waits in a robot's court. Per-user OAuth is the route; the full design, the
+  waits in a robot's court until the super sends it from Procore. Per-user OAuth is the route; the full design, the
   refresh-token rotation race it has to survive, and the Procore-side app
   registration are in `docs/procore-oauth.md`.
 - **Claude on Foundry** — swap three settings when the Marketplace agreement

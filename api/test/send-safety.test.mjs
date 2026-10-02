@@ -4,25 +4,23 @@ import assert from 'node:assert/strict';
 /**
  * 2026-10-01: one import put ~350 emails in front of every sub on a project.
  *
- * Sending is the one thing this app does that reaches people outside Buffalo,
- * and three things in the code could each multiply a single send:
+ * The super had ticked "send to the punch item manager". Sending is what moves
+ * an item out of Draft, and leaving Draft is what notifies the manager, the
+ * assignees and their companies. Two things made one tick worse than one email
+ * per item: writes were retried after Procore may already have performed them,
+ * and the send step tried up to three different send methods per item.
  *
- *   1. a write that failed with a 5xx or a dropped socket was retried, though
- *      Procore may already have performed it;
- *   2. the send chain tried up to three different send writes per item when the
- *      read-back could not prove the first had worked;
- *   3. nothing stopped a deployment from sending at all.
- *
- * Each gets a test, because each failure looks like success from inside the app.
+ * Sending is now gone from the app. Items are created as Drafts and the super
+ * sends them from Procore. These tests hold that line, because a send that
+ * creeps back in looks exactly like a feature.
  */
 
 process.env.PROCORE_CLIENT_ID = 'id';
 process.env.PROCORE_CLIENT_SECRET = 'secret';
 process.env.PROCORE_COMPANY_ID = '18895';
 
-const { procoreRequest, sendEnabled, sendPunchItem } = await import('../dist/lib/procore.js');
+const { procoreRequest } = await import('../dist/lib/procore.js');
 const { pushHandler } = await import('../dist/functions/push.js');
-const { resendHandler } = await import('../dist/functions/resend.js');
 
 const realFetch = globalThis.fetch;
 
@@ -34,7 +32,8 @@ function mockFetch(handler) {
     if (u.pathname === '/oauth/token') {
       return new Response(JSON.stringify({ access_token: 't', expires_in: 7200 }), { status: 200 });
     }
-    const call = { method: init.method || 'GET', path: u.pathname };
+    const body = typeof init.body === 'string' ? init.body : '';
+    const call = { method: init.method || 'GET', path: u.pathname, body };
     calls.push(call);
     return handler(call);
   };
@@ -43,7 +42,6 @@ function mockFetch(handler) {
 
 test.afterEach(() => {
   globalThis.fetch = realFetch;
-  delete process.env.PUNCH_SEND_ENABLED;
 });
 
 const ok = (body = {}) => new Response(JSON.stringify(body), { status: 200 });
@@ -75,48 +73,49 @@ test('a read still retries a 500', async () => {
   assert.equal(n, 2);
 });
 
-test('sending is off unless PUNCH_SEND_ENABLED=true', () => {
-  assert.equal(sendEnabled(), false);
-  for (const v of ['', '1', 'yes', 'TRUEISH']) {
-    process.env.PUNCH_SEND_ENABLED = v;
-    assert.equal(sendEnabled(), false, JSON.stringify(v));
-  }
-  process.env.PUNCH_SEND_ENABLED = 'true';
-  assert.equal(sendEnabled(), true);
-});
-
 const signedIn = (body) => ({
   text: async () => JSON.stringify(body),
   headers: { get: () => null },
 });
 const ctx = { log() {}, error() {}, warn() {} };
 
-test('a push asking to send is refused before anything is created when sending is off', async () => {
+test('a push from a stale page asking to send is refused before anything is written', async () => {
   const calls = mockFetch(() => ok({ id: 1 }));
   const res = await pushHandler(
     signedIn({ projectId: 1, send: true, items: [{ clientId: 'a', name: 'Cracked tile' }] }),
     ctx,
   );
-  assert.equal(res.status, 403);
+  assert.equal(res.status, 400);
   assert.equal(calls.length, 0);
 });
 
-test('resend is refused when sending is off', async () => {
-  const calls = mockFetch(() => ok({ id: 1 }));
-  const res = await resendHandler(signedIn({ projectId: 1, punchItemIds: [1] }), ctx);
-  assert.equal(res.status, 403);
-  assert.equal(calls.length, 0);
-});
-
-// Runs last: the send chain memoises its verdict for the life of the process.
-test('an accepted send that cannot be verified is not followed by a second send method', async () => {
-  const calls = mockFetch((c) =>
-    c.method === 'GET' ? ok({ id: 7, status: 'Open', workflow_status: 'draft' }) : ok({}),
+test('a push creates the item and makes no send write of any kind', async () => {
+  const calls = mockFetch((c) => {
+    if (c.method === 'POST' && c.path === '/rest/v1.1/punch_items') return ok({ id: 7 });
+    // Read-back: a Draft that already holds its assignee, as Procore stores it.
+    return ok({
+      id: 7,
+      status: 'Open',
+      workflow_status: 'draft',
+      assignments: [{ login_information: { name: 'Mike' } }],
+    });
+  });
+  const res = await pushHandler(
+    signedIn({
+      projectId: 1,
+      items: [{ clientId: 'a', name: 'Cracked tile', assigneeIds: [11921505], vendorId: 10263673 }],
+    }),
+    ctx,
   );
-  const before = { status: 'Open', workflowLabel: 'draft', isDraft: true, ballInCourt: [], assignees: [] };
-  const result = await sendPunchItem(1, 7, before);
+  assert.equal(res.jsonBody.created, 1);
 
   const writes = calls.filter((c) => c.method !== 'GET');
-  assert.equal(writes.length, 1, `expected one send write, got ${writes.map((w) => w.method).join(', ')}`);
-  assert.equal(result.sent, false);
+  assert.deepEqual(
+    writes.map((w) => `${w.method} ${w.path}`),
+    ['POST /rest/v1.1/punch_items'],
+  );
+  for (const c of calls) {
+    assert.ok(!/\/send\b/.test(c.path), `send endpoint called: ${c.path}`);
+    assert.ok(!/workflow_status|"draft"\s*:/.test(c.body), `workflow write: ${c.body}`);
+  }
 });

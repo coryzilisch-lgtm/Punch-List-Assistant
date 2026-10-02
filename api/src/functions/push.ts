@@ -6,7 +6,6 @@ import {
   ProcoreError,
   procoreConfigured,
   PunchItemInput,
-  sendEnabled,
   PunchPhoto,
 } from '../lib/procore';
 
@@ -43,9 +42,12 @@ interface PushBody {
   projectId: number;
   dryRun?: boolean;
   /**
-   * Move each created item out of Draft. Off by default: sending is what
-   * notifies the punch item manager and assignees, and a silent send of sixty
-   * items would email people who never agreed to receive them.
+   * Gone. This app used to be able to move items out of Draft, which is what
+   * emails the manager, the assignees and their companies. On 2026-10-01 one
+   * import that ticked it put ~350 emails in front of every sub on a project.
+   * Items are now always created as Drafts and the super sends them from
+   * Procore. Kept in the type only so a stale page that still sends it is
+   * refused, not quietly obeyed or quietly ignored.
    */
   send?: boolean;
   items: PushItemBody[];
@@ -63,8 +65,6 @@ interface PushResult {
   photosAttached?: number;
   /** Assignment attempts that failed, when the requested assignee did not stick. */
   assignErrors?: string[];
-  /** Failures moving the item out of Draft, when sending was requested. */
-  sendErrors?: string[];
   /**
    * What Procore actually stored, read back after the write — not what we sent.
    * Both early bugs here were silent successes, so the UI reports this instead.
@@ -109,13 +109,13 @@ export async function pushHandler(
 
   const dryRun = Boolean(body.dryRun);
 
-  // Refuse the whole request rather than quietly creating Drafts: the super
-  // asked for a send, and half-honouring that is how nobody notices it did not
-  // happen. Nothing is created, so pressing again with send off is safe.
-  if (body.send && !sendEnabled()) {
+  // The dashboard is served without cache-busting, so a tab opened before this
+  // deploy can still post `send: true`. Refuse it before anything is written:
+  // creating the items anyway would read to that super as "sent".
+  if (body.send) {
     return errorResponse(
-      403,
-      'Sending from this app is switched off (PUNCH_SEND_ENABLED). Untick "Send items" to create them as Drafts, then send them from Procore.',
+      400,
+      'Sending from this app has been removed — items are created as Drafts and sent from Procore. Reload the page and push again.',
     );
   }
 
@@ -181,11 +181,8 @@ export async function pushHandler(
     }
 
     try {
-      const created = await createPunchItem(body.projectId, input, photos, {
-        send: Boolean(body.send),
-      });
-      const { item, photoErrors, photosAttached, assignErrors, assignStrategy, sendErrors, sendStrategy, observed } =
-        created;
+      const created = await createPunchItem(body.projectId, input, photos);
+      const { item, photoErrors, photosAttached, assignErrors, assignStrategy, observed } = created;
       results.push({
         clientId: raw.clientId,
         ok: true,
@@ -194,7 +191,6 @@ export async function pushHandler(
         photoErrors: photoErrors.length ? photoErrors : undefined,
         photosAttached,
         assignErrors: assignErrors.length ? assignErrors : undefined,
-        sendErrors: sendErrors.length ? sendErrors : undefined,
         observed: observed ?? undefined,
       });
       // Log which strategy worked. Once the same one wins across a few real
@@ -202,7 +198,7 @@ export async function pushHandler(
       context.log(
         `push ok project=${body.projectId} punch_item=${item.id} by=${actor} ` +
           `photos=${photosAttached}/${photos.length} status=${observed?.status ?? '?'} ` +
-          `draft=${observed?.isDraft ?? '?'} send=${sendStrategy ?? 'none'} ` +
+          `draft=${observed?.isDraft ?? '?'} ` +
           `assign=${assignStrategy ?? 'none'} bic=${observed?.ballInCourt.join('|') ?? '?'}`,
       );
     } catch (err) {

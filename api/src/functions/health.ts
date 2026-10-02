@@ -1,6 +1,6 @@
 import { app, HttpRequest, HttpResponseInit } from '@azure/functions';
 import { json } from '../lib/http';
-import { procoreConfigured, sendEnabled } from '../lib/procore';
+import { procoreConfigured } from '../lib/procore';
 import { aiConfigured, modelConfig } from '../lib/model';
 
 export async function healthHandler(_request: HttpRequest): Promise<HttpResponseInit> {
@@ -8,7 +8,6 @@ export async function healthHandler(_request: HttpRequest): Promise<HttpResponse
     status: 'ok',
     timestamp: new Date().toISOString(),
     procoreConfigured: procoreConfigured(),
-    sendEnabled: sendEnabled(),
     extractionConfigured: aiConfigured(),
     aiProvider: modelConfig()?.provider ?? null,
     aiModel: modelConfig()?.model || null,
