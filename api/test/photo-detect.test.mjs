@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 // The detector is shared with the browser, so the test imports it from where it
 // lives rather than from a copy. `npm test` runs from api/, which is why the
 // path climbs out.
-import { detectPhotoRegions } from '../../dashboard/photo-detect.js';
+import { detectPhotoRegions, placedImageRegions } from '../../dashboard/photo-detect.js';
 
 /**
  * Synthetic pages, built to isolate the one judgement the detector makes:
@@ -149,4 +149,150 @@ test('a blank page yields nothing', () => {
 test('a page too small to grid is handled rather than throwing', () => {
   const tiny = new Uint8ClampedArray(20 * 20 * 4).fill(255);
   assert.deepEqual(detectPhotoRegions(tiny, 20, 20), []);
+});
+
+test('a photo whose edge touches a divider rule is still found', () => {
+  // The Darden "Operations Punch Walkthrough" layout: every issue row opens with
+  // a red rule running the width of the page, and the photo hangs directly off
+  // it. On the grid the rule and the photo were one blob, a full-width box that
+  // was mostly empty, so the fill-ratio check threw the photo out with the rule.
+  // 154 of 228 photos in that document went missing this way.
+  const px = blankPage();
+  const rows = [
+    { top: 60, bottom: 250, left: 60 },
+    { top: 300, bottom: 490, left: 110 }, // inset, as portrait photos are there
+    { top: 540, bottom: 730, left: 60 },
+  ];
+  for (const [i, r] of rows.entries()) {
+    // Three rule thicknesses, so the rule lands on the grid every way it can.
+    for (let y = r.top - 2 - i; y < r.top; y++) {
+      for (let x = 60; x < 600; x++) set(px, x, y, 210, 60, 60);
+    }
+    drawPhoto(px, r.left, r.top, 250, r.bottom, 20 + i);
+  }
+
+  const regions = detectPhotoRegions(px, W, H);
+
+  assert.equal(regions.length, 3, `found ${JSON.stringify(regions)}`);
+  for (const [i, r] of rows.entries()) {
+    assert.ok(
+      within(regions[i], { top: r.top / H, bottom: r.bottom / H, left: r.left / W, right: 250 / W }, 0.02),
+      `photo ${i} was ${JSON.stringify(regions[i])}`,
+    );
+  }
+});
+
+// ── Placed images: where the PDF itself drew each photo ─────────────────────
+
+/** The subset of pdf.js's OPS table the locator reads. Values match pdf.js 4.10. */
+const OPS = {
+  save: 10,
+  restore: 11,
+  transform: 12,
+  paintFormXObjectBegin: 74,
+  paintFormXObjectEnd: 75,
+  beginGroup: 76,
+  endGroup: 77,
+  beginAnnotation: 80,
+  endAnnotation: 81,
+  paintImageXObject: 85,
+  paintInlineImageXObject: 86,
+};
+
+/** A US Letter page at scale 1: PDF space is y-up, the viewport flips it. */
+const PW = 612;
+const PH = 792;
+const VIEWPORT = [1, 0, 0, -1, 0, PH];
+
+/** Build an operator list from [op, args] pairs. */
+const ops = (...pairs) => ({ fnArray: pairs.map((p) => p[0]), argsArray: pairs.map((p) => p[1] ?? null) });
+
+/** `q  w 0 0 h x y cm  /Im Do  Q` — how an exporter places one photo. y is the BOTTOM edge, PDF-style. */
+const placed = (x, y, w, h) => [
+  [OPS.save],
+  [OPS.transform, [w, 0, 0, h, x, y]],
+  [OPS.paintImageXObject, ['img']],
+  [OPS.restore],
+];
+
+const near = (a, b) => Math.abs(a - b) < 1e-6;
+
+test('placed photos are located exactly, in reading order', () => {
+  // The Darden walkthrough: four photos stacked down the left of the page.
+  const list = ops(
+    ...placed(84, 400, 104, 139), // painted first, but lower on the page
+    ...placed(50, 702, 500, 3), // a divider rule drawn as an image: too thin to be a photo
+    ...placed(50, 590, 139, 104),
+  );
+
+  const regions = placedImageRegions(list, OPS, VIEWPORT, PW, PH);
+
+  assert.equal(regions.length, 2);
+  assert.ok(regions[0].top < regions[1].top, 'top of the page first');
+  const lower = regions[1];
+  assert.ok(near(lower.left, 84 / PW) && near(lower.right, 188 / PW), JSON.stringify(lower));
+  assert.ok(near(lower.top, (PH - 539) / PH) && near(lower.bottom, (PH - 400) / PH), JSON.stringify(lower));
+});
+
+test('a scan, one image covering the page, defers to the pixel detector', () => {
+  const list = ops(...placed(0, 0, PW, PH));
+  assert.equal(placedImageRegions(list, OPS, VIEWPORT, PW, PH), null);
+});
+
+test('a page with no photo-sized image defers to the pixel detector', () => {
+  // A logo in the corner and nothing else: the pixels may still know something.
+  assert.equal(placedImageRegions(ops(...placed(20, 740, 30, 30)), OPS, VIEWPORT, PW, PH), null);
+  assert.equal(placedImageRegions(ops(), OPS, VIEWPORT, PW, PH), null);
+});
+
+test('a form XObject matrix applies inside the form and is undone after it', () => {
+  const list = ops(
+    [OPS.paintFormXObjectBegin, [[1, 0, 0, 1, 300, 0], [0, 0, 612, 792]]],
+    ...placed(0, 400, 200, 150), // drawn at x=300 because of the form matrix
+    [OPS.paintFormXObjectEnd],
+    ...placed(0, 100, 200, 150), // back at x=0
+  );
+
+  const regions = placedImageRegions(list, OPS, VIEWPORT, PW, PH);
+
+  assert.equal(regions.length, 2);
+  assert.ok(near(regions[0].left, 300 / PW), `form photo at ${regions[0].left}`);
+  assert.ok(near(regions[1].left, 0), `photo after the form at ${regions[1].left}`);
+});
+
+test('a transparency group does not move what is painted inside it', () => {
+  const list = ops(
+    [OPS.beginGroup, [{ matrix: [1, 0, 0, 1, 250, 0], bbox: [0, 0, 612, 792] }]],
+    ...placed(40, 400, 200, 150),
+    [OPS.endGroup, [{}]],
+  );
+
+  const [region] = placedImageRegions(list, OPS, VIEWPORT, PW, PH);
+
+  // pdf.js paints group content with the transform the group was entered with;
+  // the group matrix only sizes its scratch canvas.
+  assert.ok(near(region.left, 40 / PW), `group photo at ${region.left}`);
+});
+
+test('a photo exported as strips is one photo', () => {
+  const list = ops(...placed(100, 400, 200, 50), ...placed(100, 450, 200, 50), ...placed(100, 500, 200, 50));
+
+  const regions = placedImageRegions(list, OPS, VIEWPORT, PW, PH);
+
+  assert.equal(regions.length, 1);
+  assert.ok(near(regions[0].top, (PH - 550) / PH) && near(regions[0].bottom, (PH - 400) / PH));
+});
+
+test('two photos a normal gap apart are not merged', () => {
+  const list = ops(...placed(84, 573, 104, 139), ...placed(84, 410, 104, 139));
+  assert.equal(placedImageRegions(list, OPS, VIEWPORT, PW, PH).length, 2);
+});
+
+test('an image inside an annotation is not a photo on the page', () => {
+  const list = ops(
+    [OPS.beginAnnotation, ['a1', [0, 0, 612, 792], [1, 0, 0, 1, 0, 0], [1, 0, 0, 1, 0, 0], false]],
+    ...placed(100, 400, 200, 150),
+    [OPS.endAnnotation],
+  );
+  assert.equal(placedImageRegions(list, OPS, VIEWPORT, PW, PH), null);
 });

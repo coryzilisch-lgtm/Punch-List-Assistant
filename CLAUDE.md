@@ -300,6 +300,34 @@ Two smaller things worth not breaking: the "— None —" row carries `data-id="
 `highlight()` wraps matches in `<mark>`, so the name is several text nodes —
 reading it with `firstChild` returns only the part before the first match.
 
+## Finding the photos — Oct 2026
+
+**The symptom was:** "punch lists not attaching all of the photos". On the Darden
+*Operations Punch Walkthrough* (228 issues, one photo each) the detector found
+**74**. Nothing failed: the items just arrived in Procore without photos.
+
+Two causes, both in the pixel detector:
+
+1. **A divider rule drawn flush against a photo joined it into one page-wide
+   blob**, which was mostly empty, so the fill-ratio check discarded the photo
+   with the rule. Fixed by a 3×3 morphological opening on the cell grid
+   (`openGrid`), which strips lines 1–2 cells thick and cannot invent a photo.
+2. **Near-white reads as paper.** A photo of a white wall, a bright sky or a
+   stainless counter splits in two or vanishes. No threshold fixes this; the
+   pixels genuinely look like blank page.
+
+So the pipeline now asks the PDF first. `placedImageRegions()` walks pdf.js's
+operator list and reports where each image was painted — exact, for any
+app-exported PDF that embeds its photos one by one. It returns `null` (fall back
+to pixels) when a single image covers the page, which is what every scan looks
+like, or when no image is photo-sized. Result on that document: **228 of 228**,
+checked by eye.
+
+⚠️ Transform tracking mirrors pdf.js's canvas: a form XObject applies its matrix
+inside save/restore; **a transparency group does not change the transform its
+contents are painted with** (its matrix only sizes the scratch canvas). Getting
+that wrong shifts every photo inside a group. Both are tested.
+
 ## The Procore rate budget
 
 Procore allows ~3,600 requests/hour and the limit is **company-wide**. This app's

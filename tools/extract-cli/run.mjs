@@ -100,7 +100,7 @@ if (useAi && !fs.existsSync(extractDist)) {
   process.exit(2);
 }
 
-const { detectPhotoRegions } = await import(
+const { detectPhotoRegions, placedImageRegions } = await import(
   pathToFileURL(path.join(repoRoot, 'dashboard', 'photo-detect.js'))
 );
 
@@ -180,8 +180,18 @@ for (let n = from; n <= Math.min(to, total); n++) {
 
   const pageCanvas = await renderPage(page, RENDER_SCALE);
   const ctx = pageCanvas.getContext('2d');
-  const { data: pixels } = ctx.getImageData(0, 0, pageCanvas.width, pageCanvas.height);
-  const regions = detectPhotoRegions(pixels, pageCanvas.width, pageCanvas.height);
+  const vp = page.getViewport({ scale: 1 });
+  // Same fallback as the browser: a page pdf.js cannot list still gets pixels.
+  const placed = await page
+    .getOperatorList()
+    .then((ops) => placedImageRegions(ops, pdfjs.OPS, vp.transform, vp.width, vp.height))
+    .catch(() => null);
+  let regions = placed;
+  if (!regions) {
+    const { data: pixels } = ctx.getImageData(0, 0, pageCanvas.width, pageCanvas.height);
+    regions = detectPhotoRegions(pixels, pageCanvas.width, pageCanvas.height);
+  }
+  const source = placed ? 'placed by the PDF' : 'found in pixels';
   photoTotal += regions.length;
 
   let crops = [];
@@ -201,7 +211,7 @@ for (let n = from; n <= Math.min(to, total); n++) {
   }
 
   if (!useAi) {
-    console.log(`page ${pad(n)}  ${regions.length} image region(s) detected  (${Date.now() - started}ms)`);
+    console.log(`page ${pad(n)}  ${regions.length} image region(s) ${source}  (${Date.now() - started}ms)`);
     pageResults.push({ pageNumber: n, regions: regions.length });
     continue;
   }
@@ -230,7 +240,7 @@ for (let n = from; n <= Math.min(to, total); n++) {
     `page ${pad(n)}`,
     `${result.page_kind.padEnd(5)}`,
     `${String(result.items.length).padStart(2)} item(s)`,
-    `${regions.length} image region(s)`,
+    `${regions.length} image region(s) ${source}`,
   ];
   if (furniture.length) bits.push(`${furniture.length} discarded as page furniture`);
   bits.push(`${Date.now() - started}ms`);
