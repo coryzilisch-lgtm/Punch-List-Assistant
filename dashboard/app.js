@@ -17,6 +17,10 @@ const STEPS = ['project', 'upload', 'review', 'send'];
 
 const S = {
   step: 'project',
+  /** Procore rate-limit report from /api/quota or the last push batch; null when unknown. */
+  quota: null,
+  /** Set when a push stopped at the rate limit: { resetAt, notAttempted }. */
+  quotaStop: null,
   me: null,
   projects: [],
   project: null,
@@ -184,13 +188,45 @@ function renderBar() {
     const n = S.items.filter((i) => i.include).length;
     dry.style.display = 'inline-block';
     const unmanaged = unmanagedCount();
-    next.textContent = S.sending ? 'Creating…' : `Create ${n} punch items`;
+    // Room left in Procore's rate limit, while its window is still the current one.
+    const live = S.quota && (!S.quota.resetAt || S.quota.resetAt > Date.now());
+    const fits = live && S.quota.capacity !== null && S.quota.capacity !== undefined ? S.quota.capacity : n;
+    next.textContent = S.sending
+      ? 'Creating…'
+      : fits < n
+        ? `Create ${fits} of ${n} punch items`
+        : `Create ${n} punch items`;
     // /api/push refuses these too; disabling here just says so before the press.
-    next.disabled = S.sending || n === 0 || unmanaged > 0;
+    next.disabled = S.sending || n === 0 || unmanaged > 0 || fits === 0;
     summary.innerHTML = unmanaged
       ? `<b>${unmanaged}</b> item(s) need a punch item manager`
-      : `Creating Drafts in <b>${esc(S.project?.name || '')}</b>`;
+      : fits === 0
+        ? `No Procore quota left until <b>${esc(clockTime(S.quota.resetAt))}</b>`
+        : `Creating Drafts in <b>${esc(S.project?.name || '')}</b>`;
   }
+}
+
+/**
+ * Ask how much of Procore's rate limit is left. One request. A failure leaves the
+ * quota unknown rather than blocking the push: the API still refuses a batch it
+ * knows will not fit, and stops at the first spent window.
+ */
+async function loadQuota() {
+  try {
+    S.quota = await api('/api/quota');
+  } catch {
+    S.quota = null;
+  }
+  if (S.step === 'send' && !S.sending) {
+    renderSendSummary();
+    renderBar();
+  }
+  return S.quota;
+}
+
+/** "2:40 PM" for an epoch-ms reset time; the super needs a clock time, not seconds. */
+function clockTime(ms) {
+  return ms ? new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : 'the next reset';
 }
 
 /** Selected items with no punch item manager. Every pushed item must have one. */
@@ -651,15 +687,6 @@ function renderReadNotes() {
     .filter(Boolean);
 
   let html = '';
-  if (uncertain.length) {
-    html += note(
-      'error',
-      `<strong>${uncertain.length} item${uncertain.length === 1 ? '' : 's'} may already be in Procore.</strong> ` +
-        `The server stopped answering partway through, so it cannot say what it finished. ` +
-        `<strong>Do not push these again</strong> until you have checked the project's punch list in Procore — ` +
-        `pushing them again creates duplicates and can email the same subs twice. They have been unticked.`,
-    );
-  }
   if (failed.length) {
     html += note(
       'error',
@@ -1325,6 +1352,34 @@ function renderSendSummary() {
         'press <strong>Apply to selected items</strong>.',
     );
   }
+  const q = S.quota;
+  if (q && q.remaining !== null) {
+    const fits = q.capacity ?? selected.length;
+    const resets = q.resetAt ? `, resets about ${esc(clockTime(q.resetAt))}` : '';
+    html += note(
+      'info',
+      `<strong>Procore rate limit: ${q.remaining}${q.limit ? ` of ${q.limit}` : ''} requests left${resets}.</strong> ` +
+        `That is room for about ${fits} item(s) at ${q.perItem} requests each, keeping ${q.reserve} ` +
+        'in reserve for the Safety Dashboard, which shares this Procore account.',
+    );
+    if (fits === 0) {
+      html += note(
+        'error',
+        `<strong>Not enough Procore quota to push anything right now.</strong> Come back after ${esc(
+          clockTime(q.resetAt),
+        )}.`,
+      );
+    } else if (fits < selected.length) {
+      html += note(
+        'warn',
+        `<strong>This push will create the first ${fits} item(s) and stop.</strong> The other ` +
+          `${selected.length - fits} stay selected; press Create again after ${esc(clockTime(q.resetAt))}.`,
+      );
+    }
+  } else if (q) {
+    html += note('info', "Procore didn't report its rate limit, so this push can't be planned against it.");
+  }
+
   // Always Drafts. This app used to offer to send items out of Draft, which is
   // what emails the manager, the assignees and their companies — and one import
   // that ticked it put ~350 emails in front of every sub on a project
@@ -1352,23 +1407,39 @@ async function doPush(dryRun) {
   S.sending = true;
   renderBar();
   S.results = [];
+  S.quotaStop = null;
   $('results-card').style.display = dryRun ? 'none' : 'block';
   $('dryrun-card').style.display = dryRun ? 'block' : 'none';
   $('results').innerHTML = '';
 
-  const BATCH = dryRun ? 10 : 5;
-  const batches = [];
-  for (let i = 0; i < selected.length; i += BATCH) batches.push(selected.slice(i, i + BATCH));
+  // How many more items Procore's rate limit has room for. Infinity when the
+  // quota is unknown: the API still refuses a batch it knows will not fit and
+  // stops at the first spent window, so unknown is not unsafe.
+  let allowance = Infinity;
+  if (!dryRun) {
+    const q = await loadQuota();
+    if (q && q.capacity !== null && q.capacity !== undefined) allowance = q.capacity;
+  }
 
+  const BATCH = dryRun ? 10 : 5;
+  const queue = selected.slice();
   let done = 0;
+  let stopAt = null;
   const payloads = [];
 
-  for (const batch of batches) {
+  while (queue.length) {
+    if (!dryRun && allowance <= 0) {
+      stopAt = S.quota?.resetAt ?? null;
+      break;
+    }
+    const batch = queue.splice(0, dryRun ? BATCH : Math.min(BATCH, allowance));
+
     $('send-progress').innerHTML =
       `<div class="progress-track"><div class="progress-fill" style="width:${
         (done / selected.length) * 100
       }%"></div></div><div class="muted">${done} of ${selected.length} processed…</div>`;
 
+    let stopped = false;
     try {
       const res = await api('/api/push', {
         method: 'POST',
@@ -1384,26 +1455,52 @@ async function doPush(dryRun) {
       });
       S.results.push(...res.results);
       if (dryRun) payloads.push(...res.results.map((r) => r.payload));
+      if (!dryRun) {
+        if (res.quota) S.quota = res.quota;
+        allowance = res.quota?.capacity ?? allowance - batch.length;
+        // A rate-limited result means the window is spent; every later batch
+        // would only draw the same 429. On the Darden import 78 items did.
+        const limited = res.results.find((r) => r.rateLimited);
+        if (limited) {
+          stopped = true;
+          stopAt = limited.resetAt ?? res.quota?.resetAt ?? null;
+        }
+      }
     } catch (err) {
-      // A 4xx from our own API is a refusal before anything was written, so the
-      // items are safe to fix and push again. Anything else — the 45-second kill
-      // ("Backend call failure"), a 5xx, a dropped connection — means the server
-      // may have created and SENT some of this batch before it died. Treating
-      // those as "rejected, still selected" is how a super pushes the same items
-      // again and emails every sub on the job a second and third time.
-      const refused = !dryRun && err.status >= 400 && err.status < 500;
-      for (const item of batch) {
-        S.results.push({
-          clientId: String(item.id),
-          ok: false,
-          uncertain: !dryRun && !refused,
-          error: err.message,
-        });
+      if (!dryRun && err.status === 429 && err.body?.rateLimited) {
+        // Refused before any write because it would not fit the quota.
+        if (err.body.quota) S.quota = err.body.quota;
+        for (const item of batch) {
+          S.results.push({ clientId: String(item.id), ok: false, rateLimited: true, error: err.message });
+        }
+        stopped = true;
+        stopAt = err.body.quota?.resetAt ?? null;
+      } else {
+        // A 4xx from our own API is a refusal before anything was written, so the
+        // items are safe to fix and push again. Anything else — the 45-second kill
+        // ("Backend call failure"), a 5xx, a dropped connection — means the server
+        // may have created some of this batch before it died. Treating those as
+        // "rejected, still selected" is how a super pushes the same items again
+        // and duplicates every one that landed.
+        const refused = !dryRun && err.status >= 400 && err.status < 500;
+        for (const item of batch) {
+          S.results.push({
+            clientId: String(item.id),
+            ok: false,
+            uncertain: !dryRun && !refused,
+            error: err.message,
+          });
+        }
       }
     }
 
     done += batch.length;
     if (!dryRun) renderResults();
+    if (stopped) break;
+  }
+
+  if (!dryRun && (stopAt !== null || queue.length)) {
+    S.quotaStop = { resetAt: stopAt, notAttempted: queue.length };
   }
 
   $('send-progress').innerHTML = '';
@@ -1415,7 +1512,8 @@ async function doPush(dryRun) {
     renderResults();
     // Successfully created items are unchecked so a second press cannot create
     // duplicates — the most damaging mistake this tool could make, since a
-    // duplicate punch item means two subs dispatched for one defect.
+    // duplicate punch item means two subs dispatched for one defect. Items the
+    // rate limit stopped were never written, so they stay selected.
     for (const r of S.results) {
       if (r.ok || r.uncertain) {
         const item = S.items.find((i) => String(i.id) === r.clientId);
@@ -1431,13 +1529,35 @@ async function doPush(dryRun) {
 function renderResults() {
   const created = S.results.filter((r) => r.ok);
   const uncertain = S.results.filter((r) => !r.ok && r.uncertain);
-  const failed = S.results.filter((r) => !r.ok && !r.uncertain);
+  const limited = S.results.filter((r) => !r.ok && r.rateLimited);
+  const failed = S.results.filter((r) => !r.ok && !r.uncertain && !r.rateLimited);
 
   let html = '';
   if (created.length) {
     html += note(
       'ok',
       `<strong>${created.length} punch item${created.length === 1 ? '' : 's'} created in Procore.</strong>`,
+    );
+  }
+  // This lived in renderReadNotes() by mistake from 2026-10-01 to 10-12, where
+  // `uncertain` is undefined: it threw after every PDF read, and this warning
+  // never reached the results screen it was written for.
+  if (uncertain.length) {
+    html += note(
+      'error',
+      `<strong>${uncertain.length} item${uncertain.length === 1 ? '' : 's'} may already be in Procore.</strong> ` +
+        `The server stopped answering partway through, so it cannot say what it finished. ` +
+        `<strong>Do not push these again</strong> until you have checked the project's punch list in Procore — ` +
+        `pushing them again creates duplicates and can email the same subs twice. They have been unticked.`,
+    );
+  }
+  const notSent = limited.length + (S.quotaStop?.notAttempted || 0);
+  if (S.quotaStop || limited.length) {
+    html += note(
+      'warn',
+      `<strong>Stopped at Procore's rate limit. ${notSent} item${notSent === 1 ? ' was' : 's were'} not created.</strong> ` +
+        'Nothing was written for them, so they are still selected. Press Create again after ' +
+        `${esc(clockTime(S.quotaStop?.resetAt ?? limited[0]?.resetAt ?? null))}.`,
     );
   }
   if (failed.length) {
@@ -1611,6 +1731,7 @@ function wire() {
     } else if (S.step === 'review') {
       renderSendSummary();
       goto('send');
+      loadQuota();
     } else {
       doPush(false);
     }

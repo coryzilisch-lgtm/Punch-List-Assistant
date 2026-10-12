@@ -23,6 +23,7 @@
  */
 
 import { bust, cached as memoized, CONFIG_TTL_MS, LIST_TTL_MS } from './cache';
+import { exhaustedUntil, readQuota, recordQuota, resetAtFromHeader } from './quota';
 
 const LOGIN_BASE = process.env.PROCORE_LOGIN_BASE_URL || 'https://login.procore.com';
 const API_BASE = process.env.PROCORE_API_BASE_URL || 'https://api.procore.com';
@@ -37,11 +38,16 @@ const MAX_RETRIES = 4;
  */
 const MAX_RATE_LIMIT_WAIT_MS = 5_000;
 
+/** A 429 resetting further out than this is the hourly window spent, not a burst. */
+const SPENT_WINDOW_MS = 60_000;
+
 export class ProcoreError extends Error {
   readonly status: number;
   readonly body: unknown;
   readonly method: string;
   readonly path: string;
+  /** On a 429: when the quota resets, epoch ms, when that was knowable. */
+  resetAt: number | null = null;
 
   constructor(method: string, path: string, status: number, body: unknown) {
     super(`Procore ${status} on ${method} ${path}: ${summarize(body)}`);
@@ -215,6 +221,12 @@ export async function procoreRequest<T = unknown>(
   const idempotent = method.toUpperCase() === 'GET';
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    // Procore has already said the quota is at zero for this window. Asking
+    // again can only draw another 429; refusing here is the same answer, and
+    // like Procore's own 429 it is given before anything is written.
+    const blockedUntil = exhaustedUntil(Date.now());
+    if (blockedUntil !== null) throw rateLimited(method, url.pathname, blockedUntil, 'not sent');
+
     const token = await getToken(forceRefresh);
     forceRefresh = false;
 
@@ -247,6 +259,8 @@ export async function procoreRequest<T = unknown>(
       continue;
     }
 
+    recordQuota(readQuota(res.headers, Date.now()));
+
     if (res.ok) {
       opts.onHeaders?.(res.headers);
       return (await readBody(res)) as T;
@@ -262,25 +276,32 @@ export async function procoreRequest<T = unknown>(
     }
 
     if (res.status === 429) {
-      const waitMs = rateLimitWaitMs(res.headers.get('X-Rate-Limit-Reset'), attempt);
+      const resetHeader = res.headers.get('X-Rate-Limit-Reset');
+      const waitMs = rateLimitWaitMs(resetHeader, attempt);
 
       // Waiting out a rate limit inside a Function that is killed at 45 seconds
       // does not produce a rate-limit error — it produces Azure's opaque
       // "Backend call failure", which looks like the app is broken. This used
       // to sleep up to 60s and could never have succeeded. Wait only if the
       // window is short; otherwise say plainly what happened.
+      // A 429 carrying `Remaining: 0` was recorded above, so the next attempt is
+      // refused at the top of the loop without reaching Procore. Retrying a spent
+      // window is what turned each refused item on the Darden import into five
+      // requests.
       if (attempt < MAX_RETRIES && waitMs <= MAX_RATE_LIMIT_WAIT_MS) {
         await sleep(waitMs);
         continue;
       }
 
-      const seconds = Math.ceil(waitMs / 1000);
-      throw new ProcoreError(method, url.pathname, 429, {
-        message:
-          `Procore rate limit reached; it resets in about ${seconds}s. ` +
-          'The API service account is shared with the Safety Dashboard ingest, so a large sync ' +
-          'running at the same time can exhaust the company quota.',
-      });
+      const now = Date.now();
+      const resetAt = resetAtFromHeader(resetHeader, now) ?? now + waitMs;
+      // A 429 that resets minutes from now is a spent window whether or not
+      // Procore also sent `Remaining: 0`, so remember it as one: every later
+      // call until then is refused here instead of spending another request.
+      if (resetAt - now > SPENT_WINDOW_MS) {
+        recordQuota({ limit: null, remaining: 0, resetAt, observedAt: now });
+      }
+      throw rateLimited(method, url.pathname, resetAt, 'refused');
     }
 
     if (res.status >= 500 && idempotent && attempt < MAX_RETRIES) {
@@ -292,6 +313,21 @@ export async function procoreRequest<T = unknown>(
   }
 
   throw new Error(`Procore request exhausted retries: ${method} ${path}`);
+}
+
+/** The 429 every caller sees, whether Procore said it or the quota snapshot did. */
+function rateLimited(method: string, path: string, resetAt: number, how: 'refused' | 'not sent'): ProcoreError {
+  const seconds = Math.max(1, Math.ceil((resetAt - Date.now()) / 1000));
+  const err = new ProcoreError(method, path, 429, {
+    message:
+      (how === 'refused'
+        ? `Procore rate limit reached; it resets in about ${seconds}s. `
+        : `Not sent: Procore already reported the rate limit spent; it resets in about ${seconds}s. `) +
+      'The API service account is shared with the Safety Dashboard ingest, so a large sync ' +
+      'running at the same time can exhaust the company quota.',
+  });
+  err.resetAt = resetAt;
+  return err;
 }
 
 function backoffMs(attempt: number): number {

@@ -190,6 +190,7 @@ docs/procore-oauth.md           acting as the superintendent instead of the robo
 | `POST /api/extract` | one page → structured items |
 | `POST /api/push` | create items as **Drafts** (+ photos, assignees). Never sends. `dryRun` previews payloads |
 | `GET /api/probe?project_id=` | the connection check the app shows on step 1 |
+| `GET /api/quota` | Procore's rate limit left, and how many items that is room for. One request |
 | `GET /api/inspect` | the read-only truth probe — see below |
 
 ### `/api/inspect` modes
@@ -380,6 +381,42 @@ Three rules that keep it honest:
 3. **`listPunchItems()` is the most expensive read in the app.** Only the
    recovery sweep and the inspect survey need every row. Anything asking "can we
    read this" wants `punchItemAccess()`.
+
+### Pushing inside the quota — 2026-10-12
+
+The Darden import ran out of quota after 147 items, and a retry 40 minutes later
+hit an empty quota again with only 3 items pushed. **This app was not what drained
+it** (measured: 2 requests per item on the normal path, 6 when the photo PATCH
+fallbacks run), but it could not see that coming, because it never read the
+quota headers, and it could not stop: the dashboard sent 78 more items into the
+429, and each one was retried up to four times.
+
+`api/src/lib/quota.ts` now reads `X-Rate-Limit-Limit/Remaining/Reset` off every
+response. Four rules:
+
+1. **The create step shows the quota** (`GET /api/quota`) and how many items fit
+   at `REQUESTS_PER_ITEM` (3) while leaving `QUOTA_RESERVE` (200) for the ingest.
+   The button says "Create 7 of 12" before it is pressed.
+2. **A push takes only what fits** and leaves the rest selected. `/api/push` also
+   refuses a batch it *knows* will not fit (429, before any write). Unknown quota
+   (a cold instance, no headers) is not a refusal.
+3. **The first rate-limited batch stops the push.** Items it never sent, and
+   items refused with a 429, were never written, so they stay selected and the
+   results say when to press Create again.
+4. **A spent window is refused locally.** After `Remaining: 0`, or a 429 that
+   resets more than a minute out, `procoreRequest` throws the same 429 without
+   calling Procore until the reset time Procore gave. It only ever refuses
+   early, never permits what Procore would refuse.
+
+⚠️ Whether a separate Procore app registration gets its own quota is **unknown**.
+The "company-wide" claim above is not a tenant answer. Now that the headers are
+read, compare what this app sees against the ingest's usage before deciding.
+
+Covered by `api/test/quota.test.mjs` and, through the real UI,
+`tools/dashboard-test/push-quota.test.mjs`. Writing the browser test found that
+the "may already be in Procore" warning had been pasted into `renderReadNotes()`
+on 10-01, where it threw after every PDF read and never reached the results
+screen. It is back in `renderResults()`.
 
 **A push is ~2 requests per item** (create, read-back). That is deliberately NOT optimised.
 The read-backs are the safety property — Procore has answered 200 and stored
