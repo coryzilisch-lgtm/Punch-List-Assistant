@@ -1,10 +1,17 @@
 /**
- * Photo detection — pure pixel maths, no DOM.
+ * Photo detection — pure maths, no DOM.
  *
  * Kept free of any browser API on purpose. The app runs this on a canvas in the
  * browser, the CLI harness in `tools/extract-cli` runs it on a Node-rendered
- * bitmap, and the tests run it on synthetic pixel buffers. One implementation,
- * so what a developer verifies offline is what a superintendent gets.
+ * bitmap, and the tests run it on synthetic pixel buffers and operator lists.
+ * One implementation, so what a developer verifies offline is what a
+ * superintendent gets.
+ *
+ * Two ways in, tried in this order:
+ *  1. `placedImageRegions` — where the PDF itself says it drew each image. Exact,
+ *     when the PDF was exported by an app with the photos embedded one by one.
+ *  2. `detectPhotoRegions` — a guess from pixels, for scans, where the whole
+ *     page is a single image and the PDF has nothing useful to say.
  */
 
 /** Page pixels per grid cell. */
@@ -12,6 +19,13 @@ const CELL = 8;
 
 /** A cell counts as photo-like above this score. */
 const PHOTO_CELL = 0.45;
+
+/** A photo is at least this fraction of the page wide, and this tall. */
+const MIN_W = 0.06;
+const MIN_H = 0.045;
+
+/** Anything covering more of the page than this is the page, not a photo on it. */
+const WHOLE_PAGE = 0.85;
 
 /**
  * Find the photographs on a rendered page.
@@ -28,9 +42,10 @@ const PHOTO_CELL = 0.45;
  *    wall or a stainless fridge — bright subjects with little dark area.
  *  - Edge detection: a dense table of ruled lines (Excel-style punch lists) is
  *    all edges and would score as one huge photo.
- *  - Trusting the PDF's own embedded image list: works only when the source is a
- *    native PDF. Every scanned punch list is one full-page JPEG per page, so the
- *    image list is a single object covering the whole page — useless.
+ *  - Trusting the PDF's own embedded image list, ALONE: a scan is one full-page
+ *    JPEG per page, so the list is a single object covering the whole page. That
+ *    is why this exists; but for an app-exported PDF the list is exact and this
+ *    is only a guess, so `placedImageRegions` is asked first.
  *
  * This finds image-shaped regions, which is all pixels can tell you. It cannot
  * tell a defect photo from a header logo or a QR code — that judgement needs to
@@ -78,7 +93,7 @@ export function detectPhotoRegions(pixels, width, height) {
   const minCells = Math.max(24, Math.round(cols * rows * 0.004));
   const out = [];
 
-  for (const box of connectedBoxes(dense, cols, rows)) {
+  for (const box of connectedBoxes(openGrid(dense, cols, rows), cols, rows)) {
     const bw = box.x1 - box.x0 + 1;
     const bh = box.y1 - box.y0 + 1;
     if (box.count < minCells) continue;
@@ -88,11 +103,11 @@ export function detectPhotoRegions(pixels, width, height) {
     if (box.count / (bw * bh) < 0.62) continue;
     // Must be meaningfully large in BOTH directions — this is what rejects a
     // horizontal rule, a coloured status chip, or a logo strip.
-    if (bw / cols < 0.06 || bh / rows < 0.045) continue;
+    if (bw / cols < MIN_W || bh / rows < MIN_H) continue;
     // Nothing on a punch list is a photo of the whole page. A hit this large
     // means the page itself is a dark scan, and cropping it would produce a
     // "photo" that is just the page again.
-    if ((bw * bh) / (cols * rows) > 0.85) continue;
+    if ((bw * bh) / (cols * rows) > WHOLE_PAGE) continue;
 
     out.push({
       left: box.x0 / cols,
@@ -102,17 +117,211 @@ export function detectPhotoRegions(pixels, width, height) {
     });
   }
 
-  // Reading order: top to bottom, then left to right. The extraction prompt tells
-  // Claude the photos are numbered in this order, so it must hold. Rows are
-  // bucketed before sorting horizontally, otherwise two photos side by side with
-  // a few pixels of vertical offset would sort as two separate rows.
+  return readingOrder(out);
+}
+
+/**
+ * Where the PDF painted its images, from the page's pdf.js operator list.
+ *
+ * An app-exported punch list (the Darden walkthrough is one) embeds every photo
+ * as its own image and places it with a transform, so the page says exactly
+ * where each photo is. The pixel detector cannot match that: it reads near-white
+ * as paper, so a photo of a white wall, a bright sky or a stainless counter is
+ * split in two or lost, and a divider rule drawn flush against a photo used to
+ * swallow it outright. On that document pixels found 74 of 228 photos.
+ *
+ * Returns null whenever the PDF cannot answer, so the caller falls back to
+ * pixels: a page carrying an image that covers most of it (a scan), or a page
+ * with no image big enough to be a photo.
+ *
+ * @param {{fnArray: number[], argsArray: any[]}} opList from `page.getOperatorList()`
+ * @param {Record<string, number>} OPS pdf.js's `OPS` table, passed in so this file imports nothing
+ * @param {number[]} transform the viewport's `transform`: PDF user space to device pixels
+ * @param {number} width viewport width in device pixels
+ * @param {number} height viewport height in device pixels
+ * @returns {Array<{left:number,right:number,top:number,bottom:number}>|null}
+ */
+export function placedImageRegions(opList, OPS, transform, width, height) {
+  const { fnArray, argsArray } = opList;
+  const stack = [];
+  let ctm = transform.slice();
+  // Images inside an annotation (a stamp, a form field's appearance) are not
+  // the document's photos, and the annotation's own transform rules are not
+  // worth reproducing to find them.
+  let inAnnotation = 0;
+  const boxes = [];
+
+  for (let i = 0; i < fnArray.length; i++) {
+    const fn = fnArray[i];
+    const args = argsArray[i];
+    switch (fn) {
+      case OPS.save:
+        stack.push(ctm);
+        break;
+      case OPS.restore:
+        if (stack.length) ctm = stack.pop();
+        break;
+      case OPS.transform:
+        ctm = multiply(ctm, args);
+        break;
+      // pdf.js paints a form inside save/restore with its matrix applied, and
+      // paints a transparency group with the transform it was entered with.
+      case OPS.paintFormXObjectBegin:
+        stack.push(ctm);
+        if (Array.isArray(args?.[0]) && args[0].length === 6) ctm = multiply(ctm, args[0]);
+        break;
+      case OPS.paintFormXObjectEnd:
+        if (stack.length) ctm = stack.pop();
+        break;
+      case OPS.beginGroup:
+        stack.push(ctm);
+        break;
+      case OPS.endGroup:
+        if (stack.length) ctm = stack.pop();
+        break;
+      case OPS.beginAnnotation:
+        inAnnotation++;
+        break;
+      case OPS.endAnnotation:
+        if (inAnnotation) inAnnotation--;
+        break;
+      // An image is drawn into the unit square of the current transform.
+      case OPS.paintImageXObject:
+      case OPS.paintInlineImageXObject:
+        if (!inAnnotation) boxes.push(unitSquareBox(ctm, width, height));
+        break;
+    }
+  }
+
+  // A scan: the page is one picture, and where it sits says nothing.
+  if (boxes.some((b) => (b.right - b.left) * (b.bottom - b.top) > WHOLE_PAGE)) return null;
+
+  // Same size floor as the pixel path, so a logo, an icon or a status chip is
+  // no more a photo here than it is there.
+  const kept = mergeTouching(boxes.filter((b) => b.right - b.left >= MIN_W && b.bottom - b.top >= MIN_H));
+  if (!kept.length) return null;
+  return readingOrder(kept);
+}
+
+/** Box of the unit square under a transform, normalized and clamped to the page. */
+function unitSquareBox(m, width, height) {
+  const xs = [m[4], m[0] + m[4], m[2] + m[4], m[0] + m[2] + m[4]];
+  const ys = [m[5], m[1] + m[5], m[3] + m[5], m[1] + m[3] + m[5]];
+  const clamp = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+  return {
+    left: clamp(Math.min(...xs) / width),
+    right: clamp(Math.max(...xs) / width),
+    top: clamp(Math.min(...ys) / height),
+    bottom: clamp(Math.max(...ys) / height),
+  };
+}
+
+/** `m1 × m2` in PDF's [a b c d e f] form; the same product pdf.js's `Util.transform` computes. */
+function multiply(m1, m2) {
+  return [
+    m1[0] * m2[0] + m1[2] * m2[1],
+    m1[1] * m2[0] + m1[3] * m2[1],
+    m1[0] * m2[2] + m1[2] * m2[3],
+    m1[1] * m2[2] + m1[3] * m2[3],
+    m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
+    m1[1] * m2[4] + m1[3] * m2[5] + m1[5],
+  ];
+}
+
+/**
+ * Union boxes that overlap or touch. Some exporters slice one large photo into
+ * strips, and some paint the same image twice; either way it is one photo to
+ * the superintendent, and would be one region to the pixel detector too.
+ */
+function mergeTouching(boxes) {
+  const EPS = 0.002;
+  const out = boxes.map((b) => ({ ...b }));
+  let merged = true;
+  while (merged) {
+    merged = false;
+    for (let i = 0; i < out.length && !merged; i++) {
+      for (let j = i + 1; j < out.length; j++) {
+        const a = out[i];
+        const b = out[j];
+        if (
+          a.left <= b.right + EPS &&
+          b.left <= a.right + EPS &&
+          a.top <= b.bottom + EPS &&
+          b.top <= a.bottom + EPS
+        ) {
+          a.left = Math.min(a.left, b.left);
+          a.right = Math.max(a.right, b.right);
+          a.top = Math.min(a.top, b.top);
+          a.bottom = Math.max(a.bottom, b.bottom);
+          out.splice(j, 1);
+          merged = true;
+          break;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Reading order: top to bottom, then left to right. The extraction prompt tells
+ * Claude the photos are numbered in this order, so it must hold. Rows are
+ * bucketed before sorting horizontally, otherwise two photos side by side with
+ * a few pixels of vertical offset would sort as two separate rows.
+ */
+function readingOrder(regions) {
   const ROW_GAP = 0.04;
-  out.sort((a, b) => {
+  return regions.sort((a, b) => {
     if (Math.abs(a.top - b.top) > ROW_GAP) return a.top - b.top;
     return a.left - b.left;
   });
+}
 
-  return out;
+/**
+ * Morphological opening with a 3x3 block: keep only cells that sit inside a
+ * solid 3x3, then grow the survivors back by one cell.
+ *
+ * This cuts lines one or two cells thick away from anything they touch. Without
+ * it, a divider rule drawn flush against a photo's edge (the Darden walkthrough
+ * puts one on top of every photo) joins the photo into a single page-wide blob
+ * that is mostly empty, and the fill-ratio check below discards the photo along
+ * with the rule. A solid rectangle comes back exactly as it was. Opening only
+ * ever removes cells, so it cannot invent a photo.
+ */
+function openGrid(dense, cols, rows) {
+  const at = (x, y) => x >= 0 && y >= 0 && x < cols && y < rows && dense[y * cols + x] === 1;
+
+  const core = new Uint8Array(cols * rows);
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      if (!dense[y * cols + x]) continue;
+      let solid = true;
+      for (let dy = -1; dy <= 1 && solid; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (!at(x + dx, y + dy)) {
+            solid = false;
+            break;
+          }
+        }
+      }
+      if (solid) core[y * cols + x] = 1;
+    }
+  }
+
+  const opened = new Uint8Array(cols * rows);
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      if (!core[y * cols + x]) continue;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx >= 0 && ny >= 0 && nx < cols && ny < rows) opened[ny * cols + nx] = 1;
+        }
+      }
+    }
+  }
+  return opened;
 }
 
 /** Label connected cells (4-connectivity) and return each blob's bounding box. */

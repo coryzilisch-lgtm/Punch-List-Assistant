@@ -9,7 +9,7 @@
  */
 
 import * as pdfjs from './vendor/pdf.mjs';
-import { detectPhotoRegions } from './photo-detect.js';
+import { detectPhotoRegions, placedImageRegions } from './photo-detect.js';
 
 pdfjs.GlobalWorkerOptions.workerSrc = './vendor/pdf.worker.mjs';
 
@@ -36,7 +36,7 @@ export async function processPage(pdf, pageNumber) {
   const page = await pdf.getPage(pageNumber);
 
   const pageCanvas = await renderPage(page, RENDER_SCALE);
-  const regions = findPhotos(pageCanvas);
+  const regions = (await embeddedPhotos(page)) ?? findPhotos(pageCanvas);
 
   let photos = [];
   if (regions.length) {
@@ -76,6 +76,22 @@ async function renderPage(page, scale) {
 }
 
 // ── Photo detection ─────────────────────────────────────────────────────────
+
+/**
+ * Where the PDF says it drew its photos, or null when it cannot say (a scan) and
+ * the pixels have to be read instead. See `placedImageRegions`.
+ */
+async function embeddedPhotos(page) {
+  try {
+    const viewport = page.getViewport({ scale: 1 });
+    const ops = await page.getOperatorList();
+    return placedImageRegions(ops, pdfjs.OPS, viewport.transform, viewport.width, viewport.height);
+  } catch {
+    // The pixels worked before this existed; a PDF that pdf.js can render but
+    // not list is no reason to lose the page.
+    return null;
+  }
+}
 
 /**
  * Read the page's pixels and hand them to the shared detector.
