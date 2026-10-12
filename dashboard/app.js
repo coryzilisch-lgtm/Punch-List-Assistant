@@ -183,10 +183,19 @@ function renderBar() {
   } else {
     const n = S.items.filter((i) => i.include).length;
     dry.style.display = 'inline-block';
+    const unmanaged = unmanagedCount();
     next.textContent = S.sending ? 'Creating…' : `Create ${n} punch items`;
-    next.disabled = S.sending || n === 0;
-    summary.innerHTML = `Creating Drafts in <b>${esc(S.project?.name || '')}</b>`;
+    // /api/push refuses these too; disabling here just says so before the press.
+    next.disabled = S.sending || n === 0 || unmanaged > 0;
+    summary.innerHTML = unmanaged
+      ? `<b>${unmanaged}</b> item(s) need a punch item manager`
+      : `Creating Drafts in <b>${esc(S.project?.name || '')}</b>`;
   }
+}
+
+/** Selected items with no punch item manager. Every pushed item must have one. */
+function unmanagedCount() {
+  return S.items.filter((i) => i.include && i.title.trim() && !i.punchItemManagerId).length;
 }
 
 // ── Step 1: project ─────────────────────────────────────────────────────────
@@ -1299,12 +1308,20 @@ function renderSendSummary() {
   if (missingTitle) {
     html += note('error', `${missingTitle} selected item(s) have no text and will be skipped.`);
   }
-  const missingRoles = selected.filter((i) => !i.punchItemManagerId || !i.finalApproverId).length;
-  if (missingRoles) {
+  const unmanaged = unmanagedCount();
+  if (unmanaged) {
+    html += note(
+      'error',
+      `<strong>${unmanaged} item(s) have no punch item manager.</strong> Every item needs one before it can ` +
+        'be created. Set it in the bulk card on the review step and press <strong>Apply to selected items</strong>.',
+    );
+  }
+  const noApprover = selected.filter((i) => i.punchItemManagerId && !i.finalApproverId).length;
+  if (noApprover) {
     html += note(
       'warn',
-      `<strong>${missingRoles} item(s) have no punch item manager and/or final approver.</strong> ` +
-        'Most Procore configurations require both. Set them in the bulk card on the review step and ' +
+      `<strong>${noApprover} item(s) have no final approver.</strong> ` +
+        'Many Procore configurations require one. Set it in the bulk card on the review step and ' +
         'press <strong>Apply to selected items</strong>.',
     );
   }
@@ -1330,6 +1347,7 @@ function renderSendSummary() {
 async function doPush(dryRun) {
   const selected = S.items.filter((i) => i.include && i.title.trim());
   if (!selected.length) return;
+  if (!dryRun && unmanagedCount()) return;
 
   S.sending = true;
   renderBar();

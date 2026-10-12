@@ -119,6 +119,23 @@ export async function pushHandler(
     );
   }
 
+  // Every item needs a punch item manager. Without one an item has nobody
+  // responsible for it on Procore's side, and most tenants reject it anyway;
+  // on the 228-item Darden import, 81 items went over with none. Checked for
+  // the whole batch before any write, so a stale page cannot create half of it.
+  // Dry runs are exempt: a preview writes nothing, and seeing the payload is
+  // how a super finds out what is missing.
+  if (!dryRun) {
+    const unmanaged = body.items.filter((i) => !isProcoreId(i.punchItemManagerId));
+    if (unmanaged.length) {
+      return errorResponse(
+        400,
+        `${unmanaged.length} item(s) have no punch item manager. Every item needs one: ` +
+          'set it in the bulk card on the review step and push again. Nothing was created.',
+      );
+    }
+  }
+
   if (!dryRun && !procoreConfigured()) {
     return errorResponse(
       503,
@@ -229,6 +246,10 @@ export async function pushHandler(
     failed: results.length - created,
     results,
   });
+}
+
+function isProcoreId(value: unknown): boolean {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0;
 }
 
 function decodePhoto(dataUrl: string, baseName: string): PunchPhoto {
