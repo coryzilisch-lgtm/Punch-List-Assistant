@@ -82,7 +82,11 @@ const ctx = { log() {}, error() {}, warn() {} };
 test('a push from a stale page asking to send is refused before anything is written', async () => {
   const calls = mockFetch(() => ok({ id: 1 }));
   const res = await pushHandler(
-    signedIn({ projectId: 1, send: true, items: [{ clientId: 'a', name: 'Cracked tile' }] }),
+    signedIn({
+      projectId: 1,
+      send: true,
+      items: [{ clientId: 'a', name: 'Cracked tile', punchItemManagerId: 4410 }],
+    }),
     ctx,
   );
   assert.equal(res.status, 400);
@@ -103,7 +107,15 @@ test('a push creates the item and makes no send write of any kind', async () => 
   const res = await pushHandler(
     signedIn({
       projectId: 1,
-      items: [{ clientId: 'a', name: 'Cracked tile', assigneeIds: [11921505], vendorId: 10263673 }],
+      items: [
+        {
+          clientId: 'a',
+          name: 'Cracked tile',
+          punchItemManagerId: 4410,
+          assigneeIds: [11921505],
+          vendorId: 10263673,
+        },
+      ],
     }),
     ctx,
   );
@@ -118,4 +130,33 @@ test('a push creates the item and makes no send write of any kind', async () => 
     assert.ok(!/\/send\b/.test(c.path), `send endpoint called: ${c.path}`);
     assert.ok(!/workflow_status|"draft"\s*:/.test(c.body), `workflow write: ${c.body}`);
   }
+});
+
+test('a push with an item missing its punch item manager is refused before anything is written', async () => {
+  // The whole batch, not just the bad row: refusing before any write is what
+  // lets the dashboard treat this as "nothing was created, fix and push again".
+  const calls = mockFetch(() => ok({ id: 1 }));
+  const res = await pushHandler(
+    signedIn({
+      projectId: 1,
+      items: [
+        { clientId: 'a', name: 'Cracked tile', punchItemManagerId: 4410 },
+        { clientId: 'b', name: 'Paint touch up' },
+        { clientId: 'c', name: 'Caulk grid to wall', punchItemManagerId: '' },
+      ],
+    }),
+    ctx,
+  );
+  assert.equal(res.status, 400);
+  assert.match(res.jsonBody.error, /2 item\(s\) have no punch item manager/);
+  assert.equal(calls.length, 0);
+});
+
+test('a dry run without a punch item manager still previews', async () => {
+  const res = await pushHandler(
+    signedIn({ projectId: 1, dryRun: true, items: [{ clientId: 'a', name: 'Cracked tile' }] }),
+    ctx,
+  );
+  assert.equal(res.status ?? 200, 200);
+  assert.equal(res.jsonBody.results.length, 1);
 });

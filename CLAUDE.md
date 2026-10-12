@@ -104,6 +104,20 @@ screen flags it in red: something notified people, and it was not this app.
 sending back without a decision from Cory: it is the one thing this app could do
 that reaches people outside Buffalo.
 
+⚠️ **Unresolved, 2026-10-12: creates are reading back `initiated`.** On the
+228-item Darden walkthrough import, all 147 items that landed read back
+`workflow_status: initiated`, ball in court on the service account. The create
+payload has **never** asked for a Draft (checked across the whole git history),
+so "every item is created as a Draft" was an assumption, not a tenant answer,
+and removing sending may not have removed what notified people on 10-01. Next
+step: `/api/inspect?project_id=…&punch_item_id=…` on one of those items, to see
+which field this tenant uses for Draft, then prove a Draft create by read-back.
+
+**Every pushed item needs a punch item manager.** `/api/push` refuses the whole
+batch (400, before any write) if any item lacks one, and the dashboard disables
+Create until they are set. 81 items on that import went over with none. Dry runs
+are exempt. Final approver is still only a warning.
+
 A batch killed at 45s is also no longer shown as "rejected, still selected so
 you can resend": some of it may have been created. It is marked "may already be
 in Procore" and unticked, so a re-press cannot duplicate it.
