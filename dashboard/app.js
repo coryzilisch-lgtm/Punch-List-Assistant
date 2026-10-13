@@ -1399,7 +1399,10 @@ function renderSendSummary() {
     const resets = q.resetAt ? `, resets about ${esc(clockTime(q.resetAt))}` : '';
     html += note(
       'info',
-      `<strong>Procore rate limit: ${q.remaining}${q.limit ? ` of ${q.limit}` : ''} requests left${resets}.</strong> ` +
+      // Procore reports the spike window until the hourly limit is close, then
+      // switches the same headers to the hourly numbers. A far-off reset here
+      // therefore means the hourly limit is what is being reported.
+      `<strong>Procore is reporting its hourly limit: ${q.remaining}${q.limit ? ` of ${q.limit}` : ''} requests left${resets}.</strong> ` +
         `That is room for about ${fits} item(s) at ${q.perItem} requests each, keeping ${q.reserve} ` +
         'in reserve for the Safety Dashboard, which shares this Procore account.',
     );
