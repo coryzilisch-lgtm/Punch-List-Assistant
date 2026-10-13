@@ -21,6 +21,10 @@ const S = {
   quota: null,
   /** Set when a push stopped at the rate limit: { resetAt, notAttempted }. */
   quotaStop: null,
+  /** When S.quota was last fetched, epoch ms. */
+  quotaAt: 0,
+  /** Procore requests this import has spent, as the API reported them. */
+  procoreRequests: 0,
   me: null,
   projects: [],
   project: null,
@@ -212,9 +216,13 @@ function renderBar() {
  * quota unknown rather than blocking the push: the API still refuses a batch it
  * knows will not fit, and stops at the first spent window.
  */
-async function loadQuota() {
+async function loadQuota({ maxAgeMs = 0 } = {}) {
+  // Each call is a Procore request; a fresh answer is reused rather than re-asked.
+  if (maxAgeMs && S.quota && Date.now() - S.quotaAt < maxAgeMs) return S.quota;
   try {
     S.quota = await api('/api/quota');
+    S.quotaAt = Date.now();
+    S.procoreRequests += S.quota?.requests || 0;
   } catch {
     S.quota = null;
   }
@@ -1412,6 +1420,18 @@ function renderSendSummary() {
   } else if (q) {
     html += note('info', "Procore didn't report its rate limit, so this push can't be planned against it.");
   }
+  // The long quota may never appear in the headers; a 429 that resets minutes
+  // out is how it shows itself. Surface the last one before the super presses.
+  const longHit = (q?.evidence?.recentLimitHits || [])
+    .filter((h) => h.window === 'long' && h.resetAt > Date.now())
+    .pop();
+  if (longHit) {
+    html += note(
+      'warn',
+      `<strong>Procore's long (hourly-scale) limit was hit at ${esc(clockTime(longHit.at))}</strong> and resets about ` +
+        `${esc(clockTime(longHit.resetAt))}. Pushing before then will stop at the first item.`,
+    );
+  }
 
   // Always Drafts. This app used to offer to send items out of Draft, which is
   // what emails the manager, the assignees and their companies — and one import
@@ -1450,7 +1470,8 @@ async function doPush(dryRun) {
   // stops at the first spent window, so unknown is not unsafe.
   let allowance = Infinity;
   if (!dryRun) {
-    const q = await loadQuota();
+    S.procoreRequests = 0;
+    const q = await loadQuota({ maxAgeMs: 15_000 });
     if (q && q.capacity !== null && q.capacity !== undefined) allowance = q.capacity;
   }
 
@@ -1476,8 +1497,10 @@ async function doPush(dryRun) {
       if (resetIsSoon(S.quota) && idleWaits < MAX_IDLE_WAITS) {
         await waitForReset(S.quota.resetAt, done, selected.length);
         idleWaits += 1;
-        const q = await loadQuota();
-        allowance = q?.capacity ?? Infinity;
+        // No /api/quota call here: that is a Procore request per wait. The next
+        // batch's own response reports the quota, and the API refuses (before
+        // any write) a batch it knows will not fit.
+        allowance = BATCH;
         continue;
       }
       stopAt = S.quota?.resetAt ?? null;
@@ -1507,7 +1530,11 @@ async function doPush(dryRun) {
       S.results.push(...res.results);
       if (dryRun) payloads.push(...res.results.map((r) => r.payload));
       if (!dryRun) {
-        if (res.quota) S.quota = res.quota;
+        S.procoreRequests += res.requests || 0;
+        if (res.quota) {
+          S.quota = res.quota;
+          S.quotaAt = Date.now();
+        }
         allowance = res.quota?.capacity ?? allowance - batch.length;
         // A rate-limited result means the window is spent; every later batch
         // would only draw the same 429. On the Darden import 78 items did.
@@ -1617,11 +1644,31 @@ function renderResults() {
   }
   const notSent = limited.length + (S.quotaStop?.notAttempted || 0);
   if (S.quotaStop || limited.length) {
+    const resetAt = S.quotaStop?.resetAt ?? limited[0]?.resetAt ?? null;
+    const minutes = resetAt ? Math.round((resetAt - Date.now()) / 60_000) : null;
+    // Which limit was it? A burst window resets in seconds and is waited out, so
+    // a stop is the long, hourly-scale quota. Say how much of it this import
+    // spent, so "was it us?" has a number instead of a guess.
+    const which =
+      minutes !== null && minutes >= 2
+        ? ` It resets in about ${minutes} minutes, so this is Procore's long (hourly-scale) limit, not the burst window. ` +
+          `This import had used ${S.procoreRequests} Procore request${S.procoreRequests === 1 ? '' : 's'} when it stopped; ` +
+          "if the account's hourly limit is Procore's default 3,600 (not confirmed for this tenant), the rest went to " +
+          'something else on the shared account, most likely the Safety Dashboard ingest.'
+        : '';
     html += note(
       'warn',
       `<strong>Stopped at Procore's rate limit. ${notSent} item${notSent === 1 ? ' was' : 's were'} not created.</strong> ` +
         'Nothing was written for them, so they are still selected. Press Create again after ' +
-        `${esc(clockTime(S.quotaStop?.resetAt ?? limited[0]?.resetAt ?? null))}.`,
+        `${esc(clockTime(resetAt))}.${esc(which)}`,
+    );
+  }
+  if (created.length && S.procoreRequests) {
+    html += note(
+      'info',
+      `This import used <strong>${S.procoreRequests} Procore requests</strong> for ${created.length} item${
+        created.length === 1 ? '' : 's'
+      } created (about ${(S.procoreRequests / created.length).toFixed(1)} each).`,
     );
   }
   if (failed.length) {

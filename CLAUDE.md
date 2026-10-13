@@ -422,6 +422,39 @@ response. Five rules:
    throws the same 429 without calling Procore until the reset time Procore gave. It only ever refuses
    early, never permits what Procore would refuse.
 
+### Which limit was it — the evidence, 2026-10-13
+
+There are two limits: a **short burst window** (the headers said 25) and a
+**long, hourly-scale quota**. A third-party integrator's notes say the headers
+report the burst window whenever one applies, so the hourly quota may never
+appear in them; it shows itself only as a 429 resetting minutes out. **That is a
+lead, not a tenant answer.** So the app keeps evidence, not conclusions, all
+readable at **`GET /api/quota`** in a browser:
+
+- `evidence.lastHeaders`: every rate/limit/retry header Procore last sent, verbatim.
+- `evidence.recentLimitHits`: the last 20 429s, each `short` (resets ≤ 90s) or
+  `long`, with their headers.
+- `evidence.thisInstance.requestsLastHour`: this Function instance's own
+  requests. A floor on what the app spent, never an account total.
+
+The results screen adds up the import's own requests (`requests` on every push
+response) and, on a stop, names which limit it was and what this import had
+spent. On 10-13 a Sandbox push stopped at a long reset after **96 items, about
+200 requests**. Against a 3,600/hour quota that was not this app; the evidence
+above is how to confirm it next time.
+
+**Where an import's requests go** (measured with a mocked Procore): project list
+0 (the Fabric mirror), selecting a project ~7 (cached 10 min), reading the PDF 0,
+the create step 1, then **2 per item** (create, read-back), or 6 when the photo
+PATCH fallbacks run. The quota is no longer re-asked after each short wait.
+
+**The read-back is half of every push**, and still deliberately kept. Each push
+result now carries `echo`: whether the create's own response already said what
+the read-back said (draft state, attachments, assignees, manager). If the tenant
+shows `echo.agrees` on every item of real imports, dropping the read-back would
+halve the cost. That is a decision for Cory, with that evidence in hand, not a
+default.
+
 ⚠️ Whether a separate Procore app registration gets its own quota is **unknown**.
 The "company-wide" claim above is not a tenant answer. Now that the headers are
 read, compare what this app sees against the ingest's usage before deciding.

@@ -209,3 +209,66 @@ test('a push is not stopped by a window that resets in a moment', async () => {
   const res = await pushHandler(signedIn({ projectId: 1, items: ['a', 'b', 'c'].map(item) }), ctx);
   assert.deepEqual(res.jsonBody.results.map((r) => r.ok), [true, true, true]);
 });
+
+// ── Which limit is it? Evidence, not conclusions ─────────────────────────────
+
+const { quotaHandler } = await import('../dist/functions/quota.js');
+
+test('the rate headers are kept verbatim, whatever Procore calls them', async () => {
+  mockFetch(() =>
+    reply(200, { id: 1 }, {
+      'X-Rate-Limit-Limit': '25',
+      'X-Rate-Limit-Remaining': '23',
+      'X-Rate-Limit-Reset': '1800000000',
+      'Retry-After': '9',
+      'X-Request-Id': 'not-rate-related',
+    }),
+  );
+  await procoreRequest('GET', '/rest/v1.0/me');
+  const { evidence } = quota.quotaReport(Date.now());
+  assert.deepEqual(evidence.lastHeaders.headers, {
+    'x-rate-limit-limit': '25',
+    'x-rate-limit-remaining': '23',
+    'x-rate-limit-reset': '1800000000',
+    'retry-after': '9',
+  });
+});
+
+test('a 429 is logged as short or long by how far out it resets', async () => {
+  let n = 0;
+  mockFetch(() => {
+    n += 1;
+    if (n === 1) return reply(429, {}, { 'X-Rate-Limit-Reset': '1' });
+    if (n === 2) return reply(200, { id: 1 });
+    return reply(429, {}, { 'X-Rate-Limit-Reset': '2100' });
+  });
+  await procoreRequest('GET', '/rest/v1.0/me'); // short 429, waited out, then 200
+  await assert.rejects(procoreRequest('GET', '/rest/v1.0/me')); // the hourly-scale wall
+  const hits = quota.quotaReport(Date.now()).evidence.recentLimitHits;
+  assert.deepEqual(hits.map((h) => h.window), ['short', 'long']);
+  assert.ok(hits[1].resetAt - hits[1].at > 2_000_000);
+});
+
+test('/api/quota reports this instance\'s requests over the last hour', async () => {
+  mockFetch(() => reply(200, { id: 1 }, { 'X-Rate-Limit-Limit': '25', 'X-Rate-Limit-Remaining': '20', 'X-Rate-Limit-Reset': '30' }));
+  await procoreRequest('GET', '/rest/v1.0/me');
+  await procoreRequest('GET', '/rest/v1.0/me');
+  const res = await quotaHandler({});
+  assert.equal(res.jsonBody.evidence.thisInstance.requestsLastHour, 3, 'two calls plus the quota check itself');
+  assert.equal(res.jsonBody.window, 'short');
+  assert.equal(res.jsonBody.requests, 1);
+});
+
+test('a push reports what it cost, and whether the create already said what the read-back did', async () => {
+  const stored = { id: 7, workflow_status: 'draft', has_attachments: false, attachments: [] };
+  mockFetch((c) => reply(200, c.method === 'POST' ? stored : stored));
+  const agree = await pushHandler(signedIn({ projectId: 1, items: [item('a')] }), ctx);
+  assert.equal(agree.jsonBody.requests, 2, 'create and read-back');
+  assert.deepEqual(agree.jsonBody.results[0].echo, { agrees: true, differs: [] });
+
+  // A create that answers with a bare id cannot stand in for the read-back.
+  mockFetch((c) => reply(200, c.method === 'POST' ? { id: 7 } : stored));
+  const bare = await pushHandler(signedIn({ projectId: 1, items: [item('a')] }), ctx);
+  assert.equal(bare.jsonBody.results[0].echo.agrees, false);
+  assert.ok(bare.jsonBody.results[0].echo.differs.includes('isDraft'));
+});

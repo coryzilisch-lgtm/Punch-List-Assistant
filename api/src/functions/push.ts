@@ -5,6 +5,8 @@ import {
   createPunchItem,
   ProcoreError,
   procoreConfigured,
+  procoreRequestCount,
+  resetProcoreRequestCount,
   PunchItemInput,
   PunchPhoto,
 } from '../lib/procore';
@@ -90,6 +92,8 @@ interface PushResult {
   resetAt?: number | null;
   /** Field-level messages straight from Procore, when it gave any. */
   fieldErrors?: string[];
+  /** Did the create's own response say what the read-back said? See compareEcho(). */
+  echo?: { agrees: boolean | null; differs: string[] };
   /** Present on dry runs: the exact body that would be sent. */
   payload?: Record<string, unknown>;
 }
@@ -175,6 +179,9 @@ export async function pushHandler(
   }
 
   const actor = userEmail(request) || 'unknown';
+  // Counted per batch so the dashboard can add up what an import really costs.
+  // Approximate if two pushes share a warm instance at the same moment.
+  resetProcoreRequestCount();
   const results: PushResult[] = [];
 
   for (const raw of body.items) {
@@ -246,7 +253,7 @@ export async function pushHandler(
 
     try {
       const created = await createPunchItem(body.projectId, input, photos);
-      const { item, photoErrors, photosAttached, assignErrors, assignStrategy, observed } = created;
+      const { item, photoErrors, photosAttached, assignErrors, assignStrategy, observed, echo } = created;
       results.push({
         clientId: raw.clientId,
         ok: true,
@@ -256,6 +263,7 @@ export async function pushHandler(
         photosAttached,
         assignErrors: assignErrors.length ? assignErrors : undefined,
         observed: observed ?? undefined,
+        echo,
       });
       // Log which strategy worked. Once the same one wins across a few real
       // projects, the chains in procore.ts can collapse to it.
@@ -263,7 +271,8 @@ export async function pushHandler(
         `push ok project=${body.projectId} punch_item=${item.id} by=${actor} ` +
           `photos=${photosAttached}/${photos.length} status=${observed?.status ?? '?'} ` +
           `draft=${observed?.isDraft ?? '?'} ` +
-          `assign=${assignStrategy ?? 'none'} bic=${observed?.ballInCourt.join('|') ?? '?'}`,
+          `assign=${assignStrategy ?? 'none'} bic=${observed?.ballInCourt.join('|') ?? '?'} ` +
+          `echo=${echo.agrees === null ? '?' : echo.agrees ? 'agrees' : `differs:${echo.differs.join('|')}`}`,
       );
     } catch (err) {
       if (err instanceof ProcoreError) {
@@ -293,6 +302,7 @@ export async function pushHandler(
     created,
     failed: results.length - created,
     results,
+    requests: procoreRequestCount(),
     quota: quotaReport(Date.now()),
   });
 }
