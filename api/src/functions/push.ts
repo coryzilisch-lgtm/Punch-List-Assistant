@@ -8,6 +8,7 @@ import {
   PunchItemInput,
   PunchPhoto,
 } from '../lib/procore';
+import { exhaustedUntil, pushCapacity, currentQuota, quotaReport } from '../lib/quota';
 
 /**
  * POST /api/push — create a batch of punch items in Procore.
@@ -79,6 +80,14 @@ interface PushResult {
     punchItemManager: string | null;
   };
   error?: string;
+  /**
+   * Refused by the rate limit before anything was written: Procore answers a
+   * 429 before doing anything, and an item this push stopped short of was never
+   * sent at all. Safe to push again after `resetAt`.
+   */
+  rateLimited?: boolean;
+  /** When the quota resets, epoch ms, on a rate-limited result. */
+  resetAt?: number | null;
   /** Field-level messages straight from Procore, when it gave any. */
   fieldErrors?: string[];
   /** Present on dry runs: the exact body that would be sent. */
@@ -136,6 +145,28 @@ export async function pushHandler(
     }
   }
 
+  // Refuse a batch the quota cannot carry while leaving the reserve for the
+  // Safety Dashboard ingest. Only a KNOWN shortfall refuses: a cold instance
+  // has seen no headers yet and goes ahead, and the per-item check below stops
+  // it as soon as Procore says the window is spent.
+  if (!dryRun) {
+    const now = Date.now();
+    const capacity = pushCapacity(currentQuota(now), now);
+    if (capacity !== null && capacity < body.items.length) {
+      return json(
+        {
+          error:
+            capacity === 0
+              ? 'Procore\'s rate limit is too close to empty to push anything without starving the Safety Dashboard ingest. Nothing was created.'
+              : `Procore's rate limit only has room for ${capacity} more item(s) right now. Nothing was created.`,
+          rateLimited: true,
+          quota: quotaReport(now),
+        },
+        429,
+      );
+    }
+  }
+
   if (!dryRun && !procoreConfigured()) {
     return errorResponse(
       503,
@@ -147,6 +178,20 @@ export async function pushHandler(
   const results: PushResult[] = [];
 
   for (const raw of body.items) {
+    // Once Procore has said the window is spent, every later item in this batch
+    // would only draw a 429. Stop, and say plainly that they were never sent.
+    const blockedUntil = dryRun ? null : exhaustedUntil(Date.now());
+    if (blockedUntil !== null) {
+      results.push({
+        clientId: raw.clientId,
+        ok: false,
+        rateLimited: true,
+        resetAt: blockedUntil,
+        error: 'Not sent: the Procore rate limit ran out partway through this batch.',
+      });
+      continue;
+    }
+
     const name = (raw.name || '').trim();
     if (!name) {
       results.push({
@@ -223,6 +268,7 @@ export async function pushHandler(
         results.push({
           clientId: raw.clientId,
           ok: false,
+          ...(err.status === 429 ? { rateLimited: true, resetAt: err.resetAt } : {}),
           error: `Procore rejected this item (HTTP ${err.status}).`,
           // Surfaced verbatim: which fields a tenant requires is configuration,
           // not something this code can know ahead of time. Showing Procore's
@@ -245,6 +291,7 @@ export async function pushHandler(
     created,
     failed: results.length - created,
     results,
+    quota: quotaReport(Date.now()),
   });
 }
 
