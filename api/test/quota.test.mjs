@@ -272,3 +272,54 @@ test('a push reports what it cost, and whether the create already said what the 
   assert.equal(bare.jsonBody.results[0].echo.agrees, false);
   assert.ok(bare.jsonBody.results[0].echo.differs.includes('isDraft'));
 });
+
+// ── Procore's documented rules (rate-limiting docs, pasted by Cory 2026-10-13) ─
+
+test('a 429 is retried once after its reset, never more: failed requests count too', async () => {
+  // "Every request your app sends counts against your rate limit, including
+  // requests that fail." Four retries per 429 is what made each refused item on
+  // the Darden import cost five requests.
+  const calls = mockFetch(() => reply(429, {}, { 'X-Rate-Limit-Limit': '25', 'X-Rate-Limit-Reset': '1' }));
+  await assert.rejects(procoreRequest('GET', '/rest/v1.0/me'), (err) => err.status === 429);
+  assert.equal(calls.length, 2);
+});
+
+test('after a 429, the next request waits for the reset instead of firing into it', async () => {
+  let n = 0;
+  const times = [];
+  mockFetch(() => {
+    times.push(Date.now());
+    n += 1;
+    return n === 1 ? reply(429, {}, { 'X-Rate-Limit-Reset': '1' }) : reply(200, { id: 1 });
+  });
+  await procoreRequest('GET', '/rest/v1.0/me');
+  assert.equal(n, 2);
+  assert.ok(times[1] - times[0] >= 900, `retried after ${times[1] - times[0]}ms`);
+});
+
+test('a 503 on a read honours Retry-After; a 503 on a write is not retried', async () => {
+  let n = 0;
+  mockFetch(() => (++n === 1 ? reply(503, {}, { 'Retry-After': '1' }) : reply(200, { id: 1 })));
+  const row = await procoreRequest('GET', '/rest/v1.0/me');
+  assert.equal(row.id, 1);
+  assert.equal(n, 2);
+
+  const calls = mockFetch(() => reply(503, {}, { 'Retry-After': '1' }));
+  await assert.rejects(procoreRequest('POST', '/rest/v1.1/punch_items'), (err) => err.status === 503);
+  assert.equal(calls.length, 1, 'a write that drew a 503 may still have been performed');
+});
+
+test('the last hour is broken down by outcome, because failures spend quota too', async () => {
+  let n = 0;
+  mockFetch(() => {
+    n += 1;
+    if (n === 1) return reply(200, { id: 1 });
+    if (n === 2) return reply(404, {});
+    return reply(429, {}, { 'X-Rate-Limit-Reset': '2400' });
+  });
+  await procoreRequest('GET', '/rest/v1.0/me');
+  await assert.rejects(procoreRequest('GET', '/rest/v1.0/nope'));
+  await assert.rejects(procoreRequest('GET', '/rest/v1.0/me'));
+  const o = quota.quotaReport(Date.now()).evidence.thisInstance.lastHourByOutcome;
+  assert.deepEqual(o, { total: 3, ok: 1, rateLimited: 1, clientErrors: 1, serverErrors: 0, noResponse: 0 });
+});

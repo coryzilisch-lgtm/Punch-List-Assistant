@@ -28,6 +28,7 @@ import {
   noteHeaders,
   noteLimitHit,
   noteRequest,
+  noteStatus,
   rateHeaders,
   readQuota,
   recordQuota,
@@ -47,9 +48,6 @@ const MAX_RETRIES = 4;
  * diagnosable 429 into an undiagnosable platform kill.
  */
 const MAX_RATE_LIMIT_WAIT_MS = WAIT_IN_FUNCTION_MS;
-
-/** A 429 resetting further out than this is the hourly window spent, not a burst. */
-const SPENT_WINDOW_MS = 60_000;
 
 export class ProcoreError extends Error {
   readonly status: number;
@@ -229,6 +227,11 @@ export async function procoreRequest<T = unknown>(
   // is how one create becomes two punch items, and two subs sent to one defect. Only GETs retry on those; a write retries only on 401 and 429,
   // which Procore answers BEFORE doing anything.
   const idempotent = method.toUpperCase() === 'GET';
+  // Procore: every request counts against the limit, failures included, and on
+  // a 429 the right move is to pause until the reset and retry. So a 429 is
+  // retried ONCE. Retrying it four times is how each refused item on the Darden
+  // import cost five requests: ~390 spent on 429s alone.
+  let rateLimitRetried = false;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     // Procore has already said the quota is at zero for this window. Asking
@@ -276,6 +279,7 @@ export async function procoreRequest<T = unknown>(
       continue;
     }
 
+    noteStatus(res.status);
     recordQuota(readQuota(res.headers, Date.now()));
     const seenRateHeaders = rateHeaders(res.headers);
     noteHeaders(url.pathname, res.status, seenRateHeaders, Date.now());
@@ -297,34 +301,37 @@ export async function procoreRequest<T = unknown>(
     if (res.status === 429) {
       const resetHeader = res.headers.get('X-Rate-Limit-Reset');
       const waitMs = rateLimitWaitMs(resetHeader, attempt);
-      // Every 429 is logged, including the short ones that get waited out: those
-      // are the burst window, and counting them is how it is told from the long one.
-      const hitAt = Date.now();
-      noteLimitHit(url.pathname, resetAtFromHeader(resetHeader, hitAt) ?? hitAt + waitMs, seenRateHeaders, hitAt);
-
-      // Waiting out a rate limit inside a Function that is killed at 45 seconds
-      // does not produce a rate-limit error — it produces Azure's opaque
-      // "Backend call failure", which looks like the app is broken. This used
-      // to sleep up to 60s and could never have succeeded. Wait only if the
-      // window is short; otherwise say plainly what happened.
-      // A 429 carrying `Remaining: 0` was recorded above, so the next attempt is
-      // refused at the top of the loop without reaching Procore. Retrying a spent
-      // window is what turned each refused item on the Darden import into five
-      // requests.
-      if (attempt < MAX_RETRIES && waitMs <= MAX_RATE_LIMIT_WAIT_MS) {
-        await sleep(waitMs);
-        continue;
-      }
-
       const now = Date.now();
       const resetAt = resetAtFromHeader(resetHeader, now) ?? now + waitMs;
-      // A 429 that resets minutes from now is a spent window whether or not
-      // Procore also sent `Remaining: 0`, so remember it as one: every later
-      // call until then is refused here instead of spending another request.
-      if (resetAt - now > SPENT_WINDOW_MS) {
-        recordQuota({ limit: null, remaining: 0, resetAt, observedAt: now });
+      // Every 429 is logged, short and long alike: counting them is how the
+      // spike window is told from the hourly limit.
+      noteLimitHit(url.pathname, resetAt, seenRateHeaders, now);
+      // Whichever limit this was, it is spent until `resetAt`. Recording that
+      // stops every other request in this invocation from firing into it: the
+      // top of the loop waits a short reset out, or refuses a long one locally.
+      const reported = readQuota(res.headers, now);
+      recordQuota({ limit: reported?.limit ?? null, remaining: 0, resetAt, observedAt: now });
+
+      // Waiting inside a Function that is killed at 45 seconds must stay short:
+      // a long sleep turns a diagnosable 429 into Azure's opaque "Backend call
+      // failure". A longer reset is reported, and the dashboard waits it out.
+      if (!rateLimitRetried && resetAt - now <= MAX_RATE_LIMIT_WAIT_MS) {
+        rateLimitRetried = true;
+        continue;
       }
       throw rateLimited(method, url.pathname, resetAt, 'refused');
+    }
+
+    // Procore throttles with a 503 and `Retry-After` under heavy platform load.
+    // A read waits for it when that is short; a write is never retried, because
+    // a 5xx does not prove the write was not performed.
+    if (res.status === 503 && idempotent && attempt < MAX_RETRIES) {
+      const retryAfterMs = Number(res.headers.get('Retry-After')) * 1000;
+      if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
+        if (retryAfterMs > MAX_RATE_LIMIT_WAIT_MS) throw new ProcoreError(method, url.pathname, 503, body);
+        await sleep(retryAfterMs);
+        continue;
+      }
     }
 
     if (res.status >= 500 && idempotent && attempt < MAX_RETRIES) {

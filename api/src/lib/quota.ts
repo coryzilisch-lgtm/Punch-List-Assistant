@@ -161,7 +161,8 @@ interface LimitHit {
 let lastHeaders: HeaderSighting | null = null;
 const limitHits: LimitHit[] = [];
 const MAX_LIMIT_HITS = 20;
-const requestTimes: number[] = [];
+/** This instance's requests over the last hour, with the status each drew (null: no response). */
+const requestLog: Array<{ at: number; status: number | null }> = [];
 const instanceStartedAt = Date.now();
 const HOUR_MS = 60 * 60 * 1000;
 
@@ -176,8 +177,31 @@ export function rateHeaders(headers: { forEach?(cb: (value: string, name: string
 
 /** Count one request to Procore from this instance. */
 export function noteRequest(now: number): void {
-  requestTimes.push(now);
-  while (requestTimes.length && requestTimes[0] <= now - HOUR_MS) requestTimes.shift();
+  requestLog.push({ at: now, status: null });
+  while (requestLog.length && requestLog[0].at <= now - HOUR_MS) requestLog.shift();
+}
+
+/** Record the status the newest request drew. */
+export function noteStatus(status: number): void {
+  const lastEntry = requestLog[requestLog.length - 1];
+  if (lastEntry && lastEntry.status === null) lastEntry.status = status;
+}
+
+/**
+ * The last hour's requests by outcome. Procore counts failures exactly like
+ * successes, so a 404 or a 429 spends the same quota as a create.
+ */
+function outcomes(now: number) {
+  const recent = requestLog.filter((r) => r.at > now - HOUR_MS);
+  const count = (test: (s: number | null) => boolean) => recent.filter((r) => test(r.status)).length;
+  return {
+    total: recent.length,
+    ok: count((s) => s !== null && s < 400),
+    rateLimited: count((s) => s === 429),
+    clientErrors: count((s) => s !== null && s >= 400 && s < 500 && s !== 429),
+    serverErrors: count((s) => s !== null && s >= 500),
+    noResponse: count((s) => s === null),
+  };
 }
 
 /** Remember the rate headers of the newest response that carried any. */
@@ -197,7 +221,7 @@ export function resetQuotaForTests(): void {
   last = null;
   lastHeaders = null;
   limitHits.length = 0;
-  requestTimes.length = 0;
+  requestLog.length = 0;
 }
 
 /** What the API reports to the dashboard. */
@@ -218,7 +242,11 @@ export function quotaReport(now: number) {
       recentLimitHits: limitHits.slice(),
       // Per Function instance: SWA may run several, and this resets when one
       // recycles. A floor on what this app spent, never a total for the account.
-      thisInstance: { requestsLastHour: requestTimes.filter((t) => t > now - HOUR_MS).length, since: instanceStartedAt },
+      thisInstance: {
+        requestsLastHour: requestLog.filter((r) => r.at > now - HOUR_MS).length,
+        lastHourByOutcome: outcomes(now),
+        since: instanceStartedAt,
+      },
     },
   };
 }

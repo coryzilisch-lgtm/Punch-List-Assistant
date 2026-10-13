@@ -67,11 +67,13 @@ So:
 | The service account cannot act as a user | All four candidate impersonation headers returned 200 and Procore still saw the service account. Probed and confirmed. Per-user OAuth is the only remaining route — `docs/procore-oauth.md`. |
 | Running the app inside Procore was decided against | Reasoning in `docs/SETUP.md`. The iframe and *acting as a user* are independent problems; do not conflate them. |
 | Procore has no validate-only mode for punch items | The only way to test a write is to create a real one. Hence: preview payloads, then push exactly one item. |
+| Two rate limits, one set of headers | Procore's rate-limiting docs (pasted by Cory, 2026-10-13): an **hourly** limit and a **10-second spike** limit. `X-Rate-Limit-*` reports whichever you will hit first: the spike limit (this tenant: 25) until the hourly one is close, then the hourly numbers. **Every request counts, failures included.** See **The Procore rate budget**. |
 
 The tenant: company `18895`, service account `abs-api-export-b171139a@procore.com`,
-which is **shared with the Safety Dashboard ingest** — so its ~3,600/hour rate
-limit is shared too, and a push can be throttled partway by somebody else's
-nightly sync.
+which is **shared with the Safety Dashboard ingest** — so its hourly limit is
+shared too (the number is not confirmed: Procore's docs use 600 as their
+example, and 3,600 is only folklore here), and a push can be throttled partway by
+somebody else's nightly sync.
 
 ---
 
@@ -345,13 +347,24 @@ that wrong shifts every photo inside a group. Both are tested.
 
 ## The Procore rate budget
 
-Procore allows ~3,600 requests/hour and the limit is **company-wide**.
+**✅ From Procore's own rate-limiting docs** (developers.procore.com is blocked
+here; Cory pasted the page on 2026-10-13):
 
-**✅ Tenant answer, 2026-10-13: the quota headers describe a 25-request window.**
-`/api/quota` reported "23 of 25 requests left", resetting within the minute. So
-`X-Rate-Limit-*` describes a short window, not the hourly quota. An hourly wall
-also exists: the Darden import drew 429s resetting ~2,100s out. Code that reads
-these headers must work for both. This app's
+- Two limits: an **hourly** limit (60-minute window) and a **spike** limit
+  (10-second window). The `X-Rate-Limit-Limit/Remaining/Reset` headers report
+  **whichever you are most likely to exceed first**: the spike limit, until you
+  are close to the hourly one, then the hourly numbers. `Reset` is a Unix
+  timestamp in seconds. The tenant reported spike `25`; the hourly number has not
+  been seen yet (Procore's example is `600`; do not assume 3,600).
+- **Every request counts, including failures.** A 400, 403, 404 or 429 spends
+  quota exactly like a create.
+- On a 429, pause until `Reset` and retry. Don't keep sending while over.
+- Under heavy platform load Procore answers **503 with `Retry-After`**.
+- The **API Call Activity Report** in Procore's developer portal shows requests
+  by status code and endpoint. That, not this app, is the answer to "who spent
+  the hourly limit": this app shares its account with the Safety Dashboard ingest.
+
+This app's
 service account is the same one the Safety Dashboard's nightly ingest uses, so
 the budget is shared: a burst here can be throttled by work nobody in this app
 started, and vice versa. Measured, not asserted — `/api/probe` and
@@ -424,18 +437,28 @@ response. Five rules:
 
 ### Which limit was it — the evidence, 2026-10-13
 
-There are two limits: a **short burst window** (the headers said 25) and a
-**long, hourly-scale quota**. A third-party integrator's notes say the headers
-report the burst window whenever one applies, so the hourly quota may never
-appear in them; it shows itself only as a 429 resetting minutes out. **That is a
-lead, not a tenant answer.** So the app keeps evidence, not conclusions, all
-readable at **`GET /api/quota`** in a browser:
+A reset seconds away is the spike window; a reset minutes away means the
+headers have switched to the hourly limit, which per the docs happens as it gets
+close. The create step names it ("Procore is reporting its hourly limit") and the
+results screen does the same on a stop. The raw evidence is at
+**`GET /api/quota`** in a browser:
 
 - `evidence.lastHeaders`: every rate/limit/retry header Procore last sent, verbatim.
 - `evidence.recentLimitHits`: the last 20 429s, each `short` (resets ≤ 90s) or
   `long`, with their headers.
-- `evidence.thisInstance.requestsLastHour`: this Function instance's own
-  requests. A floor on what the app spent, never an account total.
+- `evidence.thisInstance.requestsLastHour` and `lastHourByOutcome` (ok, 429,
+  other 4xx, 5xx): this Function instance's own requests. A floor on what the
+  app spent, never an account total.
+
+**What the docs changed in the code, 2026-10-13:**
+
+- **A 429 is retried once**, after its reset, never four times. On 10-12 each
+  refused item cost up to five requests, ~390 spent on 429s alone, so part of
+  that second run's empty limit was this app.
+- **Every 429 marks the window spent until its reset**, so the next request in
+  the same invocation waits instead of firing into it.
+- **A 503 on a read honours `Retry-After`.** A write is still never retried on a
+  5xx: it may have been performed.
 
 The results screen adds up the import's own requests (`requests` on every push
 response) and, on a stop, names which limit it was and what this import had
@@ -468,9 +491,10 @@ screen. It is back in `renderResults()`.
 **A push is ~2 requests per item** (create, read-back). That is deliberately NOT optimised.
 The read-backs are the safety property — Procore has answered 200 and stored
 nothing three times — and trading them for rate would reintroduce exactly the bug
-class this repo has already paid for. A 60-item list is ~120 requests,
-which is fine against 3,600/hour; the thing to avoid is running one during the
-Safety Dashboard's nightly ingest.
+class this repo has already paid for. A 60-item list is ~120 requests:
+small against 3,600/hour, but a fifth of an hourly limit of 600 (Procore's own
+example; this tenant's number is not yet known). The thing to avoid is running
+one during the Safety Dashboard's nightly ingest.
 
 ## Beta notice and branding
 

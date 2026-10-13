@@ -170,6 +170,8 @@ test('a push the quota cannot fully carry creates what fits and stops', async ()
   try {
     await page.waitForFunction(() => /Create 7 of 12/.test(document.getElementById('next-btn').textContent));
     assert.match(await page.textContent('#send-summary'), /create the first 7 item\(s\) and stop/);
+    // A reset 40 minutes out means the headers have switched to the hourly limit.
+    assert.match(await page.textContent('#send-summary'), /reporting its hourly limit/);
 
     await page.click('#next-btn');
     await page.waitForFunction(() => document.getElementById('results').textContent.includes('Stopped'));
