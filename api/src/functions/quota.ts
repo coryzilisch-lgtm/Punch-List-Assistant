@@ -19,7 +19,7 @@ export async function quotaHandler(_request: HttpRequest): Promise<HttpResponseI
   } catch (err) {
     if (!(err instanceof ProcoreError) || err.status !== 429) throw err;
   }
-  return json(quotaReport(Date.now()));
+  return json({ ...quotaReport(Date.now()), requests: 1 });
 }
 
 app.http('quota', {

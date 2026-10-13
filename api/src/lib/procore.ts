@@ -23,7 +23,17 @@
  */
 
 import { bust, cached as memoized, CONFIG_TTL_MS, LIST_TTL_MS } from './cache';
-import { exhaustedUntil, readQuota, recordQuota, resetAtFromHeader, WAIT_IN_FUNCTION_MS } from './quota';
+import {
+  exhaustedUntil,
+  noteHeaders,
+  noteLimitHit,
+  noteRequest,
+  rateHeaders,
+  readQuota,
+  recordQuota,
+  resetAtFromHeader,
+  WAIT_IN_FUNCTION_MS,
+} from './quota';
 
 const LOGIN_BASE = process.env.PROCORE_LOGIN_BASE_URL || 'https://login.procore.com';
 const API_BASE = process.env.PROCORE_API_BASE_URL || 'https://api.procore.com';
@@ -256,6 +266,7 @@ export async function procoreRequest<T = unknown>(
     let res: Response;
     try {
       requestsMade += 1;
+      noteRequest(Date.now());
       res = await fetch(url.toString(), { method, headers, body: payload });
     } catch (err) {
       // Network-level failure. Retry with backoff; a socket reset mid-run
@@ -266,6 +277,8 @@ export async function procoreRequest<T = unknown>(
     }
 
     recordQuota(readQuota(res.headers, Date.now()));
+    const seenRateHeaders = rateHeaders(res.headers);
+    noteHeaders(url.pathname, res.status, seenRateHeaders, Date.now());
 
     if (res.ok) {
       opts.onHeaders?.(res.headers);
@@ -284,6 +297,10 @@ export async function procoreRequest<T = unknown>(
     if (res.status === 429) {
       const resetHeader = res.headers.get('X-Rate-Limit-Reset');
       const waitMs = rateLimitWaitMs(resetHeader, attempt);
+      // Every 429 is logged, including the short ones that get waited out: those
+      // are the burst window, and counting them is how it is told from the long one.
+      const hitAt = Date.now();
+      noteLimitHit(url.pathname, resetAtFromHeader(resetHeader, hitAt) ?? hitAt + waitMs, seenRateHeaders, hitAt);
 
       // Waiting out a rate limit inside a Function that is killed at 45 seconds
       // does not produce a rate-limit error — it produces Azure's opaque
@@ -1203,6 +1220,42 @@ function namesOf(v: unknown): string[] {
 }
 
 /** Read one punch item back and summarize the fields we care about. */
+/** What a punch item row says Procore stored, whichever response it came from. */
+export function observedFromRow(row: Record<string, unknown>): ObservedPunchItem {
+  const attachments = row.attachments ?? row.images ?? [];
+  const draft = draftState(row);
+  return {
+    status: typeof row.status === 'string' ? row.status : null,
+    workflowLabel: draft.label,
+    isDraft: draft.isDraft,
+    attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+    hasAttachments: typeof row.has_attachments === 'boolean' ? row.has_attachments : null,
+    ballInCourt: namesOf(row.ball_in_court ?? row.ball_in_courts),
+    assignees: namesOf(row.assignments ?? row.assignees),
+    punchItemManager: nameOf(row.punch_item_manager),
+  };
+}
+
+/**
+ * Does the create's own response already say what the read-back GET says?
+ *
+ * The read-back is half of every push's requests, and it is the safety property:
+ * Procore has answered 200 and stored nothing three times. It can only go if the
+ * create response is shown, on this tenant, to carry the same verdict on every
+ * field the app checks. This collects that evidence; it changes nothing.
+ */
+export function compareEcho(
+  created: Record<string, unknown> | null | undefined,
+  readBack: ObservedPunchItem | null,
+): { agrees: boolean | null; differs: string[] } {
+  if (!created || !readBack) return { agrees: null, differs: [] };
+  const echo = observedFromRow(created);
+  const differs = (['isDraft', 'workflowLabel', 'hasAttachments', 'attachmentCount', 'assignees', 'punchItemManager'] as const).filter(
+    (k) => JSON.stringify(echo[k]) !== JSON.stringify(readBack[k]),
+  );
+  return { agrees: differs.length === 0, differs };
+}
+
 export async function observePunchItem(
   projectId: number,
   punchItemId: number,
@@ -1213,18 +1266,7 @@ export async function observePunchItem(
       `/rest/v1.1/punch_items/${punchItemId}`,
       { query: { project_id: projectId } },
     );
-    const attachments = row.attachments ?? row.images ?? [];
-    const draft = draftState(row);
-    return {
-      status: typeof row.status === 'string' ? row.status : null,
-      workflowLabel: draft.label,
-      isDraft: draft.isDraft,
-      attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
-      hasAttachments: typeof row.has_attachments === 'boolean' ? row.has_attachments : null,
-      ballInCourt: namesOf(row.ball_in_court ?? row.ball_in_courts),
-      assignees: namesOf(row.assignments ?? row.assignees),
-      punchItemManager: nameOf(row.punch_item_manager),
-    };
+    return observedFromRow(row);
   } catch {
     // Verification is a nicety; never fail a successful create over it.
     return null;
@@ -1557,6 +1599,8 @@ export interface CreatePunchItemResult {
   assignErrors: string[];
   assignStrategy: string | null;
   observed: ObservedPunchItem | null;
+  /** Whether the create's response already matched the read-back. Evidence only. */
+  echo: { agrees: boolean | null; differs: string[] };
 }
 
 /**
@@ -1601,6 +1645,7 @@ export async function createPunchItem(
   }
 
   let observed = created?.id ? await observePunchItem(projectId, created.id) : null;
+  const echo = compareEcho(created as unknown as Record<string, unknown>, observed);
 
   // A 2xx on the create is not evidence the photos landed — three separate
   // attempts returned 200 and stored nothing. Only the read-back counts.
@@ -1633,6 +1678,7 @@ export async function createPunchItem(
     assignErrors,
     assignStrategy,
     observed,
+    echo,
   };
 }
 

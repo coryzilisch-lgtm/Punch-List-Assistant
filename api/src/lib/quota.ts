@@ -123,9 +123,81 @@ export function exhaustedUntil(now: number): number | null {
   return q.resetAt;
 }
 
-/** Test seam: forget the snapshot. */
+// ── Which limit is it? ───────────────────────────────────────────────────────
+//
+// Procore has a short burst window and a long (hourly-scale) quota. A third-party
+// integrator's notes say the headers report the burst window whenever one
+// applies, so the long quota may never appear in them at all; it shows up only
+// as a 429 whose reset is minutes away. That is a lead, not a tenant answer. So
+// this keeps the raw evidence instead of a conclusion: the rate headers exactly
+// as Procore sent them, and every recent 429 with how far out it reset.
+
+/** A reset further out than this belongs to the long quota, not the burst window. */
+export const SHORT_WINDOW_MS = 90_000;
+
+export type LimitWindow = 'short' | 'long';
+
+export function windowOf(resetAt: number | null, now: number): LimitWindow | null {
+  if (resetAt === null) return null;
+  return resetAt - now <= SHORT_WINDOW_MS ? 'short' : 'long';
+}
+
+interface HeaderSighting {
+  at: number;
+  path: string;
+  status: number;
+  /** Every response header whose name mentions rate, limit or retry, verbatim. */
+  headers: Record<string, string>;
+}
+
+interface LimitHit {
+  at: number;
+  path: string;
+  resetAt: number;
+  window: LimitWindow;
+  headers: Record<string, string>;
+}
+
+let lastHeaders: HeaderSighting | null = null;
+const limitHits: LimitHit[] = [];
+const MAX_LIMIT_HITS = 20;
+const requestTimes: number[] = [];
+const instanceStartedAt = Date.now();
+const HOUR_MS = 60 * 60 * 1000;
+
+/** The rate-related headers of a response, verbatim, names lowercased. */
+export function rateHeaders(headers: { forEach?(cb: (value: string, name: string) => void): void }): Record<string, string> {
+  const out: Record<string, string> = {};
+  headers.forEach?.((value, name) => {
+    if (/rate|limit|retry/i.test(name)) out[name.toLowerCase()] = value;
+  });
+  return out;
+}
+
+/** Count one request to Procore from this instance. */
+export function noteRequest(now: number): void {
+  requestTimes.push(now);
+  while (requestTimes.length && requestTimes[0] <= now - HOUR_MS) requestTimes.shift();
+}
+
+/** Remember the rate headers of the newest response that carried any. */
+export function noteHeaders(path: string, status: number, headers: Record<string, string>, now: number): void {
+  if (Object.keys(headers).length) lastHeaders = { at: now, path, status, headers };
+}
+
+/** Remember a 429, classed by how far out it resets. */
+export function noteLimitHit(path: string, resetAt: number, headers: Record<string, string>, now: number): void {
+  const window = windowOf(resetAt, now) ?? 'long';
+  limitHits.push({ at: now, path, resetAt, window, headers });
+  if (limitHits.length > MAX_LIMIT_HITS) limitHits.shift();
+}
+
+/** Test seam: forget everything. */
 export function resetQuotaForTests(): void {
   last = null;
+  lastHeaders = null;
+  limitHits.length = 0;
+  requestTimes.length = 0;
 }
 
 /** What the API reports to the dashboard. */
@@ -138,5 +210,15 @@ export function quotaReport(now: number) {
     capacity: pushCapacity(q, now),
     perItem: REQUESTS_PER_ITEM,
     reserve: reserveFor(q),
+    /** Which limit the headers above describe, judged by how soon they reset. */
+    window: windowOf(q?.resetAt ?? null, now),
+    /** The raw evidence. Open /api/quota in a browser to read it. */
+    evidence: {
+      lastHeaders,
+      recentLimitHits: limitHits.slice(),
+      // Per Function instance: SWA may run several, and this resets when one
+      // recycles. A floor on what this app spent, never a total for the account.
+      thisInstance: { requestsLastHour: requestTimes.filter((t) => t > now - HOUR_MS).length, since: instanceStartedAt },
+    },
   };
 }

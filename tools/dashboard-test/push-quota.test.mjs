@@ -96,6 +96,7 @@ async function toCreateStep({ quotaReply, onPush }) {
   const errors = [];
   page.on('pageerror', (e) => errors.push(String(e)));
   const pushes = [];
+  const quotaCalls = [];
 
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url());
@@ -114,6 +115,7 @@ async function toCreateStep({ quotaReply, onPush }) {
           items: Array.from({ length: ITEMS }, (_, i) => ({ source_number: String(i + 1), title: `Item ${i + 1}`, confidence: 'high', photo_indexes: [] })),
         });
       case '/api/quota':
+        quotaCalls.push(Date.now());
         return send(typeof quotaReply === 'function' ? quotaReply() : quotaReply);
       case '/api/push': {
         const body = JSON.parse(route.request().postData());
@@ -143,7 +145,7 @@ async function toCreateStep({ quotaReply, onPush }) {
 
   await page.click('#next-btn'); // → create
   await page.waitForFunction(() => document.getElementById('send-summary').textContent.includes('rate limit') || document.getElementById('send-summary').textContent.includes('Drafts'));
-  return { page, pushes, errors };
+  return { page, pushes, errors, quotaCalls };
 }
 
 const created = (body, firstId = 100) => ({
@@ -299,6 +301,58 @@ test('items refused by a window that resets in seconds are retried, not dropped'
     assert.equal(new Set(sent).size, 12, 'every item was sent');
     assert.equal(sent.length, 15, 'the three refused items were sent exactly twice, nothing else repeated');
     assert.doesNotMatch(await page.textContent('#results'), /Stopped|rejected/);
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
+// ── Knowing which limit it was, and what the import cost ────────────────────
+
+test('a long-reset stop says it was the hourly-scale limit and what this import had spent', async () => {
+  const resetAt = Date.now() + 38 * 60_000;
+  const { page, errors } = await toCreateStep({
+    quotaReply: { limit: null, remaining: null, resetAt: null, capacity: null, perItem: 3, reserve: 200, requests: 1 },
+    onPush: (body, n) =>
+      n === 1
+        ? { json: { ...created(body).json, requests: 10 } }
+        : {
+            json: {
+              results: body.items.map((it) => ({ clientId: it.clientId, ok: false, rateLimited: true, resetAt, error: 'HTTP 429' })),
+              requests: 1,
+              quota: null,
+            },
+          },
+  });
+  try {
+    await page.click('#next-btn');
+    await page.waitForFunction(() => document.getElementById('results').textContent.includes('Stopped'));
+    const text = await page.textContent('#results');
+    assert.match(text, /long \(hourly-scale\) limit, not the burst window/);
+    // 10 for the first batch + 1 for the refused one. The quota check made on
+    // opening the step is reused, not asked again, so it is not part of this push.
+    assert.match(text, /This import had used 11 Procore requests/);
+    assert.match(text, /used 11 Procore requests for 5 items created \(about 2\.2 each\)/);
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
+test('waiting out a short window costs no extra quota checks', async () => {
+  // Each /api/quota call is a Procore request. The paced push must not ask
+  // after every wait; the next batch reports the quota itself.
+  const window = () => ({ limit: 25, remaining: 23, resetAt: Date.now() + 2_000, capacity: 7, perItem: 3, reserve: 2, requests: 1 });
+  const { page, pushes, errors, quotaCalls } = await toCreateStep({
+    quotaReply: window,
+    onPush: (body) => ({ json: { ...created(body).json, requests: body.items.length * 2, quota: { ...window(), remaining: 3, capacity: 0 } } }),
+  });
+  try {
+    const before = quotaCalls.length;
+    await page.click('#next-btn');
+    await page.waitForFunction(() => /12 punch items created/.test(document.getElementById('results').textContent), null, { timeout: 30_000 });
+    assert.ok(pushes.length >= 3, 'it paced across several windows');
+    assert.ok(quotaCalls.length - before <= 1, `quota was asked ${quotaCalls.length - before} times during the push`);
     assert.deepEqual(errors, []);
   } finally {
     await page.close();
