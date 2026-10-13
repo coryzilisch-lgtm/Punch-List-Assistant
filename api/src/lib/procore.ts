@@ -23,7 +23,7 @@
  */
 
 import { bust, cached as memoized, CONFIG_TTL_MS, LIST_TTL_MS } from './cache';
-import { exhaustedUntil, readQuota, recordQuota, resetAtFromHeader } from './quota';
+import { exhaustedUntil, readQuota, recordQuota, resetAtFromHeader, WAIT_IN_FUNCTION_MS } from './quota';
 
 const LOGIN_BASE = process.env.PROCORE_LOGIN_BASE_URL || 'https://login.procore.com';
 const API_BASE = process.env.PROCORE_API_BASE_URL || 'https://api.procore.com';
@@ -36,7 +36,7 @@ const MAX_RETRIES = 4;
  * SWA managed Functions are killed at 45 seconds, so anything longer turns a
  * diagnosable 429 into an undiagnosable platform kill.
  */
-const MAX_RATE_LIMIT_WAIT_MS = 5_000;
+const MAX_RATE_LIMIT_WAIT_MS = WAIT_IN_FUNCTION_MS;
 
 /** A 429 resetting further out than this is the hourly window spent, not a burst. */
 const SPENT_WINDOW_MS = 60_000;
@@ -224,8 +224,14 @@ export async function procoreRequest<T = unknown>(
     // Procore has already said the quota is at zero for this window. Asking
     // again can only draw another 429; refusing here is the same answer, and
     // like Procore's own 429 it is given before anything is written.
+    // A window that resets within a few seconds is waited out instead: this
+    // tenant's window is 25 requests, so a push meets it constantly.
     const blockedUntil = exhaustedUntil(Date.now());
-    if (blockedUntil !== null) throw rateLimited(method, url.pathname, blockedUntil, 'not sent');
+    if (blockedUntil !== null) {
+      const wait = blockedUntil - Date.now();
+      if (wait > MAX_RATE_LIMIT_WAIT_MS) throw rateLimited(method, url.pathname, blockedUntil, 'not sent');
+      await sleep(wait + 250);
+    }
 
     const token = await getToken(forceRefresh);
     forceRefresh = false;

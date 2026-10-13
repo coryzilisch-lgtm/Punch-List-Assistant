@@ -36,11 +36,29 @@ export interface QuotaSnapshot {
 export const REQUESTS_PER_ITEM = 3;
 
 /**
- * Requests a push leaves untouched for everyone else on the service account —
+ * The most a push leaves untouched for everyone else on the service account —
  * the Safety Dashboard ingest above all. A push that spends the quota to zero
  * fails its own last items and starves the ingest.
+ *
+ * ⚠️ A CAP, scaled by `reserveFor()`, never a fixed number. The first version
+ * reserved a flat 200, sized for the ~3,600/hour quota everyone assumed these
+ * headers describe. The tenant answered `X-Rate-Limit-Limit: 25` — a short
+ * window — so 200 was eight windows' worth, capacity was always 0, and the app
+ * refused to push anything at all (2026-10-13).
  */
 export const QUOTA_RESERVE = 200;
+
+/**
+ * The longest a rate-limit reset is worth simply waiting out inside one
+ * Function invocation. SWA kills Functions at 45 seconds.
+ */
+export const WAIT_IN_FUNCTION_MS = 5_000;
+
+/** The reserve for the window Procore reported: a tenth of it, capped. */
+export function reserveFor(q: QuotaSnapshot | null): number {
+  if (!q || q.limit === null) return QUOTA_RESERVE;
+  return Math.min(QUOTA_RESERVE, Math.floor(q.limit / 10));
+}
 
 /** A header value as a non-negative number, or null. */
 function num(value: string | null): number | null {
@@ -77,7 +95,7 @@ export function readQuota(headers: { get(name: string): string | null }, now: nu
 export function pushCapacity(q: QuotaSnapshot | null, now: number): number | null {
   if (!q || q.remaining === null) return null;
   if (q.resetAt !== null && q.resetAt <= now) return null;
-  return Math.max(0, Math.floor((q.remaining - QUOTA_RESERVE) / REQUESTS_PER_ITEM));
+  return Math.max(0, Math.floor((q.remaining - reserveFor(q)) / REQUESTS_PER_ITEM));
 }
 
 let last: QuotaSnapshot | null = null;
@@ -119,6 +137,6 @@ export function quotaReport(now: number) {
     resetAt: q?.resetAt ?? null,
     capacity: pushCapacity(q, now),
     perItem: REQUESTS_PER_ITEM,
-    reserve: QUOTA_RESERVE,
+    reserve: reserveFor(q),
   };
 }

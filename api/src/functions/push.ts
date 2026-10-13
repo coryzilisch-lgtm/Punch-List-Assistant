@@ -8,7 +8,7 @@ import {
   PunchItemInput,
   PunchPhoto,
 } from '../lib/procore';
-import { exhaustedUntil, pushCapacity, currentQuota, quotaReport } from '../lib/quota';
+import { exhaustedUntil, pushCapacity, currentQuota, quotaReport, WAIT_IN_FUNCTION_MS } from '../lib/quota';
 
 /**
  * POST /api/push — create a batch of punch items in Procore.
@@ -180,8 +180,10 @@ export async function pushHandler(
   for (const raw of body.items) {
     // Once Procore has said the window is spent, every later item in this batch
     // would only draw a 429. Stop, and say plainly that they were never sent.
+    // A window resetting within seconds is not a stop: procoreRequest waits it
+    // out. Only a spent window that resets further out ends the batch.
     const blockedUntil = dryRun ? null : exhaustedUntil(Date.now());
-    if (blockedUntil !== null) {
+    if (blockedUntil !== null && blockedUntil - Date.now() > WAIT_IN_FUNCTION_MS) {
       results.push({
         clientId: raw.clientId,
         ok: false,

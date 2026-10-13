@@ -189,7 +189,8 @@ function renderBar() {
     dry.style.display = 'inline-block';
     const unmanaged = unmanagedCount();
     // Room left in Procore's rate limit, while its window is still the current one.
-    const live = S.quota && (!S.quota.resetAt || S.quota.resetAt > Date.now());
+    // Only a window that resets far off caps the push; a short one is paced.
+    const live = S.quota && (!S.quota.resetAt || S.quota.resetAt > Date.now()) && !resetIsSoon(S.quota);
     const fits = live && S.quota.capacity !== null && S.quota.capacity !== undefined ? S.quota.capacity : n;
     next.textContent = S.sending
       ? 'Creating…'
@@ -222,6 +223,32 @@ async function loadQuota() {
     renderBar();
   }
   return S.quota;
+}
+
+/**
+ * A reset this close is waited out, not reported as a stop. This tenant's window
+ * is 25 requests (Procore said so on 2026-10-13), so a push meets it every few
+ * items; only a reset minutes away, like the hourly wall on the Darden import,
+ * is worth stopping for.
+ */
+const SHORT_RESET_MS = 90_000;
+/** Waits in a row without anything being created before the push gives up. */
+const MAX_IDLE_WAITS = 5;
+
+function resetIsSoon(q) {
+  return Boolean(q?.resetAt) && q.resetAt - Date.now() <= SHORT_RESET_MS;
+}
+
+/** Hold the push until Procore's window resets, showing the countdown. */
+async function waitForReset(resetAt, done, total) {
+  const until = Math.max(resetAt || 0, Date.now() + 1000) + 1000;
+  while (Date.now() < until) {
+    const secs = Math.ceil((until - Date.now()) / 1000);
+    $('send-progress').innerHTML =
+      `<div class="progress-track"><div class="progress-fill" style="width:${(done / total) * 100}%"></div></div>` +
+      `<div class="muted">${done} of ${total} processed · waiting for Procore's rate limit, carrying on in ${secs}s…</div>`;
+    await new Promise((r) => setTimeout(r, Math.min(1000, until - Date.now())));
+  }
 }
 
 /** "2:40 PM" for an epoch-ms reset time; the super needs a clock time, not seconds. */
@@ -1353,7 +1380,13 @@ function renderSendSummary() {
     );
   }
   const q = S.quota;
-  if (q && q.remaining !== null) {
+  if (q && q.remaining !== null && resetIsSoon(q)) {
+    html += note(
+      'info',
+      `<strong>Procore rate limit: ${q.remaining}${q.limit ? ` of ${q.limit}` : ''} requests left in a short window.</strong> ` +
+        'The push paces itself: when the window runs out it waits for the reset and carries on.',
+    );
+  } else if (q && q.remaining !== null) {
     const fits = q.capacity ?? selected.length;
     const resets = q.resetAt ? `, resets about ${esc(clockTime(q.resetAt))}` : '';
     html += note(
@@ -1427,8 +1460,26 @@ async function doPush(dryRun) {
   let stopAt = null;
   const payloads = [];
 
+  /** Put never-written items back at the front, and make the loop wait for `resetAt`. */
+  const requeue = (clientIds, resetAt) => {
+    const ids = new Set(clientIds);
+    S.results = S.results.filter((r) => !(ids.has(r.clientId) && r.rateLimited));
+    queue.unshift(...selected.filter((i) => ids.has(String(i.id))));
+    done -= ids.size;
+    allowance = 0;
+    S.quota = { ...(S.quota || {}), resetAt };
+  };
+
+  let idleWaits = 0;
   while (queue.length) {
     if (!dryRun && allowance <= 0) {
+      if (resetIsSoon(S.quota) && idleWaits < MAX_IDLE_WAITS) {
+        await waitForReset(S.quota.resetAt, done, selected.length);
+        idleWaits += 1;
+        const q = await loadQuota();
+        allowance = q?.capacity ?? Infinity;
+        continue;
+      }
       stopAt = S.quota?.resetAt ?? null;
       break;
     }
@@ -1460,21 +1511,34 @@ async function doPush(dryRun) {
         allowance = res.quota?.capacity ?? allowance - batch.length;
         // A rate-limited result means the window is spent; every later batch
         // would only draw the same 429. On the Darden import 78 items did.
-        const limited = res.results.find((r) => r.rateLimited);
-        if (limited) {
-          stopped = true;
-          stopAt = limited.resetAt ?? res.quota?.resetAt ?? null;
+        const limited = res.results.filter((r) => r.rateLimited);
+        if (res.results.some((r) => r.ok)) idleWaits = 0;
+        if (limited.length) {
+          const resetAt = limited[0].resetAt ?? res.quota?.resetAt ?? null;
+          if (resetAt && resetAt - Date.now() <= SHORT_RESET_MS) {
+            // Never written (Procore answers a 429 before doing anything), so
+            // they go back to the front of the queue and the loop waits.
+            requeue(limited.map((r) => r.clientId), resetAt);
+          } else {
+            stopped = true;
+            stopAt = resetAt;
+          }
         }
       }
     } catch (err) {
       if (!dryRun && err.status === 429 && err.body?.rateLimited) {
         // Refused before any write because it would not fit the quota.
         if (err.body.quota) S.quota = err.body.quota;
+        const resetAt = err.body.quota?.resetAt ?? null;
         for (const item of batch) {
-          S.results.push({ clientId: String(item.id), ok: false, rateLimited: true, error: err.message });
+          S.results.push({ clientId: String(item.id), ok: false, rateLimited: true, resetAt, error: err.message });
         }
-        stopped = true;
-        stopAt = err.body.quota?.resetAt ?? null;
+        if (resetAt && resetAt - Date.now() <= SHORT_RESET_MS) {
+          requeue(batch.map((i) => String(i.id)), resetAt);
+        } else {
+          stopped = true;
+          stopAt = resetAt;
+        }
       } else {
         // A 4xx from our own API is a refusal before anything was written, so the
         // items are safe to fix and push again. Anything else — the 45-second kill
