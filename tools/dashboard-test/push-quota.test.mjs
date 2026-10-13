@@ -114,7 +114,7 @@ async function toCreateStep({ quotaReply, onPush }) {
           items: Array.from({ length: ITEMS }, (_, i) => ({ source_number: String(i + 1), title: `Item ${i + 1}`, confidence: 'high', photo_indexes: [] })),
         });
       case '/api/quota':
-        return send(quotaReply);
+        return send(typeof quotaReply === 'function' ? quotaReply() : quotaReply);
       case '/api/push': {
         const body = JSON.parse(route.request().postData());
         pushes.push(body);
@@ -231,6 +231,74 @@ test('a rate-limited batch stops the push; later batches are never sent', async 
     // 4 refused in batch two + 2 never attempted.
     assert.match(results, /6 items were not created/);
     assert.match(await page.textContent('#next-btn'), /Create 6 punch items/, 'all six not created stay selected');
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
+// ── The tenant's real window: 25 requests, resetting in seconds ─────────────
+
+test('the tenant\'s 25-request window: the button is not capped and the push waits through resets', async () => {
+  // 2026-10-13: Procore reported "23 of 25 requests left". The first version
+  // reserved 200 requests for the ingest, computed room for 0 items, and
+  // refused to push anything at all.
+  const window = () => ({ limit: 25, remaining: 23, resetAt: Date.now() + 2_000, capacity: 7, perItem: 3, reserve: 2 });
+  const { page, pushes, errors } = await toCreateStep({
+    quotaReply: window,
+    onPush: (body) => {
+      const r = created(body);
+      // Each batch spends the window; it resets two seconds later.
+      r.json.quota = { ...window(), remaining: 3, capacity: 0 };
+      return r;
+    },
+  });
+  try {
+    await page.waitForFunction(() => /^Create 12 punch items$/.test(document.getElementById('next-btn').textContent.trim()));
+    assert.ok(!(await page.isDisabled('#next-btn')));
+    assert.match(await page.textContent('#send-summary'), /paces itself/);
+    assert.doesNotMatch(await page.textContent('#send-summary'), /Not enough Procore quota/);
+
+    await page.click('#next-btn');
+    await page.waitForFunction(() => /12 punch items created/.test(document.getElementById('results').textContent), null, { timeout: 30_000 });
+
+    assert.deepEqual(pushes.map((p) => p.items.length), [5, 5, 2], 'paced batches, every item sent once');
+    assert.doesNotMatch(await page.textContent('#results'), /Stopped/);
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
+test('items refused by a window that resets in seconds are retried, not dropped', async () => {
+  let n = 0;
+  const { page, pushes, errors } = await toCreateStep({
+    quotaReply: () => ({ limit: 25, remaining: 20, resetAt: Date.now() + 2_000, capacity: 6, perItem: 3, reserve: 2 }),
+    onPush: (body) => {
+      n += 1;
+      if (n !== 1) return created(body, n * 100);
+      // First batch: two land, three hit the window. Those three were never written.
+      const resetAt = Date.now() + 1_500;
+      return {
+        json: {
+          results: body.items.map((it, i) =>
+            i < 2
+              ? { clientId: it.clientId, ok: true, punchItemId: 10 + i, observed: { isDraft: true } }
+              : { clientId: it.clientId, ok: false, rateLimited: true, resetAt, error: 'Procore rejected this item (HTTP 429).' },
+          ),
+          quota: { limit: 25, remaining: 0, resetAt, capacity: 0, perItem: 3, reserve: 2 },
+        },
+      };
+    },
+  });
+  try {
+    await page.click('#next-btn');
+    await page.waitForFunction(() => /12 punch items created/.test(document.getElementById('results').textContent), null, { timeout: 30_000 });
+
+    const sent = pushes.flatMap((p) => p.items.map((i) => i.clientId));
+    assert.equal(new Set(sent).size, 12, 'every item was sent');
+    assert.equal(sent.length, 15, 'the three refused items were sent exactly twice, nothing else repeated');
+    assert.doesNotMatch(await page.textContent('#results'), /Stopped|rejected/);
     assert.deepEqual(errors, []);
   } finally {
     await page.close();

@@ -165,3 +165,47 @@ test('a push stops at the first spent window and marks the rest as never sent', 
   );
   assert.equal(res.jsonBody.quota.remaining, 0);
 });
+
+// ── The tenant's real window, 2026-10-13 ─────────────────────────────────────
+
+test('the tenant\'s own reading has room to push: 23 of 25 left', () => {
+  // The first version reserved a flat 200 requests, sized for an hourly quota.
+  // Procore reported Limit 25, so capacity was 0 forever and nothing pushed.
+  const now = Date.now();
+  const q = { limit: 25, remaining: 23, resetAt: now + 30_000, observedAt: now };
+  assert.equal(quota.reserveFor(q), 2);
+  assert.equal(quota.pushCapacity(q, now), 7);
+});
+
+test('the reserve is a tenth of the window, capped for a large one', () => {
+  assert.equal(quota.reserveFor({ limit: 3600, remaining: 1, resetAt: null, observedAt: 0 }), quota.QUOTA_RESERVE);
+  assert.equal(quota.reserveFor({ limit: 1000, remaining: 1, resetAt: null, observedAt: 0 }), 100);
+  assert.equal(quota.reserveFor(null), quota.QUOTA_RESERVE, 'unknown limit keeps the cap');
+});
+
+test('a spent window that resets in a moment is waited out, not refused', async () => {
+  const now = Date.now();
+  quota.recordQuota({ limit: 25, remaining: 0, resetAt: now + 300, observedAt: now });
+  const calls = mockFetch(() => reply(200, { id: 1 }, { 'X-Rate-Limit-Limit': '25', 'X-Rate-Limit-Remaining': '24' }));
+  const started = Date.now();
+  const row = await procoreRequest('GET', '/rest/v1.0/me');
+  assert.equal(row.id, 1);
+  assert.equal(calls.length, 1);
+  assert.ok(Date.now() - started >= 300, 'it waited for the reset');
+});
+
+test('a push is not stopped by a window that resets in a moment', async () => {
+  const now = Date.now();
+  quota.recordQuota({ limit: 25, remaining: 20, resetAt: now + 30_000, observedAt: now });
+  let posts = 0;
+  mockFetch((c) => {
+    if (c.method === 'POST') {
+      posts += 1;
+      // The second create spends the window, which resets almost at once.
+      return reply(200, { id: posts }, { 'X-Rate-Limit-Limit': '25', 'X-Rate-Limit-Remaining': posts === 2 ? '0' : '15', 'X-Rate-Limit-Reset': '1' });
+    }
+    return reply(200, { id: posts, workflow_status: 'draft' }, { 'X-Rate-Limit-Limit': '25', 'X-Rate-Limit-Remaining': '24' });
+  });
+  const res = await pushHandler(signedIn({ projectId: 1, items: ['a', 'b', 'c'].map(item) }), ctx);
+  assert.deepEqual(res.jsonBody.results.map((r) => r.ok), [true, true, true]);
+});

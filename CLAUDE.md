@@ -345,7 +345,13 @@ that wrong shifts every photo inside a group. Both are tested.
 
 ## The Procore rate budget
 
-Procore allows ~3,600 requests/hour and the limit is **company-wide**. This app's
+Procore allows ~3,600 requests/hour and the limit is **company-wide**.
+
+**✅ Tenant answer, 2026-10-13: the quota headers describe a 25-request window.**
+`/api/quota` reported "23 of 25 requests left", resetting within the minute. So
+`X-Rate-Limit-*` describes a short window, not the hourly quota. An hourly wall
+also exists: the Darden import drew 429s resetting ~2,100s out. Code that reads
+these headers must work for both. This app's
 service account is the same one the Safety Dashboard's nightly ingest uses, so
 the budget is shared: a burst here can be throttled by work nobody in this app
 started, and vice versa. Measured, not asserted — `/api/probe` and
@@ -392,20 +398,28 @@ quota headers, and it could not stop: the dashboard sent 78 more items into the
 429, and each one was retried up to four times.
 
 `api/src/lib/quota.ts` now reads `X-Rate-Limit-Limit/Remaining/Reset` off every
-response. Four rules:
+response. Five rules:
 
 1. **The create step shows the quota** (`GET /api/quota`) and how many items fit
-   at `REQUESTS_PER_ITEM` (3) while leaving `QUOTA_RESERVE` (200) for the ingest.
-   The button says "Create 7 of 12" before it is pressed.
-2. **A push takes only what fits** and leaves the rest selected. `/api/push` also
+   at `REQUESTS_PER_ITEM` (3) while leaving a reserve for the ingest. The reserve
+   is **a tenth of the reported limit, capped at 200** (`reserveFor()`).
+   🛑 It shipped first as a flat 200, sized for the hourly quota. Against the
+   tenant's 25-request window that computed room for 0 items, and the app refused
+   to push anything (2026-10-13).
+2. **A reset less than 90 seconds out is waited out, not a stop.** The dashboard
+   holds the push with a countdown and carries on; items refused by that window
+   were never written and go back to the front of the queue. Inside a Function,
+   `procoreRequest` sleeps through a spent window that resets within 5s. Only a
+   reset further out caps the push, disables Create, or stops it.
+3. **Against a far-off reset, a push takes only what fits** and leaves the rest selected. `/api/push` also
    refuses a batch it *knows* will not fit (429, before any write). Unknown quota
    (a cold instance, no headers) is not a refusal.
-3. **The first rate-limited batch stops the push.** Items it never sent, and
+4. **A rate-limited batch with a far-off reset stops the push.** Items it never sent, and
    items refused with a 429, were never written, so they stay selected and the
    results say when to press Create again.
-4. **A spent window is refused locally.** After `Remaining: 0`, or a 429 that
-   resets more than a minute out, `procoreRequest` throws the same 429 without
-   calling Procore until the reset time Procore gave. It only ever refuses
+5. **A spent window is refused locally.** After `Remaining: 0` (resetting more
+   than 5s out), or a 429 that resets more than a minute out, `procoreRequest`
+   throws the same 429 without calling Procore until the reset time Procore gave. It only ever refuses
    early, never permits what Procore would refuse.
 
 ⚠️ Whether a separate Procore app registration gets its own quota is **unknown**.
