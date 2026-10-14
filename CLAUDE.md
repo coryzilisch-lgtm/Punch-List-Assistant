@@ -199,11 +199,25 @@ and the audit trail names who did the work.
   and any Procore call without a session throws `ProcoreConnectRequired`, which
   `guarded()` turns into a 401 with `procoreConnect: true`. That is distinct from
   the Entra 401, and the dashboard offers "Connect Procore" for it.
-- **The token lives in one cookie, for one session.** `pla_procore` is AES-GCM
-  sealed with `PROCORE_SESSION_KEY`, HttpOnly, Secure, bound to the Entra
-  `userId`. A cookie in someone else's session does not open. **No refresh token
-  is kept**, so there is nothing long-lived at rest and no rotation race. Expiry
-  (~2h) means one click to reconnect.
+- **The access token lives in one cookie, for one session.** `pla_procore` is
+  AES-GCM sealed with `PROCORE_SESSION_KEY`, HttpOnly, Secure, bound to the Entra
+  `userId`. A cookie in someone else's session does not open, and it never
+  carries the refresh token.
+- **The permanent link (Cory, 2026-10-14), optional.** With `PROCORE_LINK_STORE`
+  (an Azure Storage connection string), the callback keeps the refresh token,
+  sealed, in table `procorelinks`, one row per Entra user (`link-store.ts`: the
+  Table REST API with SharedKeyLite, **no SDK**, for the file cap). A request with
+  no live cookie is reconnected from the row by `restoreSession()` in `guarded()`
+  and `/api/me`, and gets a fresh cookie. Rules (`procore-link.ts`, tested in
+  `procore-link.test.mjs` against a fake table that honours ETags):
+  a refresh is a **compare-and-swap** on the row's ETag, and the loser uses the
+  winner's token (confirmed failing with the If-Match removed); a refresh Procore
+  refuses **deletes** the link; a Procore 401 mid-request marks the stored token
+  spent and clears the cookie; storage trouble makes that one request
+  unconnected, never a 500; **Disconnect deletes the row**. Without the setting,
+  nothing is kept and expiry (~2h) means one click to reconnect.
+  ⚠️ Not yet seen against the live tenant: whether Procore returns a refresh
+  token to this app, and whether it rotates it.
 - **Connecting is a popup** (`/procore-connected.js` reports back to the open
   tab), so a reconnect mid-review loses nothing. A push whose token expires
   mid-batch stops: later items are never sent into the 401, and everything not

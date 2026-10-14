@@ -1,5 +1,6 @@
 import type { HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
 import { ProcoreConnectRequired, runAsProcoreUser, sessionFromCookie } from './procore-session';
+import { clearSessionCookie, forgetAccess, restoreSession, sessionCookie } from './procore-link';
 
 /**
  * Shared HTTP helpers. Every response is JSON and no-store: this app is a
@@ -106,15 +107,36 @@ export function guarded(
     // The super's Procore session, if they connected one in this browser and it
     // belongs to this Entra identity. Every Procore call in the handler runs as
     // them; with none, the first Procore call throws ProcoreConnectRequired.
-    const session = sessionFromCookie(request.headers.get('cookie'), principal.userId, Date.now());
+    let session = sessionFromCookie(request.headers.get('cookie'), principal.userId, Date.now());
+
+    // No live cookie: a super with a permanent link is reconnected from it
+    // (refreshing if needed), and the response carries a fresh cookie so the
+    // next request does not have to. A store that is down is not a 500: this
+    // request just runs as not connected.
+    let renewed: ReturnType<typeof sessionCookie> = null;
+    if (!session) {
+      session = await restoreSession(principal.userId).catch((err) => {
+        context.warn(`${name}: could not restore the Procore link: ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+      });
+      if (session) renewed = sessionCookie(session);
+    }
 
     try {
-      return await runAsProcoreUser(session, () => handler(request, context));
+      const res = await runAsProcoreUser(session, () => handler(request, context));
+      if (renewed) res.cookies = [...(res.cookies || []), renewed];
+      return res;
     } catch (err) {
       if (err instanceof ProcoreConnectRequired) {
+        // Procore refused the token mid-request: drop the cookie, and mark a
+        // linked token spent so the next request refreshes rather than reusing it.
+        if (err.reason === 'expired') await forgetAccess(principal.userId).catch(() => {});
         // Distinct from the Entra 401 above: the dashboard offers "Connect
         // Procore" for this one, and the sign-in page for that one.
-        return errorResponse(401, err.message, { procoreConnect: true, reason: err.reason });
+        return {
+          ...errorResponse(401, err.message, { procoreConnect: true, reason: err.reason }),
+          cookies: [clearSessionCookie],
+        };
       }
       const message = err instanceof Error ? err.message : String(err);
       const stack = err instanceof Error ? err.stack : undefined;

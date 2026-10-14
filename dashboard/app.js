@@ -346,7 +346,11 @@ function renderDistGate() {
 }
 
 function procoreConnected() {
-  return Boolean(S.procore?.connected && (!S.procore.expiresAt || S.procore.expiresAt > Date.now() + 60_000));
+  // With a permanent link the server renews the token on the next request, so
+  // the ~2 hour expiry is not this page's to enforce.
+  return Boolean(
+    S.procore?.connected && (S.procore.persistent || !S.procore.expiresAt || S.procore.expiresAt > Date.now() + 60_000),
+  );
 }
 
 /**
@@ -400,7 +404,11 @@ function renderProcoreCard(problem = null) {
   if (procoreConnected()) {
     card.innerHTML =
       `<div class="procore-line">Procore: connected as <strong>${esc(procoreWho())}</strong>` +
-      (p.expiresAt ? ` <span class="muted">until about ${esc(clockTime(p.expiresAt))}</span>` : '') +
+      (p.persistent
+        ? ' <span class="muted">· stays connected</span>'
+        : p.expiresAt
+          ? ` <span class="muted">until about ${esc(clockTime(p.expiresAt))}</span>`
+          : '') +
       ' · <button type="button" class="btn-link" id="procore-disconnect">Disconnect</button></div>';
     $('procore-disconnect').addEventListener('click', disconnectProcore);
     return;

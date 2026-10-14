@@ -2,6 +2,8 @@ import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/fu
 import type { Cookie } from '@azure/functions';
 import { errorResponse, getPrincipal, guarded, json } from '../lib/http';
 import { authorizeUrl, companyId, exchangeCode, procoreConfigured, procoreNotConfiguredMessage, ProcoreError, procoreRequest } from '../lib/procore';
+import { saveLink, sessionCookieBase, unlink } from '../lib/procore-link';
+import { linkStoreConfigured } from '../lib/link-store';
 import {
   MAX_COOKIE_BYTES,
   newState,
@@ -31,7 +33,7 @@ import {
  * that user, and every later request checks it against the SWA principal.
  */
 
-const cookieBase = { path: '/api', httpOnly: true, secure: true, sameSite: 'Lax' as const };
+const cookieBase = sessionCookieBase;
 
 export async function connectHandler(request: HttpRequest): Promise<HttpResponseInit> {
   if (!procoreConfigured()) return errorResponse(503, procoreNotConfiguredMessage());
@@ -72,7 +74,7 @@ export async function callbackHandler(request: HttpRequest, context: InvocationC
   if (!code) return done(false, 'Procore sent no authorization code. Close this window and try again.');
 
   try {
-    const { accessToken, expiresIn } = await exchangeCode(code);
+    const { accessToken, expiresIn, refreshToken } = await exchangeCode(code);
     const expiresAt = Date.now() + expiresIn * 1000;
 
     // Ask Procore who this token is: the name shown as "Connected as", and the
@@ -111,8 +113,21 @@ export async function callbackHandler(request: HttpRequest, context: InvocationC
       return done(false, "Procore's token is too large for this app to keep. Tell Cory: the session needs server-side storage.");
     }
 
-    context.log(`procore connected: procore_user=${session.procoreUserId} login=${session.login}`);
-    return done(true, `Connected to Procore as ${session.name || 'you'}.`, [
+    // The permanent link: keep the refresh token (sealed) so this super does not
+    // reconnect every two hours. A store that fails costs only that: the
+    // session still works for now.
+    let kept = false;
+    if (linkStoreConfigured() && refreshToken) {
+      try {
+        await saveLink(session, refreshToken);
+        kept = true;
+      } catch (err) {
+        context.error(`procore callback: could not save the link: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    context.log(`procore connected: procore_user=${session.procoreUserId} login=${session.login} linked=${kept}`);
+    return done(true, `Connected to Procore as ${session.name || 'you'}.${kept ? ' You will stay connected.' : ''}`, [
       { ...cookieBase, name: SESSION_COOKIE, value, maxAge: Math.max(60, expiresIn - 60) },
     ]);
   } catch (err) {
@@ -135,7 +150,11 @@ function personLogin(u: Record<string, unknown> | null | undefined): string | nu
   return str(u.login) || str(u.email_address) || str(u.email);
 }
 
-export async function disconnectHandler(): Promise<HttpResponseInit> {
+export async function disconnectHandler(request: HttpRequest): Promise<HttpResponseInit> {
+  // Disconnect means disconnect: the stored link goes too, or the next request
+  // would quietly reconnect them.
+  const owner = getPrincipal(request)?.userId;
+  if (owner) await unlink(owner);
   return {
     ...json({ connected: false }),
     cookies: [{ ...cookieBase, name: SESSION_COOKIE, value: '', maxAge: 0 }],
