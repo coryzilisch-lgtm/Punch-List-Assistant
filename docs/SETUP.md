@@ -237,29 +237,30 @@ Two things that are easy to get wrong, both learned on the sibling apps:
 That is the whole list. `PUNCH_EXTRACT_MODEL` is not needed — the direct API path
 defaults to `claude-opus-5`.
 
-Key Vault values are in `kv-dataplatform-bci.vault.azure.net`, the same secrets
-the Safety Dashboard notebooks use:
+The Procore pair is **not** in Key Vault: the `procore-client-*` secrets there
+belong to the Safety Dashboard's service account and must not be pasted here.
+Copy this app's pair from the developer portal (BCI Punchlist Assistant → OAuth
+Credentials, the **top, Production** section; never the Sandbox one).
 
-```bash
-az keyvault secret show --vault-name kv-dataplatform-bci \
-  --name procore-client-id --query value -o tsv
-az keyvault secret show --vault-name kv-dataplatform-bci \
-  --name procore-client-secret --query value -o tsv
-```
+**Verify by connecting, not with curl.** This is a user-level app: Procore only
+issues a token when a person signs in, so a client-credentials `curl` against
+`/oauth/token` fails by design and proves nothing. Once deployed, open the app,
+press **Connect Procore**, sign in, and the step 1 card must read
+**"Procore: connected as <your name>"**. That one action proves the ID, the
+secret, the redirect URI and the session cookie together. If it fails, the
+popup says which:
 
-Verify them before pasting — this separates "wrong credentials" from "wrong
-permissions" later, and should come back as the service account
-`abs-api-export-b171139a@procore.com`:
+| What you see | Cause |
+|---|---|
+| Procore's error page about the redirect URI | `PROCORE_REDIRECT_URI` differs from the portal's Redirect URI field, even by a trailing slash |
+| Procore's error page saying "invalid client" | Wrong client ID, usually the Sandbox one |
+| "Procore refused the connection (HTTP 401…)" | Wrong secret, or one that does not belong to that ID |
+| "That Procore sign-in had expired…" | More than ten minutes between Connect and finishing sign-in; press Connect again |
 
-```bash
-CID='<client-id>'; CSEC='<client-secret>'
-TOKEN=$(curl -sS -X POST https://login.procore.com/oauth/token \
-  -H 'Content-Type: application/json' \
-  -d "{\"grant_type\":\"client_credentials\",\"client_id\":\"$CID\",\"client_secret\":\"$CSEC\"}" \
-  | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
-curl -sS https://api.procore.com/rest/v1.0/me \
-  -H "Authorization: Bearer $TOKEN" -H "Procore-Company-Id: 18895"
-```
+**Order, so the live app is never broken in between:** add
+`PROCORE_REDIRECT_URI` and `PROCORE_SESSION_KEY` first (older code ignores
+them), deploy, *then* swap `PROCORE_CLIENT_ID`/`PROCORE_CLIENT_SECRET` to this
+app's pair, then connect and push one item.
 
 ### Why the values are pasted, not Key Vault references
 
