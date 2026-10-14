@@ -119,11 +119,29 @@ assumption, not a tenant answer.
 
 ✅ **Answered by the tenant, 2026-10-14: Procore initiates on create.** With the
 create as the only write, 9 of 9 items on the Sandbox read back
-`create response: initiated, read-back: initiated` (the `draftTrail` on every
-result). No follow-up write is involved. The payload must ask for a Draft, and
-the field that does it is **not yet known**: get it from Procore's Create Punch
-Item docs (Cory can paste them) or from `/api/inspect` on a Draft made by hand,
-then prove it with a one-item push whose manager is the super.
+`create response: initiated, read-back: initiated`. No follow-up write was
+involved.
+
+✅ **Procore's Create Punch Item reference (pasted by Cory, 2026-10-14)** lists
+`workflow_status` (draft, initiated, …) and `distribution_member_ids` as create
+parameters, and the due date's request key as **`due`** (`due_date` is only the
+response field; the app sent `due_date` until now, so due dates were dropped).
+Every create now sends `workflow_status: "draft"` and an explicitly **empty**
+`distribution_member_ids` (in multipart, one empty
+`punch_item[distribution_member_ids][]` part: omitting it means "use the
+project default", the opposite). Assignees: the reference shows
+`login_information_ids` at the top level; the app still sends nested
+`assignments[].login_information_id`. Not yet compared on the tenant.
+
+⚠️ **Not yet proven on the tenant.** That the reference accepts these is not
+proof the tenant honours them, nor that an explicit empty list beats the
+project's Default Distribution List. Hence **the safety catch**: the dashboard
+sends the **first item alone**, and `/api/push` stops (`safetyStop`) at any
+item that reads back not Draft, unreadable, or with anyone in
+`distribution_members`. Everything after it is unsent and stays selected. The
+worst case is one item's emails, not a whole list's. Tested in
+`send-safety.test.mjs` and `push-quota.test.mjs`, both confirmed failing with
+the catch removed.
 
 **Who Initiated emails is a per-project setting.** Punch List → Settings →
 Email Notifications. On the Sandbox the **Distribution Group** column is ticked

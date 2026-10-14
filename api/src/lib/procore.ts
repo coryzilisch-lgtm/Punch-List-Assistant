@@ -1109,11 +1109,25 @@ export interface PunchPhoto {
  * dry-run path can show operators the exact body without sending it.
  */
 export function buildPunchItemPayload(input: PunchItemInput): Record<string, unknown> {
-  const item: Record<string, unknown> = { name: input.name };
+  const item: Record<string, unknown> = {
+    name: input.name,
+    // ✅ From Procore's Create Punch Item reference (pasted by Cory, 2026-10-14):
+    // `workflow_status` is accepted on create, and the tenant initiates an item
+    // that does not ask (9 of 9 read back `initiated` from the create itself).
+    // Initiated notifies people; Draft does not. Always ask for Draft.
+    workflow_status: 'draft',
+    // Explicitly nobody on the item's distribution list. The project's Default
+    // Distribution List is what emailed everyone on it: the Email Notifications
+    // settings send Item Created / Initiated to the "Distribution Group", which
+    // is the item's distribution members. The read-back checks it stayed empty.
+    distribution_member_ids: [],
+  };
 
   if (input.description) item.description = input.description;
   if (input.priority) item.priority = input.priority;
-  if (input.dueDate) item.due_date = input.dueDate;
+  // The request key is `due` (Procore's reference); `due_date` is the RESPONSE
+  // field, and sending it was filtered out without a word.
+  if (input.dueDate) item.due = input.dueDate;
   if (input.punchItemTypeId) item.punch_item_type_id = input.punchItemTypeId;
   if (input.locationId) item.location_id = input.locationId;
   if (input.tradeId) item.trade_id = input.tradeId;
@@ -1175,6 +1189,8 @@ export interface ObservedPunchItem {
   ballInCourt: string[];
   assignees: string[];
   punchItemManager: string | null;
+  /** Who is on the item's distribution list, which Procore emails per the project's settings. */
+  distributionMembers: string[];
 }
 
 /**
@@ -1268,6 +1284,7 @@ export function observedFromRow(row: Record<string, unknown>): ObservedPunchItem
     ballInCourt: namesOf(row.ball_in_court ?? row.ball_in_courts),
     assignees: namesOf(row.assignments ?? row.assignees),
     punchItemManager: nameOf(row.punch_item_manager),
+    distributionMembers: namesOf(row.distribution_members),
   };
 }
 
@@ -1318,6 +1335,10 @@ export async function observePunchItem(
 function appendNested(form: FormData, prefix: string, value: unknown): void {
   if (value === null || value === undefined) return;
   if (Array.isArray(value)) {
+    // An empty array must still be sent, as Rails' "empty list" form value:
+    // `distribution_member_ids: []` means nobody, and omitting it means "use
+    // the project's default list", which is the opposite.
+    if (!value.length) form.append(`${prefix}[]`, '');
     for (const entry of value) appendNested(form, `${prefix}[]`, entry);
     return;
   }

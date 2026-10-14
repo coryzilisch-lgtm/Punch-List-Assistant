@@ -1796,6 +1796,7 @@ async function doPush(dryRun) {
   S.quotaStop = null;
   S.connectStop = false;
   S.connectNotAttempted = 0;
+  S.safetyStop = null;
   $('results-card').style.display = dryRun ? 'none' : 'block';
   $('dryrun-card').style.display = dryRun ? 'block' : 'none';
   $('results').innerHTML = '';
@@ -1841,7 +1842,11 @@ async function doPush(dryRun) {
       stopAt = S.quota?.resetAt ?? null;
       break;
     }
-    const batch = queue.splice(0, dryRun ? BATCH : Math.min(BATCH, allowance));
+    // The first item goes alone. If it comes back as anything but a quiet Draft
+    // (initiated, or with people on its distribution list), it may have emailed
+    // them, and the push stops before a second item can do the same.
+    const size = dryRun ? BATCH : done === 0 ? 1 : BATCH;
+    const batch = queue.splice(0, dryRun ? size : Math.min(size, allowance));
 
     $('send-progress').innerHTML =
       `<div class="progress-track"><div class="progress-fill" style="width:${
@@ -1874,6 +1879,10 @@ async function doPush(dryRun) {
           S.connectStop = true;
           if (S.procore) S.procore.connected = false;
           renderProcoreCard('Your Procore connection expired partway through. Reconnect, then press Create again.');
+        }
+        if (res.safetyStop) {
+          stopped = true;
+          S.safetyStop = res.safetyStop;
         }
         if (res.quota) {
           S.quota = res.quota;
@@ -1941,7 +1950,10 @@ async function doPush(dryRun) {
     if (stopped) break;
   }
 
-  if (!dryRun && S.connectStop) {
+  if (!dryRun && S.safetyStop) {
+    // Stopped by the safety catch, not the rate limit.
+    S.safetyStop.notAttempted = queue.length;
+  } else if (!dryRun && S.connectStop) {
     // Stopped by an expired Procore connection, not the rate limit.
     S.connectNotAttempted = queue.length;
   } else if (!dryRun && (stopAt !== null || queue.length)) {
@@ -1995,6 +2007,16 @@ function renderResults() {
         `The server stopped answering partway through, so it cannot say what it finished. ` +
         `<strong>Do not push these again</strong> until you have checked the project's punch list in Procore — ` +
         `pushing them again creates duplicates and can email the same subs twice. They have been unticked.`,
+    );
+  }
+  if (S.safetyStop) {
+    const n = S.results.filter((r) => r.safetyStopped).length + (S.safetyStop.notAttempted || 0);
+    html += note(
+      'error',
+      `<strong>Stopped: an item did not come back as a quiet Draft</strong> (${esc(S.safetyStop.reason)}). ` +
+        'Procore may have emailed people about it. Check it in Procore, and check this project\'s ' +
+        '<strong>Punch List → Settings → Email Notifications</strong> and Default Distribution List. ' +
+        `${n} item${n === 1 ? ' was' : 's were'} not sent and ${n === 1 ? 'is' : 'are'} still selected.`,
     );
   }
   if (S.connectStop || unconnected.length) {
@@ -2090,6 +2112,10 @@ function renderResults() {
           bits.push(`<span class="badge flat">${esc(status)}</span>`);
         }
 
+        const dist = r.observed?.distributionMembers || [];
+        if (dist.length) {
+          bits.push(`<span class="badge err">On its distribution list: ${esc(dist.join(', '))}</span>`);
+        }
         const bic = r.observed?.ballInCourt || [];
         const wantedAssignee = Boolean(item?.assigneeId);
         if (bic.length) {

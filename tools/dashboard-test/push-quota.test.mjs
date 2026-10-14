@@ -189,7 +189,8 @@ test('a push the quota cannot fully carry creates what fits and stops', async ()
     await page.click('#next-btn');
     await page.waitForFunction(() => document.getElementById('results').textContent.includes('Stopped'));
 
-    assert.deepEqual(pushes.map((p) => p.items.length), [5, 2], 'two batches, nothing past the quota');
+    // The first item goes alone (the safety catch), then batches of five.
+    assert.deepEqual(pushes.map((p) => p.items.length), [1, 5, 1], 'nothing past the quota');
     const results = await page.textContent('#results');
     assert.match(results, /7 punch items created/);
     assert.match(results, /5 items were not created/);
@@ -220,12 +221,13 @@ test('a push with no quota room does not start', async () => {
 test('a rate-limited batch stops the push; later batches are never sent', async () => {
   // Quota unknown (Procore sent no headers), so nothing is planned up front:
   // the first batch lands, the second comes back rate limited, the third must
-  // not be sent. On the Darden import it was, eleven times over.
+  // not be sent. On the Darden import it was, eleven times over. (Push 1 is the
+  // first item alone, so the batches are 1, 5, 5, 1.)
   const resetAt = Date.now() + 30 * 60_000;
   const { page, pushes, errors } = await toCreateStep({
     quotaReply: quota({ limit: null, remaining: null, resetAt: null, capacity: null }),
     onPush: (body, n) =>
-      n === 1
+      n <= 2
         ? created(body)
         : {
             json: {
@@ -242,12 +244,12 @@ test('a rate-limited batch stops the push; later batches are never sent', async 
     await page.click('#next-btn');
     await page.waitForFunction(() => document.getElementById('results').textContent.includes('Stopped'));
 
-    assert.equal(pushes.length, 2, 'the third batch was never sent');
+    assert.equal(pushes.length, 3, 'the last batch was never sent');
     const results = await page.textContent('#results');
-    assert.match(results, /6 punch items created/);
-    // 4 refused in batch two + 2 never attempted.
-    assert.match(results, /6 items were not created/);
-    assert.match(await page.textContent('#next-btn'), /Create 6 punch items/, 'all six not created stay selected');
+    assert.match(results, /7 punch items created/);
+    // 4 refused in the rate-limited batch + 1 never attempted.
+    assert.match(results, /5 items were not created/);
+    assert.match(await page.textContent('#next-btn'), /Create 5 punch items/, 'all five not created stay selected');
     assert.deepEqual(errors, []);
   } finally {
     await page.close();
@@ -279,7 +281,7 @@ test('the tenant\'s 25-request window: the button is not capped and the push wai
     await page.click('#next-btn');
     await page.waitForFunction(() => /12 punch items created/.test(document.getElementById('results').textContent), null, { timeout: 30_000 });
 
-    assert.deepEqual(pushes.map((p) => p.items.length), [5, 5, 2], 'paced batches, every item sent once');
+    assert.deepEqual(pushes.map((p) => p.items.length), [1, 5, 5, 1], 'paced batches, every item sent once');
     assert.doesNotMatch(await page.textContent('#results'), /Stopped/);
     assert.deepEqual(errors, []);
   } finally {
@@ -293,8 +295,8 @@ test('items refused by a window that resets in seconds are retried, not dropped'
     quotaReply: () => ({ limit: 25, remaining: 20, resetAt: Date.now() + 2_000, capacity: 6, perItem: 3, reserve: 2 }),
     onPush: (body) => {
       n += 1;
-      if (n !== 1) return created(body, n * 100);
-      // First batch: two land, three hit the window. Those three were never written.
+      if (n !== 2) return created(body, n * 100);
+      // The first full batch (after the lone first item): two land, three hit the window. Those three were never written.
       const resetAt = Date.now() + 1_500;
       return {
         json: {
@@ -329,8 +331,8 @@ test('a long-reset stop says it was the hourly-scale limit and what this import 
   const { page, errors } = await toCreateStep({
     quotaReply: { limit: null, remaining: null, resetAt: null, capacity: null, perItem: 3, reserve: 200, requests: 1 },
     onPush: (body, n) =>
-      n === 1
-        ? { json: { ...created(body).json, requests: 10 } }
+      n <= 2
+        ? { json: { ...created(body).json, requests: 5 } }
         : {
             json: {
               results: body.items.map((it) => ({ clientId: it.clientId, ok: false, rateLimited: true, resetAt, error: 'HTTP 429' })),
@@ -344,10 +346,10 @@ test('a long-reset stop says it was the hourly-scale limit and what this import 
     await page.waitForFunction(() => document.getElementById('results').textContent.includes('Stopped'));
     const text = await page.textContent('#results');
     assert.match(text, /long \(hourly-scale\) limit, not the burst window/);
-    // 10 for the first batch + 1 for the refused one. The quota check made on
+    // 5 + 5 for the first two batches + 1 for the refused one. The quota check made on
     // opening the step is reused, not asked again, so it is not part of this push.
     assert.match(text, /This import had used 11 Procore requests/);
-    assert.match(text, /used 11 Procore requests for 5 items created \(about 2\.2 each\)/);
+    assert.match(text, /used 11 Procore requests for 6 items created \(about 1\.8 each\)/);
     assert.deepEqual(errors, []);
   } finally {
     await page.close();
@@ -431,7 +433,7 @@ test('a connection that expires mid-push stops it and keeps the unsent items sel
   const { page, pushes, errors } = await toCreateStep({
     quotaReply: quota(),
     onPush: (body, n) =>
-      n === 1
+      n <= 2
         ? { json: { ...created(body).json, createdAs: 'Test Super' } }
         : {
             json: {
@@ -445,15 +447,15 @@ test('a connection that expires mid-push stops it and keeps the unsent items sel
     await page.click('#next-btn');
     await page.waitForFunction(() => /connection expired/.test(document.getElementById('results').textContent));
 
-    assert.equal(pushes.length, 2, 'nothing was sent after the connection was lost');
+    assert.equal(pushes.length, 3, 'nothing was sent after the connection was lost');
     const text = await page.textContent('#results');
-    assert.match(text, /5 punch items created/);
+    assert.match(text, /6 punch items created/);
     assert.match(text, /Created in Procore as Test Super/);
-    // 5 refused in batch two + 2 never attempted.
-    assert.match(text, /7 items were not created/);
+    // 5 refused in the expired batch + 1 never attempted.
+    assert.match(text, /6 items were not created/);
     assert.doesNotMatch(text, /rate limit/i, 'an expired login is not reported as a rate limit');
     assert.ok(await page.isVisible('[data-act="procore-reconnect"]'));
-    assert.match(await page.textContent('#next-btn'), /Create 7 punch items/, 'the seven stay selected');
+    assert.match(await page.textContent('#next-btn'), /Create 6 punch items/, 'the six stay selected');
     assert.ok(await page.isDisabled('#next-btn'), 'until the super reconnects');
     assert.deepEqual(errors, []);
   } finally {
@@ -673,6 +675,43 @@ test('"Connected as" falls back to the Microsoft account, never to nobody', asyn
   try {
     // Not in the directory either: the Microsoft account is all that names them.
     await page.waitForFunction(() => /connected as new\.super@buffaloconstruction\.com/.test(document.getElementById('procore-card').textContent));
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
+// ── The safety catch: the first item goes alone (2026-10-14) ────────────────
+//
+// An item that is created Initiated, or with people on its distribution list,
+// may have emailed them. That is how subs got hundreds of emails. The first item
+// goes alone, and anything but a quiet Draft stops the push there.
+
+test('an item that does not come back a quiet Draft stops the push after one item', async () => {
+  const { page, pushes, errors } = await toCreateStep({
+    onPush: (body) => ({
+      json: {
+        results: body.items.map((it) => ({
+          clientId: it.clientId,
+          ok: true,
+          punchItemId: 501,
+          observed: { isDraft: false, workflowLabel: 'initiated', distributionMembers: ['Dana Sub'] },
+        })),
+        safetyStop: { punchItemId: 501, reason: 'it came back initiated' },
+        quota: null,
+      },
+    }),
+  });
+  try {
+    await page.click('#next-btn');
+    await page.waitForFunction(() => /did not come back as a quiet Draft/.test(document.getElementById('results').textContent));
+    assert.deepEqual(pushes.map((p) => p.items.length), [1], 'one item, then nothing');
+    const text = await page.textContent('#results');
+    assert.match(text, /it came back initiated/);
+    assert.match(text, /On its distribution list: Dana Sub/);
+    assert.match(text, /11 items were not sent/);
+    assert.doesNotMatch(text, /rate limit/i, 'a safety stop is not reported as a rate limit');
+    assert.match(await page.textContent('#next-btn'), /Create 11 punch items/, 'the rest stay selected');
     assert.deepEqual(errors, []);
   } finally {
     await page.close();
