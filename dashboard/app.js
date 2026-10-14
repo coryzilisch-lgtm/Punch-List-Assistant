@@ -255,6 +255,23 @@ function procoreConnected() {
   return Boolean(S.procore?.connected && (!S.procore.expiresAt || S.procore.expiresAt > Date.now() + 60_000));
 }
 
+/**
+ * Who the Procore connection is, as best this page knows: Procore's name for
+ * them, their row in the project directory, their Procore login, then their
+ * Microsoft account. Never blank: a connection that names nobody does not say
+ * whose items these will be.
+ */
+function procoreWho() {
+  const p = S.procore || {};
+  return (
+    p.name?.trim() ||
+    meInDirectory()?.name ||
+    p.login?.trim() ||
+    S.me?.email ||
+    'you'
+  );
+}
+
 function renderProcoreCard(problem = null) {
   const card = $('procore-card');
   if (!card) return;
@@ -286,7 +303,7 @@ function renderProcoreCard(problem = null) {
   }
   if (procoreConnected()) {
     card.innerHTML =
-      `<div class="procore-line">Procore: connected as <strong>${esc(p.name || 'you')}</strong>` +
+      `<div class="procore-line">Procore: connected as <strong>${esc(procoreWho())}</strong>` +
       (p.expiresAt ? ` <span class="muted">until about ${esc(clockTime(p.expiresAt))}</span>` : '') +
       ' · <button type="button" class="btn-link" id="procore-disconnect">Disconnect</button></div>';
     $('procore-disconnect').addEventListener('click', disconnectProcore);
@@ -700,6 +717,8 @@ async function selectProject(id) {
   const [probe] = await Promise.allSettled([api(`/api/probe?project_id=${S.project.id}`)]);
 
   if (probe.status === 'fulfilled' && probe.value.config) S.config = probe.value.config;
+  // The directory can name the super when Procore's /me did not.
+  renderProcoreCard();
 
   let html = '';
   if (probe.status === 'fulfilled') {
@@ -1748,7 +1767,7 @@ function renderSendSummary() {
   // (2026-10-01). Sending is a decision the super makes in Procore, item by item.
   html += note(
     'info',
-    `<strong>Items are created as Drafts, as ${esc(S.procore?.name?.trim() || 'you')}.</strong> ` +
+    `<strong>Items are created as Drafts, as ${esc(procoreWho())}.</strong> ` +
       'This app does not send them to the punch item manager or ' +
       'the assignees. Review them in Procore and send them from there when they are right.',
   );

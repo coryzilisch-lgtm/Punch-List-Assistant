@@ -117,24 +117,26 @@ confirmed **Initiated is what notifies people; Draft notifies no one.** The crea
 payload has never asked for a Draft, so "every item is created as a Draft" was an
 assumption, not a tenant answer.
 
-🛑 **The create is now the only write, 2026-10-14.** The 10-14 push spent ~7
-requests per item, which was the assignee and photo follow-up chains: up to
-three `PATCH` / `POST` writes per item after the create whenever the read-back
-did not show the assignee or the photos. Any of those can move a Draft forward.
-They are gone (`ensureAssignees` never writes; `ensurePhotos` and the
-strategy chains were removed). A missing assignee or photo is reported on the
-results screen and set in Procore by hand. The only second request that writes is
-the JSON create retried after the multipart one is refused with a **4xx**, which
-created nothing. `api/test/send-safety.test.mjs` asserts exactly one write even
-when the read-back shows neither assignee nor photos.
+✅ **Answered by the tenant, 2026-10-14: Procore initiates on create.** With the
+create as the only write, 9 of 9 items on the Sandbox read back
+`create response: initiated, read-back: initiated` (the `draftTrail` on every
+result). No follow-up write is involved. The payload must ask for a Draft, and
+the field that does it is **not yet known**: get it from Procore's Create Punch
+Item docs (Cory can paste them) or from `/api/inspect` on a Draft made by hand,
+then prove it with a one-item push whose manager is the super.
 
-Each result carries `draftTrail`: what the **create response** and the
-**read-back** each said about Draft. The results screen prints it on any item
-flagged *Not a Draft*. Next step: push **one** item and read it. If the create
-response already says Initiated, the tenant initiates on create and the payload
-must ask for a Draft (find the field with `/api/inspect` on a Draft made by hand
-in Procore); if the create response says Draft and the read-back does not,
-something after the create moved it.
+**Who Initiated emails is a per-project setting.** Punch List → Settings →
+Email Notifications. On the Sandbox the **Distribution Group** column is ticked
+for every action, including *Item Created* and *Item Initiated*, and the punch
+item manager is locked on for *Item Initiated*. This app never sets a
+distribution list on an item; the project's Default Distribution List does.
+
+The assignee follow-up chain is gone (a missing assignee is reported). The photo
+PATCH was removed for one push and **came back**: photos sent with the create are
+dropped on this tenant (0 of 12 landed), and they have only ever arrived by
+`PATCH /punch_items/{id}` with `punch_item[attachments][]` (then `attachments[]`).
+It runs only when the read-back shows no photo, never throws, and adds an
+`after photos` step to the trail. `send-safety.test.mjs` holds both.
 
 **Every pushed item needs a punch item manager.** `/api/push` refuses the whole
 batch (400, before any write) if any item lacks one, and the dashboard disables

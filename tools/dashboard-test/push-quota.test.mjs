@@ -652,3 +652,29 @@ test('a super who is not in the project directory cannot pick "Me", and is told 
     await page.close();
   }
 });
+
+test('"Connected as" names the super even when Procore gave no name', async () => {
+  const { page, errors } = await openApp({
+    meReply: () => ({ ...CONNECTED(), procore: { ...CONNECTED().procore, name: null, login: null } }),
+  });
+  try {
+    // No name from Procore: the project directory row for their Procore id names them.
+    await page.waitForFunction(() => /connected as Test Super/.test(document.getElementById('procore-card').textContent));
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
+test('"Connected as" falls back to the Microsoft account, never to nobody', async () => {
+  const { page, errors } = await openApp({
+    meReply: () => ({ email: 'new.super@buffaloconstruction.com', procore: { ...CONNECTED().procore, name: '  ', login: null, procoreUserId: null } }),
+  });
+  try {
+    // Not in the directory either: the Microsoft account is all that names them.
+    await page.waitForFunction(() => /connected as new\.super@buffaloconstruction\.com/.test(document.getElementById('procore-card').textContent));
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});

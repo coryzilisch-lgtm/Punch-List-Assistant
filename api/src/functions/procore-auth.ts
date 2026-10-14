@@ -1,7 +1,7 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
 import type { Cookie } from '@azure/functions';
 import { errorResponse, getPrincipal, guarded, json } from '../lib/http';
-import { authorizeUrl, exchangeCode, procoreConfigured, procoreNotConfiguredMessage, ProcoreError, procoreRequest } from '../lib/procore';
+import { authorizeUrl, companyId, exchangeCode, procoreConfigured, procoreNotConfiguredMessage, ProcoreError, procoreRequest } from '../lib/procore';
 import {
   MAX_COOKIE_BYTES,
   newState,
@@ -83,15 +83,26 @@ export async function callbackHandler(request: HttpRequest, context: InvocationC
     // every plausible field, and log which ones exist (names only, never values)
     // so the real shape is on record.
     context.log(`procore /me fields: ${Object.keys(me || {}).sort().join(',')}`);
-    const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : null);
-    const joined = [str(me?.first_name), str(me?.last_name)].filter(Boolean).join(' ') || null;
-    const login = str(me?.login) || str(me?.email_address) || str(me?.email);
-    const session: ProcoreSession = {
-      ...draft,
-      procoreUserId: typeof me?.id === 'number' ? me.id : Number(me?.id) || null,
-      name: str(me?.name) || joined || login,
-      login,
-    };
+    const procoreUserId = typeof me?.id === 'number' ? me.id : Number(me?.id) || null;
+    let name = personName(me);
+    let login = personLogin(me);
+    // "Connected as" showed nobody on the first live connects (2026-10-14), so
+    // when /me carries no name, ask the company directory for this user. A read,
+    // and optional: if it fails, the session still works and the page falls back
+    // to the login or the Microsoft account.
+    if (!name && procoreUserId) {
+      try {
+        const user = await runAsProcoreUser(draft, () =>
+          procoreRequest<Record<string, unknown>>('GET', `/rest/v1.0/companies/${companyId()}/users/${procoreUserId}`),
+        );
+        context.log(`procore company user fields: ${Object.keys(user || {}).sort().join(',')}`);
+        name = personName(user);
+        login = login || personLogin(user);
+      } catch (err) {
+        context.warn(`procore callback: no name from the company directory (${err instanceof ProcoreError ? `HTTP ${err.status}` : String(err)})`);
+      }
+    }
+    const session: ProcoreSession = { ...draft, procoreUserId, name: name || login, login };
 
     const value = seal(session);
     // A browser drops an oversized cookie without a word; say so instead.
@@ -109,6 +120,19 @@ export async function callbackHandler(request: HttpRequest, context: InvocationC
     context.error(`procore callback failed: ${detail}`);
     return done(false, `Procore refused the connection (${detail}). Close this window and try again.`);
   }
+}
+
+const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : null);
+
+/** A person's name from a Procore user record, whichever fields this tenant fills. */
+function personName(u: Record<string, unknown> | null | undefined): string | null {
+  if (!u) return null;
+  return str(u.name) || [str(u.first_name), str(u.last_name)].filter(Boolean).join(' ') || null;
+}
+
+function personLogin(u: Record<string, unknown> | null | undefined): string | null {
+  if (!u) return null;
+  return str(u.login) || str(u.email_address) || str(u.email);
 }
 
 export async function disconnectHandler(): Promise<HttpResponseInit> {

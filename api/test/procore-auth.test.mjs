@@ -181,6 +181,39 @@ test('the callback swaps the code for the super\'s token and binds the session t
   assert.ok(!res.body.includes('cory-token'), 'the token never reaches the page');
 });
 
+test('when /me carries no name, the callback asks the company directory for it', async () => {
+  const { state, stateCookie } = await startConnect();
+  const calls = mockFetch((c) =>
+    c.path === '/oauth/token'
+      ? reply(200, { access_token: 'cory-token', expires_in: 7200 })
+      : c.path === '/rest/v1.0/me'
+        ? reply(200, { id: 4410, name: '' })
+        : reply(200, { id: 4410, first_name: 'Cory', last_name: 'Zilisch', email_address: 'cory@buffalo.example' }),
+  );
+  const res = await callbackHandler(request({ owner: null, cookie: stateCookie, query: { code: 'c', state } }), ctx);
+  assert.equal(res.status, 200);
+  assert.ok(calls.some((c) => c.method === 'GET' && c.path === `/rest/v1.0/companies/${process.env.PROCORE_COMPANY_ID}/users/4410`));
+  const stored = session.unseal(res.cookies.find((c) => c.name === session.SESSION_COOKIE).value);
+  assert.equal(stored.name, 'Cory Zilisch');
+  assert.equal(stored.login, 'cory@buffalo.example');
+  assert.match(res.body, /Connected to Procore as Cory Zilisch/);
+});
+
+test('a directory lookup that fails still connects, named by login if Procore gave one', async () => {
+  const { state, stateCookie } = await startConnect();
+  mockFetch((c) =>
+    c.path === '/oauth/token'
+      ? reply(200, { access_token: 'cory-token', expires_in: 7200 })
+      : c.path === '/rest/v1.0/me'
+        ? reply(200, { id: 4410, login: 'cory@buffalo.example' })
+        : reply(403, { errors: 'forbidden' }),
+  );
+  const res = await callbackHandler(request({ owner: null, cookie: stateCookie, query: { code: 'c', state } }), ctx);
+  assert.equal(res.status, 200);
+  const stored = session.unseal(res.cookies.find((c) => c.name === session.SESSION_COOKIE).value);
+  assert.equal(stored.name, 'cory@buffalo.example');
+});
+
 test('a callback with a forged or missing state creates nothing and never calls Procore', async () => {
   const { stateCookie } = await startConnect();
   const calls = mockFetch(() => reply(200, { access_token: 'x' }));
