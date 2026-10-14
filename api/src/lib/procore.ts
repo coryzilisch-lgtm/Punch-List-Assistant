@@ -158,47 +158,24 @@ export function authorizeUrl(state: string): string {
  * Trade the one-use code (valid ten minutes) for the super's access token. The
  * refresh token Procore also returns is deliberately dropped: nothing stores it.
  */
-export interface ProcoreTokens {
-  accessToken: string;
-  expiresIn: number;
-  /** Kept only when PROCORE_LINK_STORE is set (the permanent link); never logged, never sent to the browser. */
-  refreshToken: string | null;
-}
-
-async function tokenRequest(grant: Record<string, string>): Promise<ProcoreTokens> {
+export async function exchangeCode(code: string): Promise<{ accessToken: string; expiresIn: number }> {
   const res = await fetch(`${LOGIN_BASE}/oauth/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
+      grant_type: 'authorization_code',
       client_id: process.env.PROCORE_CLIENT_ID,
       client_secret: process.env.PROCORE_CLIENT_SECRET,
+      code,
       redirect_uri: process.env.PROCORE_REDIRECT_URI,
-      ...grant,
     }),
   });
   const body = await readBody(res);
   if (!res.ok) throw new ProcoreError('POST', '/oauth/token', res.status, body);
-  const b = (body || {}) as { access_token?: string; expires_in?: number; refresh_token?: string };
-  if (!b.access_token) throw new Error('Procore token response had no access_token');
-  return {
-    accessToken: b.access_token,
-    expiresIn: Number(b.expires_in) || 7200,
-    refreshToken: typeof b.refresh_token === 'string' && b.refresh_token ? b.refresh_token : null,
-  };
-}
-
-/** The authorization code from Procore's login, swapped for the super's tokens. */
-export function exchangeCode(code: string): Promise<ProcoreTokens> {
-  return tokenRequest({ grant_type: 'authorization_code', code });
-}
-
-/**
- * A new access token from a stored refresh token. OAuth servers commonly
- * rotate the refresh token on use; whatever comes back replaces the old one,
- * and a response without one keeps the old one.
- */
-export function refreshAccessToken(refreshToken: string): Promise<ProcoreTokens> {
-  return tokenRequest({ grant_type: 'refresh_token', refresh_token: refreshToken });
+  const accessToken = (body as { access_token?: string }).access_token;
+  const expiresIn = Number((body as { expires_in?: number }).expires_in) || 7200;
+  if (!accessToken) throw new Error('Procore token response had no access_token');
+  return { accessToken, expiresIn };
 }
 
 async function readBody(res: Response): Promise<unknown> {

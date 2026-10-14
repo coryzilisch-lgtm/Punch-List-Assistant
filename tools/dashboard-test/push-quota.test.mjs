@@ -769,20 +769,3 @@ test('a project cannot be imported into until its distribution emails are confir
     await page.close();
   }
 });
-
-// ── The permanent Procore link (2026-10-14) ─────────────────────────────────
-
-test('a linked super is not asked to reconnect when the session clock runs out', async () => {
-  const { page, errors } = await openApp({
-    // The access token "expired" a minute ago, but the link renews it server-side.
-    meReply: () => ({ ...CONNECTED(), procore: { ...CONNECTED().procore, persistent: true, expiresAt: Date.now() - 60_000 } }),
-  });
-  try {
-    await page.waitForFunction(() => /stays connected/.test(document.getElementById('procore-card').textContent));
-    assert.equal(await page.$('#procore-connect'), null, 'no Connect button for a linked super');
-    assert.doesNotMatch(await page.textContent('#procore-card'), /until about/);
-    assert.deepEqual(errors, []);
-  } finally {
-    await page.close();
-  }
-});

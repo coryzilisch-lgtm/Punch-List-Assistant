@@ -211,8 +211,7 @@ then **Save**.
 | `PROCORE_CLIENT_SECRET` | Its Production client secret. **Not** Key Vault: that pair is the Safety Dashboard's |
 | `PROCORE_COMPANY_ID` | `18895` |
 | `PROCORE_REDIRECT_URI` | `https://punchass.buffaloconstruction.com/api/procore/callback`: the address supers actually open, byte for byte the same as registered on the app's OAuth Credentials page. **Not** the `azurestaticapps.net` name (see CLAUDE.md) |
-| `PROCORE_SESSION_KEY` | A random string of 32+ characters (e.g. `openssl rand -base64 48`). Encrypts the super's Procore session cookie. Changing it signs every super out of Procore and invalidates every stored link (they reconnect once), nothing worse |
-| `PROCORE_LINK_STORE` | *Optional: the permanent link.* The **connection string** of an Azure Storage account (Storage account → Security + networking → Access keys → Connection string). With it, a super connects Procore once and stays connected; without it, every ~2 hours. The table `procorelinks` is created on first use. Each row is one super's refresh token, sealed with `PROCORE_SESSION_KEY` |
+| `PROCORE_SESSION_KEY` | A random string of 32+ characters (e.g. `openssl rand -base64 48`). Encrypts the super's Procore session cookie. Changing it signs every super out of Procore, nothing worse |
 | `ANTHROPIC_API_KEY` | The key you tested with in step 0 |
 
 **Optional but recommended — read the project list from Fabric.** Listing

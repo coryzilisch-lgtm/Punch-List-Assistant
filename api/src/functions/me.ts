@@ -2,8 +2,6 @@ import { app, HttpRequest, HttpResponseInit } from '@azure/functions';
 import { getPrincipal, json } from '../lib/http';
 import { procoreConfigured, procoreSettingProblems } from '../lib/procore';
 import { sessionFromCookie } from '../lib/procore-session';
-import { restoreSession, sessionCookie } from '../lib/procore-link';
-import { linkStoreConfigured, linkStoreProblem } from '../lib/link-store';
 
 /**
  * GET /api/me — who is signed in. Used for attribution (the reference stamped
@@ -15,22 +13,15 @@ export async function meHandler(request: HttpRequest): Promise<HttpResponseInit>
   if (!principal) return json({ signedIn: false }, 401);
   // Whether this super has connected Procore in this browser. Items are created
   // as them, so the dashboard asks them to connect before anything else.
-  let session = sessionFromCookie(request.headers.get('cookie'), principal.userId, Date.now());
-  // A super with a permanent link counts as connected even when this browser's
-  // cookie has run out: reconnect them from the link, and hand back the cookie.
-  let renewed: ReturnType<typeof sessionCookie> = null;
-  if (!session) {
-    session = await restoreSession(principal.userId).catch(() => null);
-    if (session) renewed = sessionCookie(session);
-  }
-  const res = json({
+  const session = sessionFromCookie(request.headers.get('cookie'), principal.userId, Date.now());
+  return json({
     signedIn: true,
     email: principal.userDetails,
     identityProvider: principal.identityProvider,
     procore: {
       configured: procoreConfigured(),
       // Setting NAMES only, never values: what to fix in the Azure portal.
-      settingProblems: [...procoreSettingProblems(), ...(linkStoreProblem() ? [linkStoreProblem()!] : [])],
+      settingProblems: procoreSettingProblems(),
       // Where Procore sends the super back after sign-in. The dashboard compares
       // it with the address it is open on: a mismatch means the sign-in cookie
       // and the session land on a different site and connecting cannot work.
@@ -41,16 +32,12 @@ export async function meHandler(request: HttpRequest): Promise<HttpResponseInit>
       // Procore's id for this super, so the dashboard can default them as the
       // punch item manager and final approver.
       procoreUserId: session?.procoreUserId ?? null,
-      // True when connecting is one-time: the link is kept between sessions.
-      persistent: linkStoreConfigured(),
       expiresAt: session?.expiresAt ?? null,
       // For links into Procore's own pages (the punch list settings gate).
       // An id, not a secret.
       companyId: /^\d+$/.test((process.env.PROCORE_COMPANY_ID || '').trim()) ? Number(process.env.PROCORE_COMPANY_ID!.trim()) : null,
     },
   });
-  if (renewed) res.cookies = [renewed];
-  return res;
 }
 
 function callbackHost(): string | null {
