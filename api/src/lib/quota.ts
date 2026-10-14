@@ -54,6 +54,27 @@ export const QUOTA_RESERVE = 200;
  */
 export const WAIT_IN_FUNCTION_MS = 5_000;
 
+/**
+ * Procore's spike window is 10 seconds (its rate-limiting docs). A limit
+ * smaller than this is that window, whatever its Reset header seems to say.
+ *
+ * 🛑 2026-10-14: on the 228-item Darden import the push kept stopping as if the
+ * hourly limit were spent, and pressing Create a few seconds later carried on.
+ * The stop came from trusting X-Rate-Limit-Reset alone: a reset that read as
+ * minutes away was taken for the hourly limit. Only a reported limit of
+ * hourly scale (this tenant: 3,600) can mean a long wait now; anything else is
+ * capped to the spike window.
+ */
+export const SPIKE_WINDOW_MS = 10_000;
+export const HOURLY_SCALE_LIMIT = 600;
+
+/** The reset a response really implies: never further than the spike window unless the limit is hourly-scale. */
+export function plausibleReset(limit: number | null, resetAt: number | null, now: number): number | null {
+  if (resetAt === null) return null;
+  if (limit !== null && limit >= HOURLY_SCALE_LIMIT) return resetAt;
+  return Math.min(resetAt, now + SPIKE_WINDOW_MS + 1_000);
+}
+
 /** The reserve for the window Procore reported: a tenth of it, capped. */
 export function reserveFor(q: QuotaSnapshot | null): number {
   if (!q || q.limit === null) return QUOTA_RESERVE;
@@ -82,7 +103,7 @@ export function resetAtFromHeader(value: string | null, now: number): number | n
 export function readQuota(headers: { get(name: string): string | null }, now: number): QuotaSnapshot | null {
   const limit = num(headers.get('X-Rate-Limit-Limit'));
   const remaining = num(headers.get('X-Rate-Limit-Remaining'));
-  const resetAt = resetAtFromHeader(headers.get('X-Rate-Limit-Reset'), now);
+  const resetAt = plausibleReset(limit, resetAtFromHeader(headers.get('X-Rate-Limit-Reset'), now), now);
   if (limit === null && remaining === null) return null;
   return { limit, remaining, resetAt, observedAt: now };
 }

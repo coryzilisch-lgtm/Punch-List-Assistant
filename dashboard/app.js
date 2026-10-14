@@ -12,6 +12,7 @@
 
 import { loadPdf, processPage } from './pdf-pipeline.js';
 import { byLastName } from './name-sort.js';
+import { deleteImport, loadImports, saveImport } from './saved-imports.js';
 
 const STEPS = ['project', 'upload', 'review', 'send'];
 
@@ -545,6 +546,17 @@ async function loadQuota({ maxAgeMs = 0 } = {}) {
 const SHORT_RESET_MS = 90_000;
 /** Waits in a row without anything being created before the push gives up. */
 const MAX_IDLE_WAITS = 5;
+/** ~2 Procore requests a second: under the 25-per-10-seconds spike limit, with room for anything else. */
+const PACE_MS_PER_REQUEST = 500;
+
+/**
+ * When to retry after a 429 that did not say when its window resets: the end of
+ * Procore's 10-second spike window, plus jitter so a retry does not land on
+ * the same instant as everything else (Procore's docs: backoff with jitter).
+ */
+function spikeReset() {
+  return Date.now() + 11_000 + Math.floor(Math.random() * 1_500);
+}
 
 function resetIsSoon(q) {
   return Boolean(q?.resetAt) && q.resetAt - Date.now() <= SHORT_RESET_MS;
@@ -553,13 +565,65 @@ function resetIsSoon(q) {
 /** Hold the push until Procore's window resets, showing the countdown. */
 async function waitForReset(resetAt, done, total) {
   const until = Math.max(resetAt || 0, Date.now() + 1000) + 1000;
-  while (Date.now() < until) {
-    const secs = Math.ceil((until - Date.now()) / 1000);
-    $('send-progress').innerHTML =
-      `<div class="progress-track"><div class="progress-fill" style="width:${(done / total) * 100}%"></div></div>` +
-      `<div class="muted">${done} of ${total} processed · waiting for Procore's rate limit, carrying on in ${secs}s…</div>`;
-    await new Promise((r) => setTimeout(r, Math.min(1000, until - Date.now())));
-  }
+  await pauseUntil(until, 'limit', done, total);
+}
+
+/** "4:07", or "1:02:07" past an hour. */
+function clock(ms) {
+  const total = Math.max(0, Math.ceil(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = String(total % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${s}` : `${m}:${s}`;
+}
+
+/**
+ * The push's progress line: how far, how long it has run, and, while it is
+ * paused, how long until it carries on. Redrawn every second while a push runs
+ * (Cory, 2026-10-14: "give a time elapsed, and a time until resumption").
+ */
+const P = { start: 0, done: 0, total: 0, pausedUntil: 0, why: null, ticker: null };
+
+function renderProgress() {
+  const el = $('send-progress');
+  if (!el || !P.start) return;
+  const pct = P.total ? (P.done / P.total) * 100 : 0;
+  const paused = P.pausedUntil > Date.now();
+  const pause = !paused
+    ? ''
+    : P.why === 'limit'
+      ? `<div class="progress-pause">Paused for Procore's rate limit · resumes in <strong>${clock(P.pausedUntil - Date.now())}</strong></div>`
+      : `<div class="progress-pause muted">Pacing to stay under Procore's limit of 25 requests per 10 seconds · next batch in <strong>${clock(P.pausedUntil - Date.now())}</strong></div>`;
+  el.innerHTML =
+    `<div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>` +
+    `<div class="progress-line"><span>${P.done} of ${P.total} processed</span>` +
+    `<span>Elapsed <strong id="push-elapsed">${clock(Date.now() - P.start)}</strong></span></div>` +
+    pause;
+}
+
+function startProgress(total) {
+  Object.assign(P, { start: Date.now(), done: 0, total, pausedUntil: 0, why: null });
+  clearInterval(P.ticker);
+  P.ticker = setInterval(renderProgress, 1000);
+  renderProgress();
+}
+
+function stopProgress() {
+  clearInterval(P.ticker);
+  P.ticker = null;
+  const took = P.start ? Date.now() - P.start : 0;
+  P.start = 0;
+  $('send-progress').innerHTML = '';
+  return took;
+}
+
+/** Wait until `until`, showing why and for how long. */
+async function pauseUntil(until, why, done, total) {
+  Object.assign(P, { done, total, pausedUntil: until, why });
+  renderProgress();
+  while (Date.now() < until) await new Promise((r) => setTimeout(r, Math.min(1000, until - Date.now())));
+  P.pausedUntil = 0;
+  renderProgress();
 }
 
 /** "2:40 PM" for an epoch-ms reset time; the super needs a clock time, not seconds. */
@@ -699,7 +763,7 @@ function chooseProject(id) {
   $('project-search').value = project.name;
   $('project-clear').hidden = false;
   openCombo(false);
-  selectProject(project.id);
+  return selectProject(project.id);
 }
 
 function clearProject() {
@@ -1879,6 +1943,8 @@ async function doPush(dryRun) {
   renderBar();
   S.results = [];
   S.quotaStop = null;
+  S.pushTook = null;
+  if (!dryRun) startProgress(selected.length);
   S.connectStop = false;
   S.connectNotAttempted = 0;
   S.safetyStop = null;
@@ -1915,8 +1981,10 @@ async function doPush(dryRun) {
   let idleWaits = 0;
   while (queue.length) {
     if (!dryRun && allowance <= 0) {
-      if (resetIsSoon(S.quota) && idleWaits < MAX_IDLE_WAITS) {
-        await waitForReset(S.quota.resetAt, done, selected.length);
+      // An unknown reset is the spike window, not a stop: Procore's docs say
+      // pause and retry with backoff. Only a known reset far off ends the push.
+      if ((!S.quota?.resetAt || resetIsSoon(S.quota)) && idleWaits < MAX_IDLE_WAITS) {
+        await waitForReset(S.quota?.resetAt || spikeReset(), done, selected.length);
         idleWaits += 1;
         // No /api/quota call here: that is a Procore request per wait. The next
         // batch's own response reports the quota, and the API refuses (before
@@ -1933,12 +2001,14 @@ async function doPush(dryRun) {
     const size = dryRun ? BATCH : done === 0 ? 1 : BATCH;
     const batch = queue.splice(0, dryRun ? size : Math.min(size, allowance));
 
-    $('send-progress').innerHTML =
-      `<div class="progress-track"><div class="progress-fill" style="width:${
-        (done / selected.length) * 100
-      }%"></div></div><div class="muted">${done} of ${selected.length} processed…</div>`;
+    if (!dryRun) {
+      Object.assign(P, { done, total: selected.length });
+      renderProgress();
+    }
 
     let stopped = false;
+    const batchStart = Date.now();
+    let batchRequests = 0;
     try {
       const res = await api('/api/push', {
         method: 'POST',
@@ -1956,6 +2026,7 @@ async function doPush(dryRun) {
       if (dryRun) payloads.push(...res.results.map((r) => r.payload));
       if (!dryRun) {
         S.procoreRequests += res.requests || 0;
+        batchRequests = res.requests || 0;
         if (res.createdAs) S.createdAs = res.createdAs;
         // The super's token expired mid-batch. The server sent nothing after it,
         // and Procore answers a 401 before writing, so those items stay selected.
@@ -1979,8 +2050,8 @@ async function doPush(dryRun) {
         const limited = res.results.filter((r) => r.rateLimited);
         if (res.results.some((r) => r.ok)) idleWaits = 0;
         if (limited.length) {
-          const resetAt = limited[0].resetAt ?? res.quota?.resetAt ?? null;
-          if (resetAt && resetAt - Date.now() <= SHORT_RESET_MS) {
+          const resetAt = limited[0].resetAt ?? res.quota?.resetAt ?? spikeReset();
+          if (resetAt - Date.now() <= SHORT_RESET_MS) {
             // Never written (Procore answers a 429 before doing anything), so
             // they go back to the front of the queue and the loop waits.
             requeue(limited.map((r) => r.clientId), resetAt);
@@ -2005,8 +2076,8 @@ async function doPush(dryRun) {
         for (const item of batch) {
           S.results.push({ clientId: String(item.id), ok: false, rateLimited: true, resetAt, error: err.message });
         }
-        if (resetAt && resetAt - Date.now() <= SHORT_RESET_MS) {
-          requeue(batch.map((i) => String(i.id)), resetAt);
+        if (!resetAt || resetAt - Date.now() <= SHORT_RESET_MS) {
+          requeue(batch.map((i) => String(i.id)), resetAt || spikeReset());
         } else {
           stopped = true;
           stopAt = resetAt;
@@ -2032,7 +2103,20 @@ async function doPush(dryRun) {
 
     done += batch.length;
     if (!dryRun) renderResults();
-    if (stopped) break;
+    if (stopped) break; // the end of the push saves, once the stop is final
+    // After every batch, not just at the end: a tab closed mid-push still
+    // leaves an accurate list of what Procore never received.
+    if (!dryRun) await persistUnfinished();
+
+    // Pace the batches: about two Procore requests a second, under the
+    // tenant's spike limit of 25 per 10 seconds. Batches can land on different
+    // server instances, so the server's own pacing cannot see them all. On the
+    // Darden import (2026-10-14) back-to-back batches met the spike window and
+    // the push stopped, though Create worked again seconds later.
+    if (!dryRun && queue.length && batchRequests) {
+      const gap = batchRequests * PACE_MS_PER_REQUEST - (Date.now() - batchStart);
+      if (gap > 0) await pauseUntil(Date.now() + gap, 'pace', done, selected.length);
+    }
   }
 
   if (!dryRun && S.safetyStop) {
@@ -2045,13 +2129,13 @@ async function doPush(dryRun) {
     S.quotaStop = { resetAt: stopAt, notAttempted: queue.length };
   }
 
-  $('send-progress').innerHTML = '';
+  if (dryRun) $('send-progress').innerHTML = '';
+  else S.pushTook = stopProgress();
   S.sending = false;
 
   if (dryRun) {
     $('dryrun').textContent = JSON.stringify(payloads, null, 2);
   } else {
-    renderResults();
     // Successfully created items are unchecked so a second press cannot create
     // duplicates — the most damaging mistake this tool could make, since a
     // duplicate punch item means two subs dispatched for one defect. Items the
@@ -2063,9 +2147,198 @@ async function doPush(dryRun) {
       }
     }
     renderItems();
+    // The screen is final before the save, so it never says "Stopped" beside a
+    // button still reading "Creating…". The save then only adds its own line.
+    renderResults();
+    renderBar();
+    await persistUnfinished();
+    renderResults();
   }
 
   renderBar();
+}
+
+// ── Unfinished imports: resume later, in this browser ───────────────────────
+//
+// When Procore's rate limit (or an expired connection) stops a push, the items
+// it never received are saved in this browser, photos and all. The results
+// screen counts down to the reset with one Resume button, and step 1 offers the
+// import again the next time the app is opened, even after the tab was closed.
+//
+// 🛑 Only items Procore NEVER received are saved: not the ones created, and not
+// the ones that "may already be in Procore". Resuming either would duplicate
+// punch items and email the same subs twice.
+
+const TAB_ID = Math.random().toString(36).slice(2);
+const LOCK_MS = 45_000;
+const lockKey = (projectId) => `pla:import-lock:${projectId}`;
+
+/** This tab is working on the project's import; another tab must not resume it too. */
+function holdImportLock(projectId) {
+  try {
+    localStorage.setItem(lockKey(projectId), JSON.stringify({ tab: TAB_ID, at: Date.now() }));
+  } catch {
+    // No storage: no lock, and no saved imports either.
+  }
+}
+
+function lockedElsewhere(projectId) {
+  try {
+    const lock = JSON.parse(localStorage.getItem(lockKey(projectId)) || 'null');
+    return Boolean(lock && lock.tab !== TAB_ID && Date.now() - lock.at < LOCK_MS);
+  } catch {
+    return false;
+  }
+}
+
+setInterval(() => {
+  if (S.project && (S.step === 'send' || S.sending)) holdImportLock(S.project.id);
+}, 15_000);
+
+/** Save what Procore has not received for this project, or clear the record when nothing is left. */
+async function persistUnfinished() {
+  if (!S.project) return;
+  holdImportLock(S.project.id);
+  const done = new Set(S.results.filter((r) => r.ok || r.uncertain).map((r) => r.clientId));
+  const remaining = S.items.filter((i) => i.include && i.title.trim() && !done.has(String(i.id)));
+  if (!remaining.length) {
+    await deleteImport(S.project.id);
+    S.importSaved = false;
+    return;
+  }
+  S.importSaved = await saveImport({
+    projectId: S.project.id,
+    projectName: S.project.name,
+    fileName: S.fileName,
+    owner: S.me?.email || null,
+    savedAt: Date.now(),
+    resetAt: S.quotaStop?.resetAt ?? null,
+    roles: S.roles,
+    items: remaining,
+  });
+}
+
+
+/** Step 1: offer any import this person left unfinished in this browser. */
+async function renderResumeCard() {
+  const card = $('resume-card');
+  if (!card) return;
+  const mine = (await loadImports()).filter((r) => !r.owner || !S.me?.email || r.owner === S.me.email);
+  if (!mine.length) {
+    card.style.display = 'none';
+    card.innerHTML = '';
+    return;
+  }
+  card.style.display = 'block';
+  card.innerHTML =
+    `<h2>Unfinished import${mine.length === 1 ? '' : 's'}</h2>` +
+    mine
+      .map((r) => {
+        const resetFar = r.resetAt && r.resetAt > Date.now();
+        const elsewhere = lockedElsewhere(r.projectId);
+        return `<div class="resume-row" data-project="${r.projectId}">
+          <div><strong>${r.items.length} item${r.items.length === 1 ? '' : 's'} not created yet</strong> for
+            <strong>${esc(r.projectName || `project ${r.projectId}`)}</strong>${r.fileName ? ` from ${esc(r.fileName)}` : ''}.
+            <span class="muted">Saved ${esc(clockTime(r.savedAt))}${
+              resetFar ? `; Procore's limit resets about ${esc(clockTime(r.resetAt))}` : ''
+            }.</span></div>
+          <div class="resume-actions">
+            ${
+              elsewhere
+                ? '<span class="muted">Open in another tab.</span>'
+                : `<button type="button" class="btn-primary" data-act="resume-import">Resume</button>`
+            }
+            <button type="button" class="btn-link" data-act="discard-import">Discard</button>
+          </div>
+        </div>`;
+      })
+      .join('');
+  card.querySelectorAll('[data-act="resume-import"]').forEach((b) =>
+    b.addEventListener('click', () => resumeImport(Number(b.closest('.resume-row').dataset.project))),
+  );
+  card.querySelectorAll('[data-act="discard-import"]').forEach((b) =>
+    b.addEventListener('click', async () => {
+      const id = Number(b.closest('.resume-row').dataset.project);
+      // eslint-disable-next-line no-alert
+      if (!window.confirm('Discard the saved items? Anything not yet in Procore will have to be read from the PDF again.')) return;
+      await deleteImport(id);
+      renderResumeCard();
+    }),
+  );
+}
+
+/** Load a saved import back in and go straight to the Create step. */
+async function resumeImport(projectId) {
+  const record = (await loadImports()).find((r) => r.projectId === projectId);
+  const card = $('resume-card');
+  if (!record) return renderResumeCard();
+  if (!S.projects.some((p) => p.id === projectId)) {
+    card.insertAdjacentHTML('beforeend', note('error', `That project is not in your project list any more, so the import cannot resume.`));
+    return;
+  }
+  if (lockedElsewhere(projectId)) return renderResumeCard();
+  holdImportLock(projectId);
+
+  await chooseProject(projectId);
+  S.items = record.items.map((i) => ({ ...i, include: true }));
+  nextItemId = Math.max(nextItemId, ...S.items.map((i) => i.id + 1));
+  S.fileName = record.fileName;
+  if (record.roles) S.roles = record.roles;
+  S.results = [];
+  S.quotaStop = null;
+  S.resumed = true;
+  card.style.display = 'none';
+
+  renderRoles();
+  renderDefaults();
+  renderItems();
+  if (!distGateOk()) {
+    // The gate was passed before the first push, in this browser; if it is gone,
+    // it is asked again rather than skipped.
+    renderBar();
+    $('dist-gate')?.scrollIntoView({ block: 'center' });
+    return;
+  }
+  renderSendSummary();
+  goto('send');
+  loadQuota();
+}
+
+let resumeTicker = null;
+
+/** The countdown and Resume button on a stopped push's results. */
+function renderResumeNow() {
+  const box = $('resume-now');
+  if (!box) return;
+  const resetAt = S.quotaStop?.resetAt ?? null;
+  const left = S.items.filter((i) => i.include && i.title.trim()).length;
+  const ready = !resetAt || resetAt <= Date.now();
+  box.innerHTML =
+    `<div class="resume-big">${left} item${left === 1 ? '' : 's'} still to create</div>` +
+    `<p>${
+      ready
+        ? "Procore's limit has reset. Pick up where it stopped:"
+        : `Procore's limit resets about <strong>${esc(clockTime(resetAt))}</strong>, in <strong id="resume-countdown">${clock(resetAt - Date.now())}</strong>.`
+    }</p>` +
+    `<button type="button" class="btn-primary btn-big" id="resume-push" ${ready && procoreConnected() ? '' : 'disabled'}>` +
+    `${ready ? `Resume: create the ${left} remaining` : `Resume unlocks at ${esc(clockTime(resetAt))}`}</button>` +
+    `<p class="muted">${
+      S.importSaved
+        ? 'They are saved in this browser, photos included. You can close this tab: the next time you open the app here, step 1 offers to resume.'
+        : 'Keep this tab open: they could not be saved in this browser.'
+    }</p>`;
+  $('resume-push')?.addEventListener('click', () => doPush(false));
+  clearInterval(resumeTicker);
+  // Tick only the countdown text each second; redraw the box (and so the
+  // button) once, when the reset arrives.
+  if (!ready) {
+    resumeTicker = setInterval(() => {
+      if (!document.contains(box)) return clearInterval(resumeTicker);
+      if (Date.now() >= resetAt) return renderResumeNow();
+      const c = $('resume-countdown');
+      if (c) c.textContent = clock(resetAt - Date.now());
+    }, 1_000);
+  }
 }
 
 function renderResults() {
@@ -2130,12 +2403,16 @@ function renderResults() {
     html += note(
       'warn',
       `<strong>Stopped at Procore's rate limit. ${notSent} item${notSent === 1 ? ' was' : 's were'} not created.</strong> ` +
-        'Nothing was written for them, so they are still selected. Press Create again after ' +
-        `${esc(clockTime(resetAt))}.${esc(which)}`,
+        'Nothing was written for them, so they are still selected and can be resumed.' +
+        `${esc(which)}`,
     );
+    if (!S.sending) html += '<div class="card resume-now" id="resume-now"></div>';
   }
   if (created.length && S.createdAs?.trim()) {
     html += note('info', `Created in Procore as <strong>${esc(S.createdAs)}</strong>. They are Drafts in your court.`);
+  }
+  if (S.pushTook && !S.sending) {
+    html += note('info', `This push ran for <strong>${clock(S.pushTook)}</strong>.`);
   }
   if (created.length && S.procoreRequests) {
     html += note(
@@ -2228,6 +2505,7 @@ function renderResults() {
     .join('');
 
   $('results').innerHTML = html;
+  renderResumeNow();
 }
 
 // ── Wiring ──────────────────────────────────────────────────────────────────
@@ -2355,6 +2633,7 @@ async function init() {
   renderBar();
   await loadProjects();
   preselectFromUrl();
+  renderResumeCard();
 }
 
 /**
