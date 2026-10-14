@@ -137,8 +137,12 @@ project default", the opposite). Assignees: the reference shows
 proof the tenant honours them, nor that an explicit empty list beats the
 project's Default Distribution List. Hence **the safety catch**: the dashboard
 sends the **first item alone**, and `/api/push` stops (`safetyStop`) at any
-item that reads back not Draft, unreadable, or with anyone in
-`distribution_members`. Everything after it is unsent and stays selected. The
+item that reads back unreadable or with anyone in `distribution_members`.
+**Initiated is accepted, not a stop** (Cory, 2026-10-14): *Item Created* emails
+the distribution group whether or not the item is a Draft, so Draft was never
+the protection; the distribution list is. The create still asks for Draft, and
+the results show an Initiated item as "emails its punch item manager". If
+"Someone else" is the manager, that is one email to them per item. Everything after it is unsent and stays selected. The
 worst case is one item's emails, not a whole list's. Tested in
 `send-safety.test.mjs` and `push-quota.test.mjs`, both confirmed failing with
 the catch removed.
@@ -155,6 +159,16 @@ dropped on this tenant (0 of 12 landed), and they have only ever arrived by
 `PATCH /punch_items/{id}` with `punch_item[attachments][]` (then `attachments[]`).
 It runs only when the read-back shows no photo, never throws, and adds an
 `after photos` step to the trail. `send-safety.test.mjs` holds both.
+
+**The distribution list gate (step 1), 2026-10-14.** The setting is per
+project and cannot be turned off company-wide (Cory), and no API for it was
+found. So after a project is picked, a loud card gives the steps (with a link to
+`app.procore.com/webclients/host/companies/{company}/projects/{id}/tools/punchlist/settings/general`;
+`/api/me` carries `companyId` for it) and Continue stays disabled until the super
+ticks that they unticked **Distribution Group** for Item Created and Item
+Initiated and saved. Remembered per project **in that browser only**
+(`localStorage`, `pla:dist-gate:{id}`): losing it asks again, the safe
+direction. It cannot verify the setting; the first-item safety stop does that.
 
 **Every pushed item needs a punch item manager.** `/api/push` refuses the whole
 batch (400, before any write) if any item lacks one, and the dashboard disables

@@ -161,14 +161,32 @@ test('a create with photos asks for Draft and an empty distribution list in the 
   assert.equal(form.get('punch_item[due_date]'), null);
 });
 
+test('an item that comes back initiated with an empty distribution list does not stop the push', async () => {
+  // Cory, 2026-10-14: Initiated is acceptable. Item Created emails the
+  // distribution group either way, so the list is what is guarded, not Draft.
+  let posts = 0;
+  const calls = mockFetch((c) => {
+    if (c.method === 'POST') return ok({ id: 100 + ++posts, workflow_status: 'initiated' });
+    return ok({ id: 101, status: 'Open', workflow_status: 'initiated', distribution_members: [] });
+  });
+  const res = await pushHandler(
+    signedIn({ projectId: 1, items: ['a', 'b', 'c'].map((clientId) => ({ clientId, name: `Item ${clientId}`, punchItemManagerId: 4410 })) }),
+    ctx,
+  );
+  assert.equal(calls.filter((c) => c.method === 'POST').length, 3);
+  assert.equal(res.jsonBody.safetyStop, undefined);
+  assert.deepEqual(res.jsonBody.results.map((r) => r.ok), [true, true, true]);
+});
+
 for (const [why, readBack, pattern] of [
-  ['comes back initiated', { workflow_status: 'initiated', distribution_members: [] }, /came back initiated/],
-  ['has people on its distribution list', { workflow_status: 'draft', distribution_members: [{ id: 1, name: 'Dana Sub' }] }, /Dana Sub/],
+  ['has people on its distribution list', { workflow_status: 'initiated', distribution_members: [{ id: 1, name: 'Dana Sub' }] }, /Dana Sub/],
+  ['cannot be read back', null, /could not be read back/],
 ]) {
   test(`an item that ${why} stops the push: nothing after it is sent`, async () => {
     let posts = 0;
     const calls = mockFetch((c) => {
-      if (c.method === 'POST') return ok({ id: 100 + ++posts, workflow_status: readBack.workflow_status });
+      if (c.method === 'POST') return ok({ id: 100 + ++posts, workflow_status: 'initiated' });
+      if (!readBack) return new Response('{}', { status: 404 });
       return ok({ id: 101, status: 'Open', ...readBack });
     });
     const res = await pushHandler(

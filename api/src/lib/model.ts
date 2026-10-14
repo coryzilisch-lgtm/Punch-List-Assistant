@@ -245,7 +245,12 @@ export function describeAiError(err: unknown): string {
   const message = err instanceof Error ? err.message : String(err);
 
   if (status === 401 || status === 403) {
-    return `Rejected (HTTP ${status}) — the API key is wrong, or it belongs to a different Azure resource than the one configured.`;
+    // Say which key, for the provider actually in use: this used to blame "a
+    // different Azure resource" on the direct API too, which sent people looking
+    // in the wrong place (2026-10-14).
+    return resolveProvider() === 'foundry'
+      ? `Rejected (HTTP ${status}): ANTHROPIC_FOUNDRY_API_KEY was refused, or it belongs to a different Azure resource than ANTHROPIC_FOUNDRY_RESOURCE.`
+      : `Rejected (HTTP ${status}): Anthropic refused ANTHROPIC_API_KEY. The key is wrong, revoked or disabled in the Anthropic Console, or its workspace was archived. Check the value in the Static Web App's Production environment variables against an active key.`;
   }
   if (status === 404) {
     return `Not found (HTTP 404) — usually the model id is not deployed in this resource, or the resource name is wrong.`;

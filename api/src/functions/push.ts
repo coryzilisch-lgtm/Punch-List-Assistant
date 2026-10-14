@@ -308,13 +308,15 @@ export async function pushHandler(
       // its distribution list, may have emailed them. That cannot be undone for
       // this item, but it must not happen to the next 227: stop here. An item
       // whose state could not be read is not proven quiet, so it stops too.
+      // Initiated is NOT a stop (Cory, 2026-10-14): Item Created emails the
+      // distribution group whether or not the item is a Draft, so Draft was never
+      // the protection. The distribution list is. An item that could not be read
+      // back is not proven to have an empty one, so it still stops.
       const reason = !observed
-        ? 'its Draft state could not be read back'
-        : observed.isDraft !== true
-          ? `it came back ${observed.workflowLabel || 'not a Draft'}`
-          : observed.distributionMembers.length
-            ? `it has people on its distribution list (${observed.distributionMembers.join(', ')})`
-            : null;
+        ? 'it could not be read back, so its distribution list is unconfirmed'
+        : observed.distributionMembers.length
+          ? `it has people on its distribution list (${observed.distributionMembers.join(', ')})`
+          : null;
       if (reason) safetyStop = { punchItemId: item.id, reason };
       // Log which strategy worked. Once the same one wins across a few real
       // projects, the chains in procore.ts can collapse to it.
