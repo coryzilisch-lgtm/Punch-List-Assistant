@@ -96,6 +96,8 @@ interface PushResult {
   procoreConnect?: boolean;
   /** Field-level messages straight from Procore, when it gave any. */
   fieldErrors?: string[];
+  /** Where the item stood at each step: the create's response, then the read-back. */
+  draftTrail?: Array<{ step: string; isDraft: boolean | null; label: string | null }>;
   /** Did the create's own response say what the read-back said? See compareEcho(). */
   echo?: { agrees: boolean | null; differs: string[] };
   /** Present on dry runs: the exact body that would be sent. */
@@ -276,7 +278,7 @@ export async function pushHandler(
 
     try {
       const created = await createPunchItem(body.projectId, input, photos);
-      const { item, photoErrors, photosAttached, assignErrors, assignStrategy, observed, echo } = created;
+      const { item, photoErrors, photosAttached, assignErrors, assignStrategy, observed, echo, draftTrail } = created;
       results.push({
         clientId: raw.clientId,
         ok: true,
@@ -287,6 +289,7 @@ export async function pushHandler(
         assignErrors: assignErrors.length ? assignErrors : undefined,
         observed: observed ?? undefined,
         echo,
+        draftTrail,
       });
       // Log which strategy worked. Once the same one wins across a few real
       // projects, the chains in procore.ts can collapse to it.
@@ -295,6 +298,7 @@ export async function pushHandler(
           `photos=${photosAttached}/${photos.length} status=${observed?.status ?? '?'} ` +
           `draft=${observed?.isDraft ?? '?'} ` +
           `assign=${assignStrategy ?? 'none'} bic=${observed?.ballInCourt.join('|') ?? '?'} ` +
+          `trail=${draftTrail.map((t) => `${t.step}:${t.label ?? '?'}`).join('>')} ` +
           `echo=${echo.agrees === null ? '?' : echo.agrees ? 'agrees' : `differs:${echo.differs.join('|')}`}`,
       );
     } catch (err) {

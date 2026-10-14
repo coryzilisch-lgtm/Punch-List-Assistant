@@ -169,3 +169,33 @@ test('a dry run without a punch item manager still previews', async () => {
   assert.equal(res.status ?? 200, 200);
   assert.equal(res.jsonBody.results.length, 1);
 });
+
+test('an assignee or photo that does not show on read-back gets no second write', async () => {
+  // 2026-10-14: a push came back Initiated at ~7 requests per item. The follow-up
+  // assignee and photo chains ran on every item, and a follow-up write is what
+  // can move a Draft to Initiated, which notifies the assignees. The create is
+  // the only write now; whatever did not stick is reported instead.
+  const calls = mockFetch((c) => {
+    if (c.method === 'POST' && c.path === '/rest/v1.1/punch_items') return ok({ id: 7, workflow_status: 'draft' });
+    // Read-back: a Draft with no assignee and no attachment visible.
+    return ok({ id: 7, status: 'Open', workflow_status: 'draft', has_attachments: false, attachments: [] });
+  });
+  const photo = 'data:image/jpeg;base64,' + Buffer.from('jpeg').toString('base64');
+  const res = await pushHandler(
+    signedIn({
+      projectId: 1,
+      items: [{ clientId: 'a', name: 'Cracked tile', punchItemManagerId: 4410, assigneeIds: [11921505], photos: [photo] }],
+    }),
+    ctx,
+  );
+
+  const writes = calls.filter((c) => c.method !== 'GET');
+  assert.deepEqual(writes.map((w) => `${w.method} ${w.path}`), ['POST /rest/v1.1/punch_items'], 'exactly one write');
+  const r = res.jsonBody.results[0];
+  assert.match(r.assignErrors.join(' '), /Set the assignee in Procore/);
+  assert.match(r.photoErrors.join(' '), /Add them in Procore/);
+  assert.deepEqual(
+    r.draftTrail.map((t) => `${t.step}:${t.label}`),
+    ['create response:draft', 'read-back:draft'],
+  );
+});

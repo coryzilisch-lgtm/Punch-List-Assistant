@@ -110,19 +110,46 @@ screen flags it in red: something notified people, and it was not this app.
 sending back without a decision from Cory: it is the one thing this app could do
 that reaches people outside Buffalo.
 
-⚠️ **Unresolved, 2026-10-12: creates are reading back `initiated`.** On the
-228-item Darden walkthrough import, all 147 items that landed read back
-`workflow_status: initiated`, ball in court on the service account. The create
-payload has **never** asked for a Draft (checked across the whole git history),
-so "every item is created as a Draft" was an assumption, not a tenant answer,
-and removing sending may not have removed what notified people on 10-01. Next
-step: `/api/inspect?project_id=…&punch_item_id=…` on one of those items, to see
-which field this tenant uses for Draft, then prove a Draft create by read-back.
+⚠️ **Unresolved: creates are reading back `initiated`.** On the 228-item
+Darden import (10-12) all 147 items read back `workflow_status: initiated`, and
+on 10-14, with items created as Cory on his own login, 11 of 11 did again. Cory
+confirmed **Initiated is what notifies people; Draft notifies no one.** The create
+payload has never asked for a Draft, so "every item is created as a Draft" was an
+assumption, not a tenant answer.
+
+🛑 **The create is now the only write, 2026-10-14.** The 10-14 push spent ~7
+requests per item, which was the assignee and photo follow-up chains: up to
+three `PATCH` / `POST` writes per item after the create whenever the read-back
+did not show the assignee or the photos. Any of those can move a Draft forward.
+They are gone (`ensureAssignees` never writes; `ensurePhotos` and the
+strategy chains were removed). A missing assignee or photo is reported on the
+results screen and set in Procore by hand. The only second request that writes is
+the JSON create retried after the multipart one is refused with a **4xx**, which
+created nothing. `api/test/send-safety.test.mjs` asserts exactly one write even
+when the read-back shows neither assignee nor photos.
+
+Each result carries `draftTrail`: what the **create response** and the
+**read-back** each said about Draft. The results screen prints it on any item
+flagged *Not a Draft*. Next step: push **one** item and read it. If the create
+response already says Initiated, the tenant initiates on create and the payload
+must ask for a Draft (find the field with `/api/inspect` on a Draft made by hand
+in Procore); if the create response says Draft and the read-back does not,
+something after the create moved it.
 
 **Every pushed item needs a punch item manager.** `/api/push` refuses the whole
 batch (400, before any write) if any item lacks one, and the dashboard disables
 Create until they are set. 81 items on that import went over with none. Dry runs
-are exempt. Final approver is still only a warning.
+are exempt. Final approver is still only a warning at the API.
+
+**The review step asks who the manager and final approver are** (Cory,
+2026-10-14). A card at the top offers **Me (name)** or **Someone else** for
+each, and Continue stays disabled until both name a person. The answer is
+written onto every item; a single row can still be changed below. "Me" is the
+signed-in super's row in the project directory, matched on `procoreUserId` from
+`/api/me`, then email (Procore login, then Entra). If they are not in the
+directory, "Me" is disabled and the card says so: an id Procore's directory
+does not hold is not one it will accept. The bulk card no longer carries these
+two fields. Covered in `tools/dashboard-test/push-quota.test.mjs`.
 
 A batch killed at 45s is also no longer shown as "rejected, still selected so
 you can resend": some of it may have been created. It is marked "may already be

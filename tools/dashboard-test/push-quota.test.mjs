@@ -12,7 +12,7 @@
  *    into it, and leaves everything not created selected.
  *
  * Everything runs through the real UI: pick the project, upload a PDF, set the
- * manager in the bulk card, press Create. Only `/api/*` is stubbed.
+ * manager and final approver, press Create. Only `/api/*` is stubbed.
  *
  *   node tools/dashboard-test/push-quota.test.mjs
  */
@@ -63,7 +63,10 @@ function onePagePdf() {
 }
 
 const CONFIG = {
-  users: [{ id: 4410, name: 'Pat Manager', company: 'Buffalo Construction Inc.' }],
+  users: [
+    { id: 4410, name: 'Pat Manager', company: 'Buffalo Construction Inc.', email: 'pat@buffaloconstruction.com' },
+    { id: 5520, name: 'Test Super', company: 'Buffalo Construction Inc.', email: 'test@buffaloconstruction.com' },
+  ],
   vendors: [],
   trades: [],
   punchItemTypes: [],
@@ -93,7 +96,7 @@ test.after(async () => {
 /** A super who has connected Procore, unless a test says otherwise. */
 const CONNECTED = () => ({
   email: 'test@buffaloconstruction.com',
-  procore: { configured: true, connected: true, name: 'Test Super', expiresAt: Date.now() + 3_600_000 },
+  procore: { configured: true, connected: true, name: 'Test Super', procoreUserId: 5520, expiresAt: Date.now() + 3_600_000 },
 });
 
 async function openApp({ quotaReply = quota(), onPush = () => ({ json: { results: [] } }), meReply = CONNECTED, extraRoutes = {} } = {}) {
@@ -149,12 +152,9 @@ async function toCreateStep(opts) {
   await page.waitForFunction(() => !document.getElementById('next-btn').disabled, null, { timeout: 20_000 });
   await page.click('#next-btn'); // → review
 
-  // The bulk card's manager picker, then Apply: the same thing a super does.
-  const combo = page.locator('input.namecombo[data-act="punchItemManagerId"][data-scope="default"]');
-  await combo.click();
-  await combo.fill('Pat');
-  await page.locator('#name-popup li[data-id="4410"]').click();
-  await page.click('#apply-defaults');
+  // The two questions at the top of the review step, answered "Me".
+  await page.check('input[name="role-punchItemManagerId"][value="me"]');
+  await page.check('input[name="role-finalApproverId"][value="me"]');
 
   await page.click('#next-btn'); // → create
   await page.waitForFunction(() => document.getElementById('send-summary').textContent.includes('rate limit') || document.getElementById('send-summary').textContent.includes('Drafts'));
@@ -547,6 +547,106 @@ test('opened at the callback address, Connect is offered as normal', async () =>
   try {
     await page.waitForSelector('#procore-connect');
     assert.doesNotMatch(await page.textContent('#procore-card'), /Open this app at/);
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
+// ── Who the items answer to ──────────────────────────────────────────────────
+//
+// The review step opens by asking who the punch item manager and final approver
+// are, "Me" or "Someone else", and does not continue until both are answered.
+
+async function toReview(opts) {
+  const ctx = await openApp(opts);
+  const { page } = ctx;
+  await page.waitForFunction(() => !document.getElementById('next-btn').disabled);
+  await page.click('#next-btn'); // → upload
+  await page.setInputFiles('#file-input', { name: 'list.pdf', mimeType: 'application/pdf', buffer: onePagePdf() });
+  await page.waitForFunction(() => !document.getElementById('next-btn').disabled, null, { timeout: 20_000 });
+  await page.click('#next-btn'); // → review
+  await page.waitForSelector('#roles-card fieldset.role');
+  return ctx;
+}
+
+/** Every item has gone to /api/push (it goes in batches). */
+async function allPushed(pushes) {
+  const until = Date.now() + 10_000;
+  while (pushes.flatMap((p) => p.items).length < ITEMS) {
+    if (Date.now() > until) throw new Error(`only ${pushes.flatMap((p) => p.items).length} of ${ITEMS} items were pushed`);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+const nextDisabled = (page) => page.evaluate(() => document.getElementById('next-btn').disabled);
+
+test('the review step cannot continue until both roles are answered, and "Me" is the signed-in super', async () => {
+  const { page, pushes, errors } = await toReview({ onPush: (body) => created(body) });
+  try {
+    assert.equal(await nextDisabled(page), true, 'nothing answered');
+    assert.match(await page.textContent('#bar-summary'), /punch item manager and final approver are/);
+    assert.match(await page.textContent('#roles-card'), /Me \(Test Super\)/);
+
+    await page.check('input[name="role-punchItemManagerId"][value="me"]');
+    assert.equal(await nextDisabled(page), true, 'final approver still unanswered');
+    await page.check('input[name="role-finalApproverId"][value="me"]');
+    assert.equal(await nextDisabled(page), false);
+
+    await page.click('#next-btn'); // → create
+    await page.waitForFunction(() => document.getElementById('send-summary').textContent.includes('Drafts'));
+    await page.click('#next-btn');
+    await allPushed(pushes);
+    const items = pushes.flatMap((p) => p.items);
+    assert.equal(items.length, ITEMS);
+    for (const it of items) {
+      assert.equal(it.punchItemManagerId, 5520);
+      assert.equal(it.finalApproverId, 5520);
+    }
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
+test('"Someone else" stays unanswered until a person is picked, then applies to every item', async () => {
+  const { page, pushes, errors } = await toReview({ onPush: (body) => created(body) });
+  try {
+    await page.check('input[name="role-punchItemManagerId"][value="me"]');
+    await page.check('input[name="role-finalApproverId"][value="other"]');
+    assert.equal(await nextDisabled(page), true, '"Someone else" with nobody picked is not an answer');
+
+    const combo = page.locator('input.namecombo[data-act="finalApproverId"][data-scope="role"]');
+    await combo.click();
+    await combo.fill('Pat');
+    await page.locator('#name-popup li[data-id="4410"]').click();
+    assert.equal(await nextDisabled(page), false);
+    assert.equal(await combo.inputValue(), 'Pat Manager');
+
+    await page.click('#next-btn');
+    await page.waitForFunction(() => document.getElementById('send-summary').textContent.includes('Drafts'));
+    await page.click('#next-btn');
+    await allPushed(pushes);
+    for (const it of pushes.flatMap((p) => p.items)) {
+      assert.equal(it.punchItemManagerId, 5520);
+      assert.equal(it.finalApproverId, 4410);
+    }
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
+test('a super who is not in the project directory cannot pick "Me", and is told why', async () => {
+  const { page, errors } = await toReview({
+    meReply: () => ({
+      email: 'stranger@buffaloconstruction.com',
+      procore: { ...CONNECTED().procore, name: 'Stranger', procoreUserId: 9999, login: 'stranger@buffaloconstruction.com' },
+    }),
+  });
+  try {
+    assert.equal(await page.isDisabled('input[name="role-punchItemManagerId"][value="me"]'), true);
+    assert.match(await page.textContent('#roles-card'), /not in this project's directory/);
     assert.deepEqual(errors, []);
   } finally {
     await page.close();
