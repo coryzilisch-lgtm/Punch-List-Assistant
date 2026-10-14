@@ -137,8 +137,12 @@ project default", the opposite). Assignees: the reference shows
 proof the tenant honours them, nor that an explicit empty list beats the
 project's Default Distribution List. Hence **the safety catch**: the dashboard
 sends the **first item alone**, and `/api/push` stops (`safetyStop`) at any
-item that reads back not Draft, unreadable, or with anyone in
-`distribution_members`. Everything after it is unsent and stays selected. The
+item that reads back unreadable or with anyone in `distribution_members`.
+**Initiated is accepted, not a stop** (Cory, 2026-10-14): *Item Created* emails
+the distribution group whether or not the item is a Draft, so Draft was never
+the protection; the distribution list is. The create still asks for Draft, and
+the results show an Initiated item as "emails its punch item manager". If
+"Someone else" is the manager, that is one email to them per item. Everything after it is unsent and stays selected. The
 worst case is one item's emails, not a whole list's. Tested in
 `send-safety.test.mjs` and `push-quota.test.mjs`, both confirmed failing with
 the catch removed.

@@ -472,19 +472,6 @@ function clockTime(ms) {
 }
 
 /** Selected items with no punch item manager. Every pushed item must have one. */
-/**
- * What each step of the push said about Draft, e.g. "create response: Initiated,
- * read-back: Initiated". The create is the only write, so this says whether
- * Procore made the item Initiated on create or something changed it afterwards.
- */
-function draftTrailText(trail) {
-  if (!Array.isArray(trail) || !trail.length) return '';
-  const said = trail
-    .map((t) => `${t.step}: ${t.label || (t.isDraft === true ? 'Draft' : t.isDraft === false ? 'not Draft' : 'unknown')}`)
-    .join(', ');
-  return `<span class="muted"> (${esc(said)})</span>`;
-}
-
 function unmanagedCount() {
   return S.items.filter((i) => i.include && i.title.trim() && !i.punchItemManagerId).length;
 }
@@ -2013,8 +2000,8 @@ function renderResults() {
     const n = S.results.filter((r) => r.safetyStopped).length + (S.safetyStop.notAttempted || 0);
     html += note(
       'error',
-      `<strong>Stopped: an item did not come back as a quiet Draft</strong> (${esc(S.safetyStop.reason)}). ` +
-        'Procore may have emailed people about it. Check it in Procore, and check this project\'s ' +
+      `<strong>Stopped: an item may have emailed its distribution list</strong> (${esc(S.safetyStop.reason)}). ` +
+        'Check it in Procore, and check this project\'s ' +
         '<strong>Punch List → Settings → Email Notifications</strong> and Default Distribution List. ' +
         `${n} item${n === 1 ? ' was' : 's were'} not sent and ${n === 1 ? 'is' : 'are'} still selected.`,
     );
@@ -2101,13 +2088,10 @@ function renderResults() {
         if (isDraft === true) {
           bits.push('<span class="badge flat">Draft — send it from Procore</span>');
         } else if (isDraft === false) {
-          // This app never sends, so an item that read back out of Draft got there
-          // some other way — and leaving Draft is what notifies people. Say so.
-          bits.push(
-            `<span class="badge err">Not a Draft: ${esc(workflow || status || 'unknown')}</span>` +
-              '<span class="muted"> Procore may already have notified the assignees. Check this item in Procore.</span>' +
-              draftTrailText(r.draftTrail),
-          );
+          // Accepted (Cory, 2026-10-14): Procore initiates on create here, and an
+          // Initiated item emails its punch item manager. Said plainly, not as an
+          // error; the distribution list is what the push guards.
+          bits.push(`<span class="badge info">${esc(workflow || status || 'Not a Draft')}: emails its punch item manager</span>`);
         } else if (status) {
           bits.push(`<span class="badge flat">${esc(status)}</span>`);
         }

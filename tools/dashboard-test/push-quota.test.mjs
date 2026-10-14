@@ -683,11 +683,11 @@ test('"Connected as" falls back to the Microsoft account, never to nobody', asyn
 
 // ── The safety catch: the first item goes alone (2026-10-14) ────────────────
 //
-// An item that is created Initiated, or with people on its distribution list,
-// may have emailed them. That is how subs got hundreds of emails. The first item
-// goes alone, and anything but a quiet Draft stops the push there.
+// An item with people on its distribution list may have emailed them. That is
+// how subs got hundreds of emails. The first item goes alone, and a distribution
+// list on it stops the push there. (Initiated alone is accepted: Cory, 2026-10-14.)
 
-test('an item that does not come back a quiet Draft stops the push after one item', async () => {
+test('an item with people on its distribution list stops the push after one item', async () => {
   const { page, pushes, errors } = await toCreateStep({
     onPush: (body) => ({
       json: {
@@ -697,17 +697,17 @@ test('an item that does not come back a quiet Draft stops the push after one ite
           punchItemId: 501,
           observed: { isDraft: false, workflowLabel: 'initiated', distributionMembers: ['Dana Sub'] },
         })),
-        safetyStop: { punchItemId: 501, reason: 'it came back initiated' },
+        safetyStop: { punchItemId: 501, reason: 'it has people on its distribution list (Dana Sub)' },
         quota: null,
       },
     }),
   });
   try {
     await page.click('#next-btn');
-    await page.waitForFunction(() => /did not come back as a quiet Draft/.test(document.getElementById('results').textContent));
+    await page.waitForFunction(() => /may have emailed its distribution list/.test(document.getElementById('results').textContent));
     assert.deepEqual(pushes.map((p) => p.items.length), [1], 'one item, then nothing');
     const text = await page.textContent('#results');
-    assert.match(text, /it came back initiated/);
+    assert.match(text, /initiated: emails its punch item manager/);
     assert.match(text, /On its distribution list: Dana Sub/);
     assert.match(text, /11 items were not sent/);
     assert.doesNotMatch(text, /rate limit/i, 'a safety stop is not reported as a rate limit');
