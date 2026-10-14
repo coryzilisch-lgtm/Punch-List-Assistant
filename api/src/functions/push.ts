@@ -94,6 +94,8 @@ interface PushResult {
   resetAt?: number | null;
   /** Not sent: the super's Procore connection is missing or expired. Never written. */
   procoreConnect?: boolean;
+  /** Not sent, because an earlier item in the batch tripped the safety stop. */
+  safetyStopped?: boolean;
   /** Field-level messages straight from Procore, when it gave any. */
   fieldErrors?: string[];
   /** Where the item stood at each step: the create's response, then the read-back. */
@@ -198,8 +200,19 @@ export async function pushHandler(
   // Set when the super's token expires mid-batch: every later item is skipped
   // rather than sent into the same 401, which would spend quota on refusals.
   let connectLost = false;
+  /** Set when an item read back as something that notifies people: nothing more is sent. */
+  let safetyStop: { punchItemId: number; reason: string } | null = null;
 
   for (const raw of body.items) {
+    if (safetyStop) {
+      results.push({
+        clientId: raw.clientId,
+        ok: false,
+        safetyStopped: true,
+        error: 'Not sent: an earlier item did not come back as a quiet Draft, so the push stopped.',
+      });
+      continue;
+    }
     if (connectLost) {
       results.push({
         clientId: raw.clientId,
@@ -291,6 +304,18 @@ export async function pushHandler(
         echo,
         draftTrail,
       });
+      // 🛑 The safety catch. An item that is not a Draft, or that has people on
+      // its distribution list, may have emailed them. That cannot be undone for
+      // this item, but it must not happen to the next 227: stop here. An item
+      // whose state could not be read is not proven quiet, so it stops too.
+      const reason = !observed
+        ? 'its Draft state could not be read back'
+        : observed.isDraft !== true
+          ? `it came back ${observed.workflowLabel || 'not a Draft'}`
+          : observed.distributionMembers.length
+            ? `it has people on its distribution list (${observed.distributionMembers.join(', ')})`
+            : null;
+      if (reason) safetyStop = { punchItemId: item.id, reason };
       // Log which strategy worked. Once the same one wins across a few real
       // projects, the chains in procore.ts can collapse to it.
       context.log(
@@ -338,6 +363,7 @@ export async function pushHandler(
     // Whose account created these, so "created by the integration" is never a surprise.
     createdAs: currentProcoreSession()?.name ?? null,
     procoreConnect: connectLost || undefined,
+    safetyStop: safetyStop ?? undefined,
     requests: procoreRequestCount(),
     quota: quotaReport(Date.now()),
   });

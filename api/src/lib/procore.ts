@@ -1109,11 +1109,25 @@ export interface PunchPhoto {
  * dry-run path can show operators the exact body without sending it.
  */
 export function buildPunchItemPayload(input: PunchItemInput): Record<string, unknown> {
-  const item: Record<string, unknown> = { name: input.name };
+  const item: Record<string, unknown> = {
+    name: input.name,
+    // ✅ From Procore's Create Punch Item reference (pasted by Cory, 2026-10-14):
+    // `workflow_status` is accepted on create, and the tenant initiates an item
+    // that does not ask (9 of 9 read back `initiated` from the create itself).
+    // Initiated notifies people; Draft does not. Always ask for Draft.
+    workflow_status: 'draft',
+    // Explicitly nobody on the item's distribution list. The project's Default
+    // Distribution List is what emailed everyone on it: the Email Notifications
+    // settings send Item Created / Initiated to the "Distribution Group", which
+    // is the item's distribution members. The read-back checks it stayed empty.
+    distribution_member_ids: [],
+  };
 
   if (input.description) item.description = input.description;
   if (input.priority) item.priority = input.priority;
-  if (input.dueDate) item.due_date = input.dueDate;
+  // The request key is `due` (Procore's reference); `due_date` is the RESPONSE
+  // field, and sending it was filtered out without a word.
+  if (input.dueDate) item.due = input.dueDate;
   if (input.punchItemTypeId) item.punch_item_type_id = input.punchItemTypeId;
   if (input.locationId) item.location_id = input.locationId;
   if (input.tradeId) item.trade_id = input.tradeId;
@@ -1175,6 +1189,8 @@ export interface ObservedPunchItem {
   ballInCourt: string[];
   assignees: string[];
   punchItemManager: string | null;
+  /** Who is on the item's distribution list, which Procore emails per the project's settings. */
+  distributionMembers: string[];
 }
 
 /**
@@ -1268,6 +1284,7 @@ export function observedFromRow(row: Record<string, unknown>): ObservedPunchItem
     ballInCourt: namesOf(row.ball_in_court ?? row.ball_in_courts),
     assignees: namesOf(row.assignments ?? row.assignees),
     punchItemManager: nameOf(row.punch_item_manager),
+    distributionMembers: namesOf(row.distribution_members),
   };
 }
 
@@ -1318,6 +1335,10 @@ export async function observePunchItem(
 function appendNested(form: FormData, prefix: string, value: unknown): void {
   if (value === null || value === undefined) return;
   if (Array.isArray(value)) {
+    // An empty array must still be sent, as Rails' "empty list" form value:
+    // `distribution_member_ids: []` means nobody, and omitting it means "use
+    // the project's default list", which is the opposite.
+    if (!value.length) form.append(`${prefix}[]`, '');
     for (const entry of value) appendNested(form, `${prefix}[]`, entry);
     return;
   }
@@ -1366,13 +1387,57 @@ async function createWithPhotos(
 }
 
 /**
- * 🛑 There are no follow-up writes. This spot held the write-strategy chains:
- * after the create, up to three PATCH/POST attempts each to attach a photo or
- * set an assignee whenever the read-back did not show it. On 2026-10-14 a
- * user-level push came back Initiated at ~7 requests per item, and Initiated is
- * what notifies people. The create is now the only write in a push; anything
- * that did not stick on it is reported for the super to fix in Procore.
+ * Attaching photos to an item that already exists.
+ *
+ * On this tenant photos sent with the create are accepted and dropped: on
+ * 2026-10-14 a push with the create as its only write landed 0 of 12 photos.
+ * They have only ever arrived through this PATCH. It was removed for one push on
+ * the theory that it was what moved items to Initiated; that same push proved
+ * otherwise, because the create response itself already said `initiated`.
+ *
+ * So it is back, and it is the ONLY follow-up write, and it is narrow: it runs
+ * only when the read-back shows no photo, it touches nothing but attachments,
+ * it never throws (the item exists; failing the row would invite a duplicate on
+ * the next press), and its effect on Draft is recorded in the draft trail.
+ * The assignee chain stays gone.
  */
+const ATTACH_PARTS = ['punch_item[attachments][]', 'attachments[]'] as const;
+/** The part name that worked last, per super. Steady state is one PATCH. */
+const attachWinner = new Map<string, (typeof ATTACH_PARTS)[number]>();
+
+async function attachPhotos(
+  projectId: number,
+  punchItemId: number,
+  photos: PunchPhoto[],
+): Promise<{ attached: boolean; observed: ObservedPunchItem | null; errors: string[] }> {
+  const errors: string[] = [];
+  const known = attachWinner.get(actorKey());
+  const order = known ? [known, ...ATTACH_PARTS.filter((p) => p !== known)] : [...ATTACH_PARTS];
+  let observed: ObservedPunchItem | null = null;
+  for (const part of order) {
+    const form = new FormData();
+    form.append('project_id', String(projectId));
+    for (const photo of photos) {
+      form.append(part, new Blob([new Uint8Array(photo.bytes)], { type: photo.contentType }), photo.filename);
+    }
+    try {
+      await procoreRequest('PATCH', `/rest/v1.1/punch_items/${punchItemId}`, { query: { project_id: projectId }, form });
+    } catch (err) {
+      errors.push(`PATCH ${part}: ${describeError(err)}`);
+      // A refusal of this part name may mean the other one works. Anything else
+      // (a rate limit, a 5xx, a dropped connection) is not worth a second write.
+      if (err instanceof ProcoreError && err.status >= 400 && err.status < 500 && err.status !== 401 && err.status !== 429) continue;
+      return { attached: false, observed, errors };
+    }
+    observed = await observePunchItem(projectId, punchItemId).catch(() => null);
+    if (storedPhotos(observed) > 0) {
+      attachWinner.set(actorKey(), part);
+      return { attached: true, observed, errors: [] };
+    }
+    errors.push(`PATCH ${part}: accepted but stored no attachment`);
+  }
+  return { attached: false, observed, errors };
+}
 
 function describeError(err: unknown): string {
   return err instanceof ProcoreError
@@ -1492,17 +1557,17 @@ export async function createPunchItem(
     { step: 'read-back', isDraft: observed?.isDraft ?? null, label: observed?.workflowLabel ?? null },
   ];
 
-  // 🛑 No follow-up write. A photo that did not land on the create used to be
-  // PATCHed on afterwards; a follow-up write is exactly what can move a Draft
-  // to Initiated, and Initiated notifies the assignees. The create is the only
-  // write: a missing photo is reported, and the super adds it in Procore.
-  const photosAttached = storedPhotos(observed);
-  if (photos.length && created?.id && observed && photosAttached === 0 && !observed.hasAttachments) {
-    photoErrors.push(
-      `${photos.length} photo(s) did not attach on create. This app does not make a second write to add them, ` +
-        'because that can move the item out of Draft. Add them in Procore.',
-    );
+  // Photos the create dropped go on with one PATCH (see attachPhotos). It is
+  // the only follow-up write, and the trail records where Draft stood after it.
+  if (photos.length && created?.id && observed && storedPhotos(observed) === 0) {
+    const attached = await attachPhotos(projectId, created.id, photos);
+    if (attached.observed) observed = attached.observed;
+    draftTrail.push({ step: 'after photos', isDraft: observed?.isDraft ?? null, label: observed?.workflowLabel ?? null });
+    if (!attached.attached) {
+      photoErrors.push(`${photos.length} photo(s) did not attach (${attached.errors.join('; ')}). Add them in Procore.`);
+    }
   }
+  const photosAttached = storedPhotos(observed);
 
   let assignErrors: string[] = [];
   let assignStrategy: string | null = null;
@@ -1532,7 +1597,7 @@ export async function createPunchItem(
 }
 
 export interface DraftStep {
-  step: 'create response' | 'read-back';
+  step: 'create response' | 'read-back' | 'after photos';
   isDraft: boolean | null;
   label: string | null;
 }

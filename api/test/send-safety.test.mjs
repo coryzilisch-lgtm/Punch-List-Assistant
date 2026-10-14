@@ -42,7 +42,7 @@ function mockFetch(handler) {
       return new Response(JSON.stringify({ access_token: 't', expires_in: 7200 }), { status: 200 });
     }
     const body = typeof init.body === 'string' ? init.body : '';
-    const call = { method: init.method || 'GET', path: u.pathname, body };
+    const call = { method: init.method || 'GET', path: u.pathname, body, form: init.body instanceof FormData ? init.body : null };
     calls.push(call);
     return handler(call);
   };
@@ -137,9 +137,53 @@ test('a push creates the item and makes no send write of any kind', async () => 
   );
   for (const c of calls) {
     assert.ok(!/\/send\b/.test(c.path), `send endpoint called: ${c.path}`);
-    assert.ok(!/workflow_status|"draft"\s*:/.test(c.body), `workflow write: ${c.body}`);
   }
+  // The only workflow state this app ever writes is Draft, on the create.
+  const sent = JSON.parse(writes[0].body);
+  assert.equal(sent.punch_item.workflow_status, 'draft');
+  assert.deepEqual(sent.punch_item.distribution_member_ids, []);
 });
+
+test('a create with photos asks for Draft and an empty distribution list in the form too', async () => {
+  const calls = mockFetch((c) => {
+    if (c.method === 'POST') return ok({ id: 7, workflow_status: 'draft' });
+    return ok({ id: 7, workflow_status: 'draft', has_attachments: true, attachments: [{ id: 1 }], distribution_members: [] });
+  });
+  const photo = 'data:image/jpeg;base64,' + Buffer.from('jpeg').toString('base64');
+  await pushHandler(
+    signedIn({ projectId: 1, items: [{ clientId: 'a', name: 'Cracked tile', punchItemManagerId: 4410, dueDate: '2026-11-01', photos: [photo] }] }),
+    ctx,
+  );
+  const form = calls.find((c) => c.method === 'POST').form;
+  assert.equal(form.get('punch_item[workflow_status]'), 'draft');
+  assert.deepEqual(form.getAll('punch_item[distribution_member_ids][]'), [''], 'an explicit empty list, not an omitted one');
+  assert.equal(form.get('punch_item[due]'), '2026-11-01', 'the request key is due, not due_date');
+  assert.equal(form.get('punch_item[due_date]'), null);
+});
+
+for (const [why, readBack, pattern] of [
+  ['comes back initiated', { workflow_status: 'initiated', distribution_members: [] }, /came back initiated/],
+  ['has people on its distribution list', { workflow_status: 'draft', distribution_members: [{ id: 1, name: 'Dana Sub' }] }, /Dana Sub/],
+]) {
+  test(`an item that ${why} stops the push: nothing after it is sent`, async () => {
+    let posts = 0;
+    const calls = mockFetch((c) => {
+      if (c.method === 'POST') return ok({ id: 100 + ++posts, workflow_status: readBack.workflow_status });
+      return ok({ id: 101, status: 'Open', ...readBack });
+    });
+    const res = await pushHandler(
+      signedIn({
+        projectId: 1,
+        items: ['a', 'b', 'c'].map((clientId) => ({ clientId, name: `Item ${clientId}`, punchItemManagerId: 4410 })),
+      }),
+      ctx,
+    );
+    assert.equal(calls.filter((c) => c.method === 'POST').length, 1, 'one item, then stop');
+    assert.match(res.jsonBody.safetyStop.reason, pattern);
+    assert.deepEqual(res.jsonBody.results.map((r) => r.ok), [true, false, false]);
+    assert.ok(res.jsonBody.results.slice(1).every((r) => r.safetyStopped));
+  });
+}
 
 test('a push with an item missing its punch item manager is refused before anything is written', async () => {
   // The whole batch, not just the bad row: refusing before any write is what
@@ -170,32 +214,55 @@ test('a dry run without a punch item manager still previews', async () => {
   assert.equal(res.jsonBody.results.length, 1);
 });
 
-test('an assignee or photo that does not show on read-back gets no second write', async () => {
-  // 2026-10-14: a push came back Initiated at ~7 requests per item. The follow-up
-  // assignee and photo chains ran on every item, and a follow-up write is what
-  // can move a Draft to Initiated, which notifies the assignees. The create is
-  // the only write now; whatever did not stick is reported instead.
+test('an assignee that does not show on read-back gets no second write', async () => {
+  // The assignee chain made up to three writes per item after the create. It is
+  // gone: a missing assignee is reported for the super to set in Procore.
   const calls = mockFetch((c) => {
     if (c.method === 'POST' && c.path === '/rest/v1.1/punch_items') return ok({ id: 7, workflow_status: 'draft' });
-    // Read-back: a Draft with no assignee and no attachment visible.
     return ok({ id: 7, status: 'Open', workflow_status: 'draft', has_attachments: false, attachments: [] });
   });
-  const photo = 'data:image/jpeg;base64,' + Buffer.from('jpeg').toString('base64');
   const res = await pushHandler(
-    signedIn({
-      projectId: 1,
-      items: [{ clientId: 'a', name: 'Cracked tile', punchItemManagerId: 4410, assigneeIds: [11921505], photos: [photo] }],
-    }),
+    signedIn({ projectId: 1, items: [{ clientId: 'a', name: 'Cracked tile', punchItemManagerId: 4410, assigneeIds: [11921505] }] }),
     ctx,
   );
-
   const writes = calls.filter((c) => c.method !== 'GET');
   assert.deepEqual(writes.map((w) => `${w.method} ${w.path}`), ['POST /rest/v1.1/punch_items'], 'exactly one write');
   const r = res.jsonBody.results[0];
   assert.match(r.assignErrors.join(' '), /Set the assignee in Procore/);
-  assert.match(r.photoErrors.join(' '), /Add them in Procore/);
-  assert.deepEqual(
-    r.draftTrail.map((t) => `${t.step}:${t.label}`),
-    ['create response:draft', 'read-back:draft'],
+  assert.deepEqual(r.draftTrail.map((t) => `${t.step}:${t.label}`), ['create response:draft', 'read-back:draft']);
+});
+
+test('photos the create dropped get one attachments PATCH, never a send, and the trail records it', async () => {
+  // 2026-10-14: with the create as the only write, 0 of 12 photos landed. The
+  // create response already said initiated, so the PATCH was not the cause.
+  let patched = false;
+  const calls = mockFetch((c) => {
+    if (c.method === 'POST' && c.path === '/rest/v1.1/punch_items') return ok({ id: 7, workflow_status: 'initiated' });
+    if (c.method === 'PATCH') {
+      patched = true;
+      return ok({ id: 7 });
+    }
+    return ok({
+      id: 7,
+      status: 'Open',
+      workflow_status: 'initiated',
+      has_attachments: patched,
+      attachments: patched ? [{ id: 1, name: 'p.jpg' }] : [],
+    });
+  });
+  const photo = 'data:image/jpeg;base64,' + Buffer.from('jpeg').toString('base64');
+  const res = await pushHandler(
+    signedIn({ projectId: 1, items: [{ clientId: 'a', name: 'Cracked tile', punchItemManagerId: 4410, photos: [photo] }] }),
+    ctx,
   );
+  const writes = calls.filter((c) => c.method !== 'GET');
+  assert.deepEqual(
+    writes.map((w) => `${w.method} ${w.path}`),
+    ['POST /rest/v1.1/punch_items', 'PATCH /rest/v1.1/punch_items/7'],
+  );
+  assert.ok(!calls.some((c) => /\/send\b/.test(c.path)));
+  const r = res.jsonBody.results[0];
+  assert.equal(r.photosAttached, 1);
+  assert.ok(!r.photoErrors?.length);
+  assert.deepEqual(r.draftTrail.map((t) => t.step), ['create response', 'read-back', 'after photos']);
 });
