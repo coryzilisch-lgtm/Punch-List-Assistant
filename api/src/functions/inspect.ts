@@ -16,6 +16,8 @@ import { fabricConfigured, findVendorTables } from '../lib/fabric';
 
 /**
  * GET /api/inspect?project_id=123[&punch_item_id=274] — read Procore's own shapes.
+ *   &punch_item_number=953   find an item by the number Procore's list shows
+ *   &history=1               who moved it and when (with either of the above)
  *
  * Why this exists, bluntly: this integration has now written to Procore three
  * times, been answered 200 three times, and stored nothing three times —
@@ -406,9 +408,74 @@ export async function inspectHandler(
     return json({ projectId, uploads: await probeUploads(projectId) });
   }
 
+  // Find an item by the number Procore's list shows ("#953"), which is what a
+  // super has in front of them; every other mode wants the internal id.
+  const number = Number(request.query.get('punch_item_number') || 0);
+  let itemId = punchItemId;
+  if (!itemId && number) {
+    const rows = await listPunchItems(projectId).catch(() => [] as Row[]);
+    const hit = rows.find((r) => Number(r.position) === number || Number(r.number) === number);
+    if (!hit) return errorResponse(404, `No punch item numbered ${number} was found on project ${projectId}.`);
+    itemId = Number(hit.id);
+  }
+
+  // Who moved an item, and when. Asked on 2026-10-14 when #953 turned up Work
+  // Required with nobody admitting to sending it. Procore's history endpoint
+  // for punch items is not known from here, so this asks a few read-only
+  // candidates and reports every answer, the same way list discovery does.
+  if (itemId && request.query.get('history')) {
+    const candidates = [
+      { label: 'GET /rest/v1.0/projects/{p}/punch_items/{id}/change_history', path: `/rest/v1.0/projects/${projectId}/punch_items/${itemId}/change_history`, query: {} },
+      { label: 'GET /rest/v1.1/punch_items/{id}/change_history', path: `/rest/v1.1/punch_items/${itemId}/change_history`, query: { project_id: projectId } },
+      { label: 'GET /rest/v1.0/punch_items/{id}/change_history', path: `/rest/v1.0/punch_items/${itemId}/change_history`, query: { project_id: projectId } },
+      { label: 'GET /rest/v1.0/punch_items/{id}/history', path: `/rest/v1.0/punch_items/${itemId}/history`, query: { project_id: projectId } },
+    ];
+    const answers: Array<{ label: string; status: number | 'ok'; rows?: number; sample?: unknown; error?: string }> = [];
+    for (const c of candidates) {
+      try {
+        const body = await procoreRequest<unknown>('GET', c.path, { query: c.query });
+        const rows = Array.isArray(body) ? body : null;
+        answers.push({ label: c.label, status: 'ok', rows: rows?.length, sample: rows ? rows.slice(-20) : body });
+        if (rows && rows.length) break; // a history with rows answers the question
+      } catch (err) {
+        answers.push({
+          label: c.label,
+          status: err instanceof ProcoreError ? err.status : 0,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        // A rate limit or an outage is not an answer about the path.
+        if (err instanceof ProcoreError && (err.status === 429 || err.status >= 500)) break;
+      }
+    }
+    // The item as it stands now, for the fields that say who did what last.
+    const item = await procoreRequest<Row>('GET', `/rest/v1.1/punch_items/${itemId}`, { query: { project_id: projectId } }).catch(() => null);
+    const pick = (k: string) => (item ? item[k] : undefined);
+    return json({
+      projectId,
+      punchItemId: itemId,
+      punchItemNumber: number || pick('position') || null,
+      now: item
+        ? {
+            workflow_status: pick('workflow_status'),
+            created_by: pick('created_by'),
+            created_at: pick('created_at'),
+            updated_at: pick('updated_at'),
+            date_initiated: pick('date_initiated'),
+            punch_item_manager: pick('punch_item_manager'),
+            ball_in_court: pick('ball_in_court'),
+            assignments: pick('assignments'),
+            distribution_members: pick('distribution_members'),
+          }
+        : null,
+      history: answers,
+      requests: procoreRequestCount(),
+    });
+  }
+
   // Single-item mode: dump one item verbatim. Used to read back an item this app
   // created, and to compare it field-by-field against one Procore's UI created.
-  if (punchItemId) {
+  if (itemId) {
+    const punchItemId = itemId;
     try {
       const item = await procoreRequest<Row>('GET', `/rest/v1.1/punch_items/${punchItemId}`, {
         query: { project_id: projectId },

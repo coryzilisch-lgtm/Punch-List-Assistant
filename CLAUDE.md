@@ -64,7 +64,7 @@ So:
 | Fact | Detail |
 |---|---|
 | `workflow_status` is the Draft/Initiated field | `draft` → `initiated` → … → `closed`. **`status` is `Open`/`Closed`** and says nothing about the workflow. The first send step gated on `status === 'draft'`, so it never ran and reported nothing. |
-| The assignee key is `login_information_id` | **Not** `assignee_id`. The obvious name is the wrong one, accepted and filtered out. Locked down by a test in `api/test/punch-payload.test.mjs`. |
+| Assignees go as top-level `login_information_ids` on create | From Procore's Create Punch Item reference (pasted by Cory, 2026-10-14). **Not** `assignee_id` (accepted and filtered out), and never alongside the nested `assignments[].login_information_id` (read off a stored row, not the request contract; both together could assign a person twice). A company with no person keeps `assignments: [{vendor_id}]`. Locked by `api/test/punch-payload.test.mjs`; not yet confirmed by a tenant read-back. |
 | The photo file part is `punch_item[attachments][]` | **Not** `images[]` — `images` is an empty array even on items that have photos. `has_attachments` is the boolean to trust; `web_images` mirrors `attachments`. |
 | Ball-in-court is derived, never writable | A **Draft** sits with its **creator**; an **initiated** item with its **assignee**. Naming a punch item manager does not move it (item #274 proves it). |
 | Items are created as the super, never a robot | User-level OAuth, built 2026-10-14 (see **Who items are created by**). **No service-account fallback**, by Cory's decision: an unconnected super cannot push. (The old service account could not act as a user: all four impersonation headers were probed and ignored.) |
@@ -317,6 +317,9 @@ docs/procore-oauth.md           acting as the superintendent instead of the robo
 ?project_id=123&punch_item_id=N  dump one item verbatim
 ?project_id=123&lists=1          which list paths this tenant serves + vendor sources
 ?project_id=123&uploads=1        does the direct-upload flow exist here
+?project_id=123&punch_item_number=953&history=1
+                                 who moved #953 and when: read-only candidate
+                                 change-history paths, each answer reported
 ?as_user=<procore user id>       can the service account act as a person (answer: no)
 ```
 

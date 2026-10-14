@@ -1143,14 +1143,22 @@ export function buildPunchItemPayload(input: PunchItemInput): Record<string, unk
   // view spells the scalar out as `login_information_id`. A Rails controller
   // filters an unpermitted key without complaining, which is exactly the shape
   // of the failure that was seen — 200, and no assignee.
+  //
+  // ✅ Procore's Create Punch Item reference (pasted by Cory, 2026-10-14) names
+  // the create field: top-level `login_information_ids`. The nested
+  // `assignments[].login_information_id` form was read off a stored row, not
+  // the request contract, and with the follow-up assignee writes gone it is the
+  // reference's field or nothing. Sent alone, never both: if both were
+  // permitted, one person could be assigned twice. The read-back reports
+  // whether it stuck.
+  //
+  // A company with no person has no documented create field, so it keeps the
+  // nested form, the only shape known for it.
   const assignees = input.assigneeIds || [];
-  if (assignees.length || input.vendorId) {
-    item.assignments = assignees.length
-      ? assignees.map((id) => ({
-          login_information_id: id,
-          ...(input.vendorId ? { vendor_id: input.vendorId } : {}),
-        }))
-      : [{ vendor_id: input.vendorId }];
+  if (assignees.length) {
+    item.login_information_ids = assignees;
+  } else if (input.vendorId) {
+    item.assignments = [{ vendor_id: input.vendorId }];
   }
 
   return item;

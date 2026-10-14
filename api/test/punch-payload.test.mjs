@@ -15,22 +15,26 @@ import { buildPunchItemPayload } from '../dist/lib/procore.js';
  * comment — a future "tidy up" that renames this back would otherwise ship
  * looking exactly like success.
  */
-test('an assignee is sent as login_information_id', () => {
+test('an assignee is sent as login_information_ids, the create field Procore documents', () => {
+  // 2026-10-14: Procore's Create Punch Item reference names it. Never
+  // `assignee_id`, and never alongside the nested form, which could assign one
+  // person twice.
   const payload = buildPunchItemPayload({ name: 'Cracked tile', assigneeIds: [11921505] });
-  assert.deepEqual(payload.assignments, [{ login_information_id: 11921505 }]);
-  assert.ok(!('assignee_id' in payload.assignments[0]));
+  assert.deepEqual(payload.login_information_ids, [11921505]);
+  assert.ok(!('assignments' in payload));
+  assert.ok(!('assignee_id' in payload));
 });
 
-test('a vendor rides along with the assignee when one was chosen', () => {
-  const payload = buildPunchItemPayload({
-    name: 'Cracked tile',
-    assigneeIds: [1, 2],
-    vendorId: 10263673,
-  });
-  assert.deepEqual(payload.assignments, [
-    { login_information_id: 1, vendor_id: 10263673 },
-    { login_information_id: 2, vendor_id: 10263673 },
-  ]);
+test('people chosen with their company go as people; the company follows the person', () => {
+  const payload = buildPunchItemPayload({ name: 'Cracked tile', assigneeIds: [1, 2], vendorId: 10263673 });
+  assert.deepEqual(payload.login_information_ids, [1, 2]);
+  assert.ok(!('assignments' in payload));
+});
+
+test('a company with no person keeps the nested form, the only shape known for it', () => {
+  const payload = buildPunchItemPayload({ name: 'Cracked tile', vendorId: 10263673 });
+  assert.deepEqual(payload.assignments, [{ vendor_id: 10263673 }]);
+  assert.ok(!('login_information_ids' in payload));
 });
 
 /**
@@ -41,4 +45,5 @@ test('a vendor rides along with the assignee when one was chosen', () => {
 test('no assignee and no vendor means no assignments key at all', () => {
   const payload = buildPunchItemPayload({ name: 'Cracked tile' });
   assert.ok(!('assignments' in payload));
+  assert.ok(!('login_information_ids' in payload));
 });
