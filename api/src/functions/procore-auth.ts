@@ -78,14 +78,19 @@ export async function callbackHandler(request: HttpRequest, context: InvocationC
     // Ask Procore who this token is: the name shown as "Connected as", and the
     // proof the token works before anything relies on it.
     const draft: ProcoreSession = { accessToken, expiresAt, owner, procoreUserId: null, name: null, login: null };
-    const me = await runAsProcoreUser(draft, () =>
-      procoreRequest<{ id?: number; name?: string; login?: string }>('GET', '/rest/v1.0/me'),
-    );
+    const me = await runAsProcoreUser(draft, () => procoreRequest<Record<string, unknown>>('GET', '/rest/v1.0/me'));
+    // The first live connect came back with no usable name (2026-10-14), so read
+    // every plausible field, and log which ones exist (names only, never values)
+    // so the real shape is on record.
+    context.log(`procore /me fields: ${Object.keys(me || {}).sort().join(',')}`);
+    const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : null);
+    const joined = [str(me?.first_name), str(me?.last_name)].filter(Boolean).join(' ') || null;
+    const login = str(me?.login) || str(me?.email_address) || str(me?.email);
     const session: ProcoreSession = {
       ...draft,
-      procoreUserId: typeof me?.id === 'number' ? me.id : null,
-      name: me?.name || me?.login || null,
-      login: me?.login || null,
+      procoreUserId: typeof me?.id === 'number' ? me.id : Number(me?.id) || null,
+      name: str(me?.name) || joined || login,
+      login,
     };
 
     const value = seal(session);

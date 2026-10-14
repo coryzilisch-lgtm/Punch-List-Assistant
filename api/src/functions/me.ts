@@ -29,6 +29,9 @@ export async function meHandler(request: HttpRequest): Promise<HttpResponseInit>
       connected: Boolean(session),
       name: session?.name ?? null,
       login: session?.login ?? null,
+      // Procore's id for this super, so the dashboard can default them as the
+      // punch item manager and final approver.
+      procoreUserId: session?.procoreUserId ?? null,
       expiresAt: session?.expiresAt ?? null,
     },
   });

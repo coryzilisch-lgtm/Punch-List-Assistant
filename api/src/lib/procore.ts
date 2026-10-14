@@ -1366,142 +1366,19 @@ async function createWithPhotos(
 }
 
 /**
- * One way of making a write stick. Procore answers 200 for writes it discards,
- * so each is judged by the read-back, never by its response.
+ * 🛑 There are no follow-up writes. This spot held the write-strategy chains:
+ * after the create, up to three PATCH/POST attempts each to attach a photo or
+ * set an assignee whenever the read-back did not show it. On 2026-10-14 a
+ * user-level push came back Initiated at ~7 requests per item, and Initiated is
+ * what notifies people. The create is now the only write in a push; anything
+ * that did not stick on it is reported for the super to fix in Procore.
  */
-interface WriteStrategy<A extends unknown[]> {
-  label: string;
-  run: (projectId: number, punchItemId: number, ...args: A) => Promise<void>;
-}
-
-/**
- * Remember what worked, and what could not be made to work.
- *
- * A push is up to ten items, and a punch list is sixty. Re-running a chain of
- * guesses per item would multiply both the wall clock (the Function is killed at
- * 45 seconds) and the Procore rate-limit budget by the length of the chain, for
- * an answer that cannot change between two items a second apart. So the first
- * item in a process pays for the discovery and every later one takes the short
- * path — including the unhappy short path, where the whole chain has already
- * been shown not to work and re-proving it just burns the quota.
- */
-const memo: {
-  assign: string | null;
-  attach: string | null;
-  /**
-   * Keyed by `actorKey()`. A strategy that WORKED is a fact about Procore's
-   * contract and holds for everyone; one that FAILED may have failed on this
-   * super's permissions, and must not stop the next super from trying.
-   */
-  assignFailure: Map<string, string[]>;
-  attachFailure: Map<string, string[]>;
-} = {
-  assign: null,
-  attach: null,
-  assignFailure: new Map(),
-  attachFailure: new Map(),
-};
-
-function ordered<A extends unknown[]>(list: Array<WriteStrategy<A>>, known: string | null) {
-  if (!known) return list;
-  const hit = list.find((s) => s.label === known);
-  return hit ? [hit, ...list.filter((s) => s !== hit)] : list;
-}
-
-/**
- * Run a chain of write strategies until the read-back proves one worked.
- *
- * Shared by photos, assignees and sending because all three had the same two
- * problems: Procore answers 200 for writes it discards, so only a read-back
- * counts; and re-proving the chain per item would multiply the 45-second budget
- * and the shared rate-limit quota by its length.
- *
- * A transient failure stops the chain WITHOUT recording a verdict. Falling
- * through to the next strategy on a 429 is worse than useless — it spends more
- * of the quota that is already exhausted, and then blames the contract for a
- * problem that was the clock.
- */
-async function runChain<A extends unknown[]>(
-  list: Array<WriteStrategy<A>>,
-  known: string | null,
-  projectId: number,
-  punchItemId: number,
-  args: A,
-  worked: (after: ObservedPunchItem | null) => boolean,
-  rejected: string,
-): Promise<{
-  strategy: string | null;
-  errors: string[];
-  observed: ObservedPunchItem | null;
-  transient: boolean;
-}> {
-  const errors: string[] = [];
-  for (const strategy of ordered(list, known)) {
-    try {
-      await strategy.run(projectId, punchItemId, ...args);
-      const after = await observePunchItem(projectId, punchItemId);
-      if (worked(after)) return { strategy: strategy.label, errors, observed: after, transient: false };
-      errors.push(`${strategy.label}: ${rejected}`);
-    } catch (err) {
-      errors.push(`${strategy.label}: ${describeError(err)}`);
-      if (isTransient(err)) return { strategy: null, errors, observed: null, transient: true };
-    }
-  }
-  return { strategy: null, errors, observed: null, transient: false };
-}
 
 function describeError(err: unknown): string {
   return err instanceof ProcoreError
     ? `${err.status} ${err.fieldErrors().join('; ') || summarize(err.body)}`
     : String(err);
 }
-
-/**
- * Attach photos to an item that already exists.
- *
- * Only runs when the create did not carry them, so in the happy path it costs
- * nothing. It exists because losing the photos is recoverable in the field and
- * losing the row is not: whatever happens here, the superintendent still has the
- * item in Procore and a report of what is missing from it.
- */
-const ATTACH_STRATEGIES: Array<WriteStrategy<[PunchPhoto[]]>> = [
-  {
-    label: 'PATCH punch_item[attachments][]',
-    run: async (projectId, punchItemId, photos) => {
-      const form = new FormData();
-      form.append('project_id', String(projectId));
-      for (const photo of photos) {
-        form.append(
-          'punch_item[attachments][]',
-          new Blob([new Uint8Array(photo.bytes)], { type: photo.contentType }),
-          photo.filename,
-        );
-      }
-      await procoreRequest('PATCH', `/rest/v1.1/punch_items/${punchItemId}`, {
-        query: { project_id: projectId },
-        form,
-      });
-    },
-  },
-  {
-    label: 'PATCH attachments[]',
-    run: async (projectId, punchItemId, photos) => {
-      const form = new FormData();
-      form.append('project_id', String(projectId));
-      for (const photo of photos) {
-        form.append(
-          'attachments[]',
-          new Blob([new Uint8Array(photo.bytes)], { type: photo.contentType }),
-          photo.filename,
-        );
-      }
-      await procoreRequest('PATCH', `/rest/v1.1/punch_items/${punchItemId}`, {
-        query: { project_id: projectId },
-        form,
-      });
-    },
-  },
-];
 
 /** How many photos Procore says it is holding, trusting its own flag first. */
 function storedPhotos(o: ObservedPunchItem | null): number {
@@ -1510,128 +1387,40 @@ function storedPhotos(o: ObservedPunchItem | null): number {
   return o.attachmentCount;
 }
 
-async function ensurePhotos(
-  projectId: number,
-  punchItemId: number,
-  photos: PunchPhoto[],
-  observed: ObservedPunchItem | null,
-): Promise<{ errors: string[]; observed: ObservedPunchItem | null }> {
-  if (!photos.length || storedPhotos(observed) > 0) return { errors: [], observed };
-  const knownAttachFailure = memo.attachFailure.get(actorKey());
-  if (knownAttachFailure) return { errors: knownAttachFailure, observed };
-
-  const run = await runChain(
-    ATTACH_STRATEGIES,
-    memo.attach,
-    projectId,
-    punchItemId,
-    [photos],
-    (after) => storedPhotos(after) > 0,
-    'accepted but stored no attachment',
-  );
-
-  if (run.strategy) {
-    memo.attach = run.strategy;
-    return { errors: [], observed: run.observed };
-  }
-  if (!run.transient) memo.attachFailure.set(actorKey(), run.errors);
-  return { errors: run.errors, observed };
-}
-
-const ASSIGN_STRATEGIES: Array<WriteStrategy<[number[], number | null]>> = [
-  {
-    // Rails nested attributes. The plain `assignments` array on create was
-    // accepted and stored nothing, which is exactly what a Rails controller does
-    // with a nested collection that is not named `*_attributes`.
-    label: 'PATCH assignments_attributes',
-    run: async (projectId, punchItemId, assigneeIds, vendorId) => {
-      await procoreRequest('PATCH', `/rest/v1.1/punch_items/${punchItemId}`, {
-        query: { project_id: projectId },
-        body: {
-          project_id: projectId,
-          punch_item: {
-            assignments_attributes: assigneeIds.map((id) => ({
-              login_information_id: id,
-              ...(vendorId ? { vendor_id: vendorId } : {}),
-            })),
-          },
-        },
-      });
-    },
-  },
-  {
-    // The nested path `/punch_items/{id}/punch_item_assignments` 404s with an
-    // empty body, so it does not exist. Procore's flat-URL-with-query-param shape
-    // is the same one that turned out to be correct for project_roles, where the
-    // nested form also answered emptily.
-    label: 'POST punch_item_assignments',
-    run: async (projectId, punchItemId, assigneeIds, vendorId) => {
-      for (const assigneeId of assigneeIds) {
-        await procoreRequest('POST', '/rest/v1.1/punch_item_assignments', {
-          query: { project_id: projectId },
-          body: {
-            project_id: projectId,
-            punch_item_assignment: {
-              punch_item_id: punchItemId,
-              login_information_id: assigneeId,
-              ...(vendorId ? { vendor_id: vendorId } : {}),
-            },
-          },
-        });
-      }
-    },
-  },
-  {
-    label: 'PATCH login_information_ids',
-    run: async (projectId, punchItemId, assigneeIds) => {
-      await procoreRequest('PATCH', `/rest/v1.1/punch_items/${punchItemId}`, {
-        query: { project_id: projectId },
-        body: { project_id: projectId, punch_item: { login_information_ids: assigneeIds } },
-      });
-    },
-  },
-];
 
 /**
- * Make sure the requested assignee actually holds the item.
+ * Report whether the requested assignee is on the item. It never writes.
  *
- * Runs only when the create did not already achieve it, and only when an
- * assignee was chosen. An unassigned item is meant to sit in nobody's court —
- * inventing an assignee to satisfy a Procore default would put work in front of
- * a person who never agreed to it.
+ * 🛑 This used to run a chain of up to three follow-up writes after the create
+ * (PATCH assignments_attributes, POST punch_item_assignments, PATCH
+ * login_information_ids) whenever the read-back did not show the assignee. On
+ * 2026-10-14 a user-level push of 11 items read back **initiated, not Draft**,
+ * at ~7 Procore requests per item: the chain ran on every one. Leaving Draft is
+ * what notifies the assignees and their companies, and this app never sends.
+ * A follow-up write is the only thing in a push that could have moved them, so
+ * the chain is gone: one write per item, the create, as `send-safety.test.mjs`
+ * already claimed. The assignee goes inline on the create (`login_information_id`);
+ * if the read-back does not show it, the super is told and sets it in Procore.
  */
 export async function ensureAssignees(
-  projectId: number,
-  punchItemId: number,
+  _projectId: number,
+  _punchItemId: number,
   assigneeIds: number[],
-  vendorId: number | null,
+  _vendorId: number | null,
   observed: ObservedPunchItem | null,
 ): Promise<{ strategy: string | null; errors: string[]; observed: ObservedPunchItem | null }> {
   if (!assigneeIds.length) return { strategy: null, errors: [], observed };
   if (observed && observed.assignees.length > 0) {
     return { strategy: 'inline assignments on create', errors: [], observed };
   }
-  const knownAssignFailure = memo.assignFailure.get(actorKey());
-  if (knownAssignFailure) {
-    return { strategy: null, errors: knownAssignFailure, observed };
-  }
-
-  const run = await runChain(
-    ASSIGN_STRATEGIES,
-    memo.assign,
-    projectId,
-    punchItemId,
-    [assigneeIds, vendorId],
-    (after) => Boolean(after && after.assignees.length > 0),
-    'accepted but no assignee was stored',
-  );
-
-  if (run.strategy) {
-    memo.assign = run.strategy;
-    return { strategy: run.strategy, errors: [], observed: run.observed };
-  }
-  if (!run.transient) memo.assignFailure.set(actorKey(), run.errors);
-  return { strategy: null, errors: run.errors, observed };
+  return {
+    strategy: null,
+    errors: [
+      'The assignee did not show on the item when it was read back. This app does not make a second write to ' +
+        'assign it, because that can move the item out of Draft. Set the assignee in Procore before sending.',
+    ],
+    observed,
+  };
 }
 
 export interface CreatePunchItemResult {
@@ -1643,6 +1432,8 @@ export interface CreatePunchItemResult {
   observed: ObservedPunchItem | null;
   /** Whether the create's response already matched the read-back. Evidence only. */
   echo: { agrees: boolean | null; differs: string[] };
+  /** The Draft state at each step of the push. */
+  draftTrail: DraftStep[];
 }
 
 /**
@@ -1666,6 +1457,10 @@ export async function createPunchItem(
     try {
       created = await createWithPhotos(projectId, input, photos);
     } catch (err) {
+      // Only a refusal is safe to follow with a second create: Procore answers
+      // a 4xx before writing. After a 5xx or a dropped connection the item may
+      // already exist, and a second create would duplicate it.
+      if (!(err instanceof ProcoreError) || err.status >= 500 || err.status === 401 || err.status === 429) throw err;
       photoErrors.push(
         `photos rejected on create: ${
           err instanceof ProcoreError
@@ -1689,14 +1484,25 @@ export async function createPunchItem(
   let observed = created?.id ? await observePunchItem(projectId, created.id) : null;
   const echo = compareEcho(created as unknown as Record<string, unknown>, observed);
 
-  // A 2xx on the create is not evidence the photos landed — three separate
-  // attempts returned 200 and stored nothing. Only the read-back counts.
-  if (photos.length && created?.id) {
-    const attached = await ensurePhotos(projectId, created.id, photos, observed);
-    observed = attached.observed ?? observed;
-    photoErrors.push(...attached.errors);
-  }
+  // Where the item stood at each step, so "it came back Initiated" can be pinned
+  // to the step that did it instead of guessed at (2026-10-14).
+  const createdDraft = created ? draftState(created as unknown as Record<string, unknown>) : { isDraft: null, label: null };
+  const draftTrail: DraftStep[] = [
+    { step: 'create response', isDraft: createdDraft.isDraft, label: createdDraft.label },
+    { step: 'read-back', isDraft: observed?.isDraft ?? null, label: observed?.workflowLabel ?? null },
+  ];
+
+  // 🛑 No follow-up write. A photo that did not land on the create used to be
+  // PATCHed on afterwards; a follow-up write is exactly what can move a Draft
+  // to Initiated, and Initiated notifies the assignees. The create is the only
+  // write: a missing photo is reported, and the super adds it in Procore.
   const photosAttached = storedPhotos(observed);
+  if (photos.length && created?.id && observed && photosAttached === 0 && !observed.hasAttachments) {
+    photoErrors.push(
+      `${photos.length} photo(s) did not attach on create. This app does not make a second write to add them, ` +
+        'because that can move the item out of Draft. Add them in Procore.',
+    );
+  }
 
   let assignErrors: string[] = [];
   let assignStrategy: string | null = null;
@@ -1721,7 +1527,14 @@ export async function createPunchItem(
     assignStrategy,
     observed,
     echo,
+    draftTrail,
   };
+}
+
+export interface DraftStep {
+  step: 'create response' | 'read-back';
+  isDraft: boolean | null;
+  label: string | null;
 }
 
 /** Read punch items back — used by the probe and by duplicate detection. */

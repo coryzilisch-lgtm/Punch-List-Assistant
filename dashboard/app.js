@@ -38,10 +38,17 @@ const S = {
   pageStatus: [], // 'pending' | 'busy' | 'done' | 'skip' | 'fail'
   pageNotes: [],
   items: [],
+  /**
+   * The two questions at the top of the review step: who is the punch item
+   * manager and who is the final approver. `choice` is '' (unanswered), 'me' or
+   * 'other'; `id` is the Procore user id it resolved to.
+   */
+  roles: {
+    punchItemManagerId: { choice: '', id: '' },
+    finalApproverId: { choice: '', id: '' },
+  },
   defaults: {
     punchItemTypeId: '',
-    punchItemManagerId: '',
-    finalApproverId: '',
     assigneeId: '',
     vendorId: '',
     priority: '',
@@ -206,9 +213,12 @@ function renderBar() {
       : 'Upload a punch list PDF';
   } else if (S.step === 'review') {
     const n = S.items.filter((i) => i.include).length;
+    const unanswered = unansweredRoles();
     next.textContent = 'Continue';
-    next.disabled = n === 0;
-    summary.innerHTML = `<b>${n}</b> of ${S.items.length} items selected`;
+    next.disabled = n === 0 || unanswered.length > 0;
+    summary.innerHTML = unanswered.length
+      ? `Answer who the ${unanswered.map((r) => ROLE_LABELS[r].toLowerCase()).join(' and ')} ${unanswered.length === 1 ? 'is' : 'are'}`
+      : `<b>${n}</b> of ${S.items.length} items selected`;
   } else {
     const n = S.items.filter((i) => i.include).length;
     dry.style.display = 'inline-block';
@@ -333,6 +343,7 @@ async function refreshProcore() {
   } catch {
     // Keep what we had; the next Procore call will say if it is gone.
   }
+  if (S.step === 'review') renderRoles();
   renderProcoreCard();
   renderBar();
 }
@@ -444,6 +455,19 @@ function clockTime(ms) {
 }
 
 /** Selected items with no punch item manager. Every pushed item must have one. */
+/**
+ * What each step of the push said about Draft, e.g. "create response: Initiated,
+ * read-back: Initiated". The create is the only write, so this says whether
+ * Procore made the item Initiated on create or something changed it afterwards.
+ */
+function draftTrailText(trail) {
+  if (!Array.isArray(trail) || !trail.length) return '';
+  const said = trail
+    .map((t) => `${t.step}: ${t.label || (t.isDraft === true ? 'Draft' : t.isDraft === false ? 'not Draft' : 'unknown')}`)
+    .join(', ');
+  return `<span class="muted"> (${esc(said)})</span>`;
+}
+
 function unmanagedCount() {
   return S.items.filter((i) => i.include && i.title.trim() && !i.punchItemManagerId).length;
 }
@@ -649,6 +673,8 @@ async function lookupProjectById() {
 async function selectProject(id) {
   S.project = S.projects.find((p) => p.id === Number(id)) || null;
   S.config = null;
+  // A person picked from another project's directory is not an answer here.
+  resetRoles();
   renderBar();
   if (!S.project) {
     $('readiness-card').style.display = 'none';
@@ -1109,6 +1135,12 @@ function commitName(id) {
   input.value = optionLabel(list, id);
 
   const act = input.dataset.act;
+  if (input.dataset.scope === 'role') {
+    S.roles[act] = { choice: 'other', id: id || '' };
+    closeNameCombo(false);
+    applyRole(act);
+    return;
+  }
   if (input.dataset.scope === 'default') {
     S.defaults[act] = id || '';
   } else {
@@ -1194,6 +1226,109 @@ function optionList(list, selected, blank) {
   );
 }
 
+// The punch item manager and final approver are asked, not defaulted. They are
+// who an item answers to in Procore, a wrong one is easy to miss on the review
+// rows, and the super is usually, but not always, both. So the review step opens
+// with the question and does not continue until both are answered.
+
+const ROLE_LABELS = { punchItemManagerId: 'Punch item manager', finalApproverId: 'Final approver' };
+
+/**
+ * The signed-in super's row in this project's directory, or null. Matched on
+ * Procore's own user id first, then on email (their Procore login, then their
+ * Microsoft sign-in), since the directory is what Procore will accept an id from.
+ */
+function meInDirectory() {
+  const users = S.config?.users || [];
+  const pid = S.procore?.procoreUserId;
+  if (pid) {
+    const byId = users.find((u) => Number(u.id) === Number(pid));
+    if (byId) return byId;
+  }
+  const emails = [S.procore?.login, S.me?.email]
+    .filter((e) => typeof e === 'string' && e.includes('@'))
+    .map((e) => e.trim().toLowerCase());
+  return users.find((u) => u.email && emails.includes(String(u.email).trim().toLowerCase())) || null;
+}
+
+/** Roles not yet answered with a person. */
+function unansweredRoles() {
+  return Object.keys(ROLE_LABELS).filter((r) => !S.roles[r].id);
+}
+
+function resetRoles() {
+  for (const r of Object.keys(ROLE_LABELS)) S.roles[r] = { choice: '', id: '' };
+}
+
+/** Write a role's answer onto every item. A row changed afterwards keeps its own value until the answer changes. */
+function applyRole(role) {
+  const id = S.roles[role].id;
+  if (id) for (const item of S.items) item[role] = id;
+  renderRoles();
+  renderItems();
+  renderBar();
+}
+
+function renderRoles() {
+  const card = $('roles-card');
+  if (!card) return;
+  const me = meInDirectory();
+  const myName = me?.name || S.procore?.name?.trim() || '';
+
+  const question = (role) => {
+    const r = S.roles[role];
+    const label = ROLE_LABELS[role];
+    const other =
+      r.choice === 'other'
+        ? `<div class="role-other">${nameCombo({ act: role, scope: 'role', value: r.id, kind: 'person', placeholder: 'Type their name or company…' })}</div>`
+        : '';
+    return `
+      <fieldset class="role" data-role="${role}">
+        <legend>Who is the <strong>${esc(label.toLowerCase())}</strong> on these items?</legend>
+        <label class="role-opt">
+          <input type="radio" name="role-${role}" value="me" ${r.choice === 'me' ? 'checked' : ''} ${me ? '' : 'disabled'} />
+          Me${myName ? ` (${esc(myName)})` : ''}
+        </label>
+        <label class="role-opt">
+          <input type="radio" name="role-${role}" value="other" ${r.choice === 'other' ? 'checked' : ''} />
+          Someone else
+        </label>
+        ${other}
+        ${r.choice === 'other' && !r.id ? '<p class="hint">Pick them from the project directory.</p>' : ''}
+      </fieldset>`;
+  };
+
+  card.innerHTML = `
+    <h2>Who these items answer to</h2>
+    <p class="hint">Every item gets the people you choose here. You can still change a single row below.</p>
+    <div class="grid-2">${question('punchItemManagerId')}${question('finalApproverId')}</div>
+    ${
+      me
+        ? ''
+        : note(
+            'warn',
+            `<strong>You are not in this project's directory in Procore</strong>${myName ? ` (looked for ${esc(myName)})` : ''}, ` +
+              'so "Me" cannot be chosen. Add yourself to the project in Procore, or pick someone else.',
+          )
+    }`;
+
+  card.querySelectorAll('input[type="radio"]').forEach((radio) => {
+    radio.addEventListener('change', () => {
+      const role = radio.closest('.role').dataset.role;
+      if (radio.value === 'me') {
+        S.roles[role] = { choice: 'me', id: String(meInDirectory()?.id || '') };
+        applyRole(role);
+      } else {
+        // Someone else: nobody until they are picked, so Continue stays shut.
+        S.roles[role] = { choice: 'other', id: '' };
+        renderRoles();
+        renderBar();
+        card.querySelector(`.role[data-role="${role}"] input.namecombo`)?.focus();
+      }
+    });
+  });
+}
+
 function renderDefaults() {
   const c = S.config || {};
   const d = S.defaults;
@@ -1201,14 +1336,6 @@ function renderDefaults() {
 
   $('defaults').innerHTML = `
     <div class="grid-2">
-      <div>
-        <label class="fl">Punch item manager</label>
-${nameCombo({ act: 'punchItemManagerId', scope: 'default', value: d.punchItemManagerId, kind: 'person' })}
-      </div>
-      <div>
-        <label class="fl">Final approver</label>
-${nameCombo({ act: 'finalApproverId', scope: 'default', value: d.finalApproverId, kind: 'person' })}
-      </div>
       <div>
         <label class="fl">Assign to (person)</label>
 ${nameCombo({ act: 'assigneeId', scope: 'default', value: d.assigneeId, kind: 'person' })}
@@ -1244,8 +1371,7 @@ ${nameCombo({ act: 'vendorId', scope: 'default', value: d.vendorId, kind: 'compa
         ? ''
         : note(
             'warn',
-            'No project users came back from Procore, so the people dropdowns are empty. ' +
-              'Procore usually requires a punch item manager and a final approver — without them the push may be rejected. ' +
+            'No project users came back from Procore, so the assignee picker is empty. ' +
               'Check that your Procore account can see this project\'s directory.',
           )
     }
@@ -1284,8 +1410,6 @@ function applyDefaults() {
 
   const fields = [
     ['punchItemTypeId', 'punchItemTypeId'],
-    ['punchItemManagerId', 'punchItemManagerId'],
-    ['finalApproverId', 'finalApproverId'],
     ['assigneeId', 'assigneeId'],
     ['vendorId', 'vendorId'],
     ['priority', 'priority'],
@@ -1558,7 +1682,7 @@ function renderSendSummary() {
     html += note(
       'error',
       `<strong>${unmanaged} item(s) have no punch item manager.</strong> Every item needs one before it can ` +
-        'be created. Set it in the bulk card on the review step and press <strong>Apply to selected items</strong>.',
+        'be created. Go back to the review step and set it on those rows.',
     );
   }
   const noApprover = selected.filter((i) => i.punchItemManagerId && !i.finalApproverId).length;
@@ -1566,8 +1690,7 @@ function renderSendSummary() {
     html += note(
       'warn',
       `<strong>${noApprover} item(s) have no final approver.</strong> ` +
-        'Many Procore configurations require one. Set it in the bulk card on the review step and ' +
-        'press <strong>Apply to selected items</strong>.',
+        'Many Procore configurations require one. Go back to the review step and set it on those rows.',
     );
   }
   const q = S.quota;
@@ -1625,7 +1748,7 @@ function renderSendSummary() {
   // (2026-10-01). Sending is a decision the super makes in Procore, item by item.
   html += note(
     'info',
-    `<strong>Items are created as Drafts, as ${esc(S.procore?.name || 'you')}.</strong> ` +
+    `<strong>Items are created as Drafts, as ${esc(S.procore?.name?.trim() || 'you')}.</strong> ` +
       'This app does not send them to the punch item manager or ' +
       'the assignees. Review them in Procore and send them from there when they are right.',
   );
@@ -1885,7 +2008,7 @@ function renderResults() {
         `${esc(clockTime(resetAt))}.${esc(which)}`,
     );
   }
-  if (created.length && S.createdAs) {
+  if (created.length && S.createdAs?.trim()) {
     html += note('info', `Created in Procore as <strong>${esc(S.createdAs)}</strong>. They are Drafts in your court.`);
   }
   if (created.length && S.procoreRequests) {
@@ -1941,7 +2064,8 @@ function renderResults() {
           // some other way — and leaving Draft is what notifies people. Say so.
           bits.push(
             `<span class="badge err">Not a Draft: ${esc(workflow || status || 'unknown')}</span>` +
-              '<span class="muted"> Procore may already have notified the assignees. Check this item in Procore.</span>',
+              '<span class="muted"> Procore may already have notified the assignees. Check this item in Procore.</span>' +
+              draftTrailText(r.draftTrail),
           );
         } else if (status) {
           bits.push(`<span class="badge flat">${esc(status)}</span>`);
@@ -2054,6 +2178,12 @@ function wire() {
   $('next-btn').addEventListener('click', () => {
     if (S.step === 'project') goto('upload');
     else if (S.step === 'upload') {
+      // Items read since the roles were answered get the same people.
+      for (const role of Object.keys(ROLE_LABELS)) {
+        const id = S.roles[role].id;
+        if (id) for (const item of S.items) if (!item[role]) item[role] = id;
+      }
+      renderRoles();
       renderDefaults();
       renderItems();
       goto('review');
