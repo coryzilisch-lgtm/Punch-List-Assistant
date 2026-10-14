@@ -63,8 +63,26 @@ test('quota headers are read, with the reset as a duration or an epoch', () => {
   );
   assert.deepEqual(q, { limit: 3600, remaining: 412, resetAt: now + 900_000, observedAt: now });
 
-  const epoch = quota.readQuota(headers({ 'X-Rate-Limit-Remaining': '5', 'X-Rate-Limit-Reset': '1800000600' }), now);
+  const epoch = quota.readQuota(
+    headers({ 'X-Rate-Limit-Limit': '3600', 'X-Rate-Limit-Remaining': '5', 'X-Rate-Limit-Reset': '1800000600' }),
+    now,
+  );
   assert.equal(epoch.resetAt, 1_800_000_600_000);
+});
+
+test('a reset minutes away on a spike-sized limit is read as the 10-second window', () => {
+  // 2026-10-14, the Darden import: the push stopped "for the hourly limit" and
+  // carried on when Create was pressed seconds later. A 25-request limit is
+  // Procore's spike window, which lasts 10 seconds, whatever Reset says.
+  const now = 1_800_000_000_000;
+  const spike = quota.readQuota(
+    headers({ 'X-Rate-Limit-Limit': '25', 'X-Rate-Limit-Remaining': '0', 'X-Rate-Limit-Reset': '1800002000' }),
+    now,
+  );
+  assert.ok(spike.resetAt - now <= quota.SPIKE_WINDOW_MS + 1_000);
+  // No limit reported at all: not proof of the hourly limit either.
+  const unknown = quota.readQuota(headers({ 'X-Rate-Limit-Remaining': '0', 'X-Rate-Limit-Reset': '1800002000' }), now);
+  assert.ok(unknown.resetAt - now <= quota.SPIKE_WINDOW_MS + 1_000);
 });
 
 test('a response with no quota headers is not mistaken for an empty quota', () => {
@@ -249,7 +267,8 @@ test('a 429 is logged as short or long by how far out it resets', async () => {
     n += 1;
     if (n === 1) return reply(429, {}, { 'X-Rate-Limit-Reset': '1' });
     if (n === 2) return reply(200, { id: 1 });
-    return reply(429, {}, { 'X-Rate-Limit-Reset': '2100' });
+    // Only an hourly-scale limit can mean a long wait.
+    return reply(429, {}, { 'X-Rate-Limit-Limit': '3600', 'X-Rate-Limit-Reset': '2100' });
   });
   await procoreRequest('GET', '/rest/v1.0/me'); // short 429, waited out, then 200
   await assert.rejects(procoreRequest('GET', '/rest/v1.0/me')); // the hourly-scale wall
@@ -331,4 +350,17 @@ test('the last hour is broken down by outcome, because failures spend quota too'
   await assert.rejects(procoreRequest('GET', '/rest/v1.0/me'));
   const o = quota.quotaReport(Date.now()).evidence.thisInstance.lastHourByOutcome;
   assert.deepEqual(o, { total: 3, ok: 1, rateLimited: 1, clientErrors: 1, serverErrors: 0, noResponse: 0 });
+});
+
+test('requests are paced under the spike window: the 21st in ten seconds waits', async () => {
+  const { resetPacingForTests } = await import('../dist/lib/procore.js');
+  resetPacingForTests();
+  quota.resetQuotaForTests();
+  mockFetch(() => reply(200, { id: 1 }));
+  const start = Date.now();
+  for (let i = 0; i < 20; i++) await procoreRequest('GET', '/rest/v1.0/me');
+  assert.ok(Date.now() - start < 2_000, 'twenty go straight through');
+  await procoreRequest('GET', '/rest/v1.0/me');
+  assert.ok(Date.now() - start >= 9_500, 'the next one waits for the window');
+  resetPacingForTests();
 });

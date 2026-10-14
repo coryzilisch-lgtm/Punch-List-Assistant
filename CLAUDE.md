@@ -561,6 +561,52 @@ response. Five rules:
    throws the same 429 without calling Procore until the reset time Procore gave. It only ever refuses
    early, never permits what Procore would refuse.
 
+### The push stopped on the spike window, not the hourly limit — 2026-10-14
+
+On the 228-item Darden import the push kept stopping "at Procore's rate
+limit", and pressing Create **seconds later** carried on. So it was the
+10-second spike window (25), misjudged as a long stop. Two causes, both fixed:
+
+1. **A reset was trusted on its own.** Any 429 whose `X-Rate-Limit-Reset` read
+   as more than 90s out was treated as the hourly limit. Now
+   `plausibleReset()` (quota.ts) caps the reset to the 10-second window unless
+   the reported `X-Rate-Limit-Limit` is **hourly-scale (≥ 600**, the value in
+   Procore's own docs example of hourly headers). Applied to every response
+   and every 429.
+2. **An unknown reset stopped the push.** When the quota read as spent with no
+   reset time, or a 429 came back without one, the dashboard stopped. Procore's
+   docs (pasted again by Cory, 2026-10-14) say pause and retry with backoff and
+   jitter, so `spikeReset()` waits ~11–12.5s and carries on. Only a **known**
+   reset far off still ends a push (bounded by `MAX_IDLE_WAITS`).
+
+**And the push is paced, so it rarely meets the window at all.** The server
+holds each instance to **20 requests per 10 seconds** (`pace()` in
+procore.ts); the dashboard spaces batches at **~2 requests a second** from each
+batch's reported `requests`, because batches can land on different instances.
+A 228-item list (~500 requests) takes roughly four minutes. Both are tested,
+and both new tests were confirmed failing against the old code.
+
+### Resuming a stopped import — browser storage, 2026-10-14
+
+Cory chose **this browser** over a server store: no Azure resource, and owners'
+documents stay off Buffalo's servers; the cost is resuming on the same computer.
+`dashboard/saved-imports.js` (IndexedDB, one record per project) holds **only
+items Procore never received**: never the created ones, never the "may already
+be in Procore" ones (resuming those duplicates items and emails subs twice).
+It is saved after every batch and at the end, and cleared when nothing is left.
+
+- The results screen shows a big **"N items still to create"** box with the
+  reset time and one **Resume** button that unlocks at the reset.
+- Step 1 shows **Unfinished import** cards (Resume / Discard) on the next visit,
+  even after the tab was closed. Resume reloads the project, the items (photos
+  included) and the role answers, and goes straight to Create; the distribution
+  gate is asked again if this browser lost it.
+- A `localStorage` lock (`pla:import-lock:{id}`, 45s, refreshed every 15s)
+  stops a second tab resuming the same import.
+- 🛑 The screen is made final **before** the save is awaited. Awaiting the save
+  first left "Stopped" on screen beside a button still reading "Creating…"
+  (found as flaky browser tests, 2026-10-14).
+
 ### Which limit was it — the evidence, 2026-10-13
 
 A reset seconds away is the spike window; a reset minutes away means the

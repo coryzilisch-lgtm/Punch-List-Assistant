@@ -769,3 +769,99 @@ test('a project cannot be imported into until its distribution emails are confir
     await page.close();
   }
 });
+
+// ── Pacing (2026-10-14) ──────────────────────────────────────────────────────
+//
+// On the Darden import back-to-back batches met Procore's 25-per-10-seconds
+// spike window and the push stopped, though Create worked seconds later. The
+// dashboard now spaces batches by what each one cost (~2 requests a second).
+
+test('batches are spaced by what they cost, about two Procore requests a second', async () => {
+  const sentAt = [];
+  const { page, errors } = await toCreateStep({
+    onPush: (body) => {
+      sentAt.push(Date.now());
+      // 4 requests for the lone first item, so the next batch waits ~2 seconds.
+      return { json: { ...created(body).json, requests: 4 } };
+    },
+  });
+  try {
+    await page.click('#next-btn');
+    await page.waitForFunction(() => /12 punch items created/.test(document.getElementById('results').textContent), null, { timeout: 30_000 });
+    assert.ok(sentAt[1] - sentAt[0] >= 1_800, `second batch waited ${sentAt[1] - sentAt[0]}ms`);
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
+// ── Resuming a stopped import (2026-10-14) ───────────────────────────────────
+
+test('a push stopped by the hourly limit shows a countdown, saves what is left, and resumes from step 1', async () => {
+  const resetAt = Date.now() + 30 * 60_000;
+  let n = 0;
+  const { page, pushes, errors, port } = await toCreateStep({
+    quotaReply: quota({ limit: null, remaining: null, resetAt: null, capacity: null }),
+    onPush: (body) => {
+      n += 1;
+      if (n === 1) return created(body);
+      return {
+        json: {
+          results: body.items.map((it) => ({ clientId: it.clientId, ok: false, rateLimited: true, resetAt, error: 'HTTP 429' })),
+          quota: null,
+        },
+      };
+    },
+  });
+  try {
+    await page.click('#next-btn');
+    await page.waitForFunction(() => /saved in this browser/.test(document.getElementById('resume-now')?.textContent || ''));
+    const box = await page.textContent('#resume-now');
+    assert.match(box, /11 items still to create/);
+    assert.match(box, /saved in this browser/);
+    assert.ok(await page.isDisabled('#resume-push'), 'locked until the reset');
+
+    // Close the tab and come back: step 1 offers the 11, not the one created.
+    await page.reload({ waitUntil: 'networkidle' });
+    await page.waitForFunction(() => /11 items not created yet/.test(document.getElementById('resume-card').textContent));
+    // This tab's own lock from before the reload is released by the reload.
+    await page.evaluate(() => Object.keys(localStorage).filter((k) => k.startsWith('pla:import-lock:')).forEach((k) => localStorage.removeItem(k)));
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+    await page.reload({ waitUntil: 'networkidle' });
+    await page.click('#resume-card [data-act="resume-import"]');
+    await page.waitForFunction(() => document.getElementById('panel-send').classList.contains('active'));
+    assert.match(await page.textContent('#next-btn'), /Create 11 punch items/);
+    const sentBefore = pushes.flatMap((p) => p.items).length;
+    assert.equal(sentBefore, 6, 'the first item, then one refused batch of five');
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
+test('a 429 with no reset time is waited out as the spike window, not a stop', async () => {
+  // The Darden import stopped "at the rate limit" and Create worked seconds later.
+  let n = 0;
+  const { page, pushes, errors } = await toCreateStep({
+    quotaReply: quota({ limit: null, remaining: null, resetAt: null, capacity: null }),
+    onPush: (body) => {
+      n += 1;
+      if (n !== 2) return created(body, n * 100);
+      return {
+        json: {
+          results: body.items.map((it) => ({ clientId: it.clientId, ok: false, rateLimited: true, error: 'HTTP 429' })),
+          quota: null,
+        },
+      };
+    },
+  });
+  try {
+    await page.click('#next-btn');
+    await page.waitForFunction(() => /12 punch items created/.test(document.getElementById('results').textContent), null, { timeout: 45_000 });
+    assert.doesNotMatch(await page.textContent('#results'), /Stopped/);
+    assert.equal(new Set(pushes.flatMap((p) => p.items.map((i) => i.clientId))).size, 12);
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});

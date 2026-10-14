@@ -32,9 +32,11 @@ import {
   noteRequest,
   noteStatus,
   rateHeaders,
+  plausibleReset,
   readQuota,
   recordQuota,
   resetAtFromHeader,
+  SPIKE_WINDOW_MS,
   WAIT_IN_FUNCTION_MS,
 } from './quota';
 
@@ -231,6 +233,32 @@ export interface RequestOptions {
   onHeaders?: (headers: Headers) => void;
 }
 
+/**
+ * Pacing: at most PACE_MAX requests in any 10 seconds from this instance,
+ * under the tenant's spike limit of 25 with room for the probe and anyone else
+ * on the same Developer App. A push of 228 items is ~500 requests, so this costs
+ * about four minutes and saves the 429s that were stopping it (2026-10-14).
+ */
+const PACE_MAX = 20;
+const recentRequests: number[] = [];
+
+async function pace(): Promise<void> {
+  for (;;) {
+    const now = Date.now();
+    while (recentRequests.length && now - recentRequests[0] >= SPIKE_WINDOW_MS) recentRequests.shift();
+    if (recentRequests.length < PACE_MAX) {
+      recentRequests.push(now);
+      return;
+    }
+    await sleep(recentRequests[0] + SPIKE_WINDOW_MS - now + 25);
+  }
+}
+
+/** Tests only: forget the pacing history. */
+export function resetPacingForTests(): void {
+  recentRequests.length = 0;
+}
+
 export async function procoreRequest<T = unknown>(
   method: string,
   path: string,
@@ -265,6 +293,10 @@ export async function procoreRequest<T = unknown>(
       if (wait > MAX_RATE_LIMIT_WAIT_MS) throw rateLimited(method, url.pathname, blockedUntil, 'not sent');
       await sleep(wait + 250);
     }
+
+    // Stay under the spike window instead of meeting it: every request counts,
+    // and a 429 costs a request and a wait.
+    await pace();
 
     // The super's own token, and nothing else: no service-account fallback.
     const session = currentProcoreSession();
@@ -324,7 +356,13 @@ export async function procoreRequest<T = unknown>(
       const resetHeader = res.headers.get('X-Rate-Limit-Reset');
       const waitMs = rateLimitWaitMs(resetHeader, attempt);
       const now = Date.now();
-      const resetAt = resetAtFromHeader(resetHeader, now) ?? now + waitMs;
+      // Unless Procore reports an hourly-scale limit, this is the 10-second spike
+      // window, however far off the Reset header reads (see plausibleReset).
+      const resetAt = plausibleReset(
+        readQuota(res.headers, now)?.limit ?? null,
+        resetAtFromHeader(resetHeader, now) ?? now + waitMs,
+        now,
+      )!;
       // Every 429 is logged, short and long alike: counting them is how the
       // spike window is told from the hourly limit.
       noteLimitHit(url.pathname, resetAt, seenRateHeaders, now);
