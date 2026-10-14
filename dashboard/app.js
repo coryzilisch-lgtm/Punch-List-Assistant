@@ -25,6 +25,10 @@ const S = {
   quotaAt: 0,
   /** Procore requests this import has spent, as the API reported them. */
   procoreRequests: 0,
+  /** The super's Procore connection, from /api/me: { configured, connected, name, expiresAt }. */
+  procore: null,
+  /** Set when a push stopped because the Procore connection expired. */
+  connectStop: false,
   me: null,
   projects: [],
   project: null,
@@ -78,6 +82,19 @@ async function api(path, options) {
     // the Entra gate was switched on. Neither is a problem with the request the
     // super just made, and "Request failed (HTTP 401)" sends people hunting for
     // one — the same reason a bodyless 404 is reported as a deploy problem.
+    // A 401 carrying `procoreConnect` is not the Entra sign-in: the super's
+    // Procore login is missing or expired. Offer to reconnect, in a popup, so
+    // nothing they have reviewed is thrown away.
+    if (res.status === 401 && body?.procoreConnect) {
+      if (S.procore) S.procore.connected = false;
+      renderProcoreCard(body.reason === 'expired' ? 'Your Procore connection expired. Reconnect to carry on.' : null);
+      renderBar();
+      const err = new Error(body.error || 'Connect your Procore account first.');
+      err.status = 401;
+      err.procoreConnect = true;
+      err.body = body;
+      throw err;
+    }
     if (res.status === 401) {
       showSignInRequired(body?.signInUrl || '/.auth/login/aad');
       const err = new Error('You are signed out. Sign in with your Buffalo account to continue.');
@@ -173,8 +190,12 @@ function renderBar() {
 
   if (S.step === 'project') {
     next.textContent = 'Continue';
-    next.disabled = !S.project;
-    summary.textContent = S.project ? S.project.name : 'Choose a project to begin';
+    next.disabled = !S.project || !procoreConnected();
+    summary.textContent = !procoreConnected()
+      ? 'Connect Procore to begin'
+      : S.project
+        ? S.project.name
+        : 'Choose a project to begin';
   } else if (S.step === 'upload') {
     const done = S.pageStatus.filter((s) => s === 'done' || s === 'skip').length;
     const total = S.pageStatus.length;
@@ -202,14 +223,104 @@ function renderBar() {
         ? `Create ${fits} of ${n} punch items`
         : `Create ${n} punch items`;
     // /api/push refuses these too; disabling here just says so before the press.
-    next.disabled = S.sending || n === 0 || unmanaged > 0 || fits === 0;
-    summary.innerHTML = unmanaged
+    next.disabled = S.sending || n === 0 || unmanaged > 0 || fits === 0 || !procoreConnected();
+    summary.innerHTML = !procoreConnected()
+      ? 'Reconnect Procore to create items'
+      : unmanaged
       ? `<b>${unmanaged}</b> item(s) need a punch item manager`
       : fits === 0
         ? `No Procore quota left until <b>${esc(clockTime(S.quota.resetAt))}</b>`
         : `Creating Drafts in <b>${esc(S.project?.name || '')}</b>`;
   }
 }
+
+// ── Procore connection ───────────────────────────────────────────────────────
+//
+// Items are created as the signed-in super, on their own Procore login, so a
+// Draft sits in their court and Procore's own permissions apply. There is no
+// fallback to a service account. Connecting happens in a popup so that a
+// reconnect mid-review, when the ~2 hour token runs out, loses nothing.
+
+function procoreConnected() {
+  return Boolean(S.procore?.connected && (!S.procore.expiresAt || S.procore.expiresAt > Date.now() + 60_000));
+}
+
+function renderProcoreCard(problem = null) {
+  const card = $('procore-card');
+  if (!card) return;
+  const p = S.procore;
+  if (p && !p.configured) {
+    card.innerHTML = note('error', '<strong>Procore is not configured on this deployment.</strong> Tell Cory.');
+    return;
+  }
+  if (procoreConnected()) {
+    card.innerHTML =
+      `<div class="procore-line">Procore: connected as <strong>${esc(p.name || 'you')}</strong>` +
+      (p.expiresAt ? ` <span class="muted">until about ${esc(clockTime(p.expiresAt))}</span>` : '') +
+      ' · <button type="button" class="btn-link" id="procore-disconnect">Disconnect</button></div>';
+    $('procore-disconnect').addEventListener('click', disconnectProcore);
+    return;
+  }
+  card.innerHTML =
+    '<h2>Connect your Procore account</h2>' +
+    (problem ? note('warn', esc(problem)) : '') +
+    '<p class="hint">Items are created <strong>as you</strong>, so they sit in your court as Drafts and follow ' +
+    "your own Procore permissions. You sign in on Procore's own page; this app never sees your password.</p>" +
+    '<button type="button" class="btn-primary" id="procore-connect">Connect Procore</button>';
+  $('procore-connect').addEventListener('click', connectProcore);
+}
+
+function connectProcore() {
+  const popup = window.open('/api/procore/connect', 'procore-connect', 'width=520,height=720');
+  if (popup) return;
+  // Pop-up blocked. A full-page redirect would throw away anything reviewed, so
+  // only take it when there is nothing to lose.
+  if (S.items.length) {
+    renderProcoreCard('Your browser blocked the Procore sign-in window. Allow pop-ups for this site, then press Connect Procore again.');
+  } else {
+    location.href = '/api/procore/connect';
+  }
+}
+
+async function disconnectProcore() {
+  try {
+    await api('/api/procore/disconnect', { method: 'POST' });
+  } catch {
+    // The cookie expires on its own; the page state is what matters here.
+  }
+  S.procore = { ...(S.procore || {}), connected: false, name: null, expiresAt: null };
+  renderProcoreCard();
+  renderBar();
+}
+
+async function refreshProcore() {
+  try {
+    const me = await api('/api/me');
+    S.me = me;
+    S.procore = me?.procore || null;
+  } catch {
+    // Keep what we had; the next Procore call will say if it is gone.
+  }
+  renderProcoreCard();
+  renderBar();
+}
+
+/** The popup's last page reports here, on this origin only. */
+window.addEventListener('message', async (e) => {
+  if (e.origin !== location.origin || e.data?.type !== 'procore-connect') return;
+  if (!e.data.ok) {
+    renderProcoreCard(e.data.message || 'Procore did not connect.');
+    return;
+  }
+  S.connectStop = false;
+  await refreshProcore();
+  if (S.step === 'send') {
+    renderSendSummary();
+    renderResults();
+  } else if (S.step === 'project' && S.project && !S.config) {
+    selectProject(S.project.id);
+  }
+});
 
 /**
  * Ask how much of Procore's rate limit is left. One request. A failure leaves the
@@ -481,6 +592,10 @@ async function selectProject(id) {
     (S.project.number ? ` · #${esc(S.project.number)}` : '') +
     (S.project.stage ? ` · ${esc(S.project.stage)}` : '');
   $('readiness-card').style.display = 'block';
+  if (!procoreConnected()) {
+    $('readiness').innerHTML = '<div class="muted">Connect Procore above to check your access to this project.</div>';
+    return;
+  }
   $('readiness').innerHTML = '<div class="muted">Checking Procore access…</div>';
 
   // ONE call, not two. These used to run in parallel — but the probe builds the
@@ -1063,7 +1178,7 @@ ${nameCombo({ act: 'vendorId', scope: 'default', value: d.vendorId, kind: 'compa
             'warn',
             'No project users came back from Procore, so the people dropdowns are empty. ' +
               'Procore usually requires a punch item manager and a final approver — without them the push may be rejected. ' +
-              'Check that the service account can see this project\'s directory.',
+              'Check that your Procore account can see this project\'s directory.',
           )
     }
   `;
@@ -1442,7 +1557,8 @@ function renderSendSummary() {
   // (2026-10-01). Sending is a decision the super makes in Procore, item by item.
   html += note(
     'info',
-    '<strong>Items are created as Drafts.</strong> This app does not send them to the punch item manager or ' +
+    `<strong>Items are created as Drafts, as ${esc(S.procore?.name || 'you')}.</strong> ` +
+      'This app does not send them to the punch item manager or ' +
       'the assignees. Review them in Procore and send them from there when they are right.',
   );
 
@@ -1459,11 +1575,17 @@ async function doPush(dryRun) {
   const selected = S.items.filter((i) => i.include && i.title.trim());
   if (!selected.length) return;
   if (!dryRun && unmanagedCount()) return;
+  if (!dryRun && !procoreConnected()) {
+    renderProcoreCard('Connect Procore to create items. They are created as you.');
+    return;
+  }
 
   S.sending = true;
   renderBar();
   S.results = [];
   S.quotaStop = null;
+  S.connectStop = false;
+  S.connectNotAttempted = 0;
   $('results-card').style.display = dryRun ? 'none' : 'block';
   $('dryrun-card').style.display = dryRun ? 'block' : 'none';
   $('results').innerHTML = '';
@@ -1534,6 +1656,15 @@ async function doPush(dryRun) {
       if (dryRun) payloads.push(...res.results.map((r) => r.payload));
       if (!dryRun) {
         S.procoreRequests += res.requests || 0;
+        if (res.createdAs) S.createdAs = res.createdAs;
+        // The super's token expired mid-batch. The server sent nothing after it,
+        // and Procore answers a 401 before writing, so those items stay selected.
+        if (res.procoreConnect || res.results.some((r) => r.procoreConnect)) {
+          stopped = true;
+          S.connectStop = true;
+          if (S.procore) S.procore.connected = false;
+          renderProcoreCard('Your Procore connection expired partway through. Reconnect, then press Create again.');
+        }
         if (res.quota) {
           S.quota = res.quota;
           S.quotaAt = Date.now();
@@ -1556,7 +1687,14 @@ async function doPush(dryRun) {
         }
       }
     } catch (err) {
-      if (!dryRun && err.status === 429 && err.body?.rateLimited) {
+      if (!dryRun && err.procoreConnect) {
+        // Refused before any write: no Procore connection.
+        for (const item of batch) {
+          S.results.push({ clientId: String(item.id), ok: false, procoreConnect: true, error: err.message });
+        }
+        stopped = true;
+        S.connectStop = true;
+      } else if (!dryRun && err.status === 429 && err.body?.rateLimited) {
         // Refused before any write because it would not fit the quota.
         if (err.body.quota) S.quota = err.body.quota;
         const resetAt = err.body.quota?.resetAt ?? null;
@@ -1593,7 +1731,10 @@ async function doPush(dryRun) {
     if (stopped) break;
   }
 
-  if (!dryRun && (stopAt !== null || queue.length)) {
+  if (!dryRun && S.connectStop) {
+    // Stopped by an expired Procore connection, not the rate limit.
+    S.connectNotAttempted = queue.length;
+  } else if (!dryRun && (stopAt !== null || queue.length)) {
     S.quotaStop = { resetAt: stopAt, notAttempted: queue.length };
   }
 
@@ -1624,7 +1765,8 @@ function renderResults() {
   const created = S.results.filter((r) => r.ok);
   const uncertain = S.results.filter((r) => !r.ok && r.uncertain);
   const limited = S.results.filter((r) => !r.ok && r.rateLimited);
-  const failed = S.results.filter((r) => !r.ok && !r.uncertain && !r.rateLimited);
+  const unconnected = S.results.filter((r) => !r.ok && r.procoreConnect);
+  const failed = S.results.filter((r) => !r.ok && !r.uncertain && !r.rateLimited && !r.procoreConnect);
 
   let html = '';
   if (created.length) {
@@ -1643,6 +1785,15 @@ function renderResults() {
         `The server stopped answering partway through, so it cannot say what it finished. ` +
         `<strong>Do not push these again</strong> until you have checked the project's punch list in Procore — ` +
         `pushing them again creates duplicates and can email the same subs twice. They have been unticked.`,
+    );
+  }
+  if (S.connectStop || unconnected.length) {
+    const n = unconnected.length + (S.connectNotAttempted || 0);
+    html += note(
+      'warn',
+      `<strong>Your Procore connection expired. ${n} item${n === 1 ? ' was' : 's were'} not created.</strong> ` +
+        'Nothing was written for them, so they are still selected. Reconnect, then press Create again. ' +
+        '<button type="button" class="btn-link" data-act="procore-reconnect">Reconnect Procore</button>',
     );
   }
   const notSent = limited.length + (S.quotaStop?.notAttempted || 0);
@@ -1665,6 +1816,9 @@ function renderResults() {
         'Nothing was written for them, so they are still selected. Press Create again after ' +
         `${esc(clockTime(resetAt))}.${esc(which)}`,
     );
+  }
+  if (created.length && S.createdAs) {
+    html += note('info', `Created in Procore as <strong>${esc(S.createdAs)}</strong>. They are Drafts in your court.`);
   }
   if (created.length && S.procoreRequests) {
     html += note(
@@ -1731,13 +1885,6 @@ function renderResults() {
           bits.push(`<span class="badge info">Ball in court: ${esc(bic.join(', '))}</span>`);
         } else if (wantedAssignee) {
           bits.push('<span class="badge err">Assignee did not stick</span>');
-        }
-        // A Draft item sitting with its creator is Procore's own workflow, not a
-        // defect — say so rather than letting it read as a bug.
-        if (bic.length === 1 && /abs-api-export/i.test(bic[0]) && isDraft !== false) {
-          bits.push(
-            '<span class="muted">Draft items sit with their creator until they are sent to the punch item manager.</span>',
-          );
         }
         if (r.assignErrors?.length) {
           bits.push(`<span class="muted">${esc(r.assignErrors.join('; '))}</span>`);
@@ -1853,6 +2000,11 @@ function wire() {
 
   $('dryrun-btn').addEventListener('click', () => doPush(true));
 
+  // "Reconnect Procore" on the results screen, after a connection expired mid-push.
+  $('results').addEventListener('click', (e) => {
+    if (e.target.closest('[data-act="procore-reconnect"]')) connectProcore();
+  });
+
   // A half-finished import is real work. Warn before it is thrown away.
   window.addEventListener('beforeunload', (e) => {
     if (S.items.some((i) => i.include)) {
@@ -1868,11 +2020,14 @@ async function init() {
 
   try {
     S.me = await api('/api/me');
+    S.procore = S.me?.procore || null;
     $('who').textContent = S.me?.email || '';
   } catch {
     // Identity is for attribution only; the app still works without it.
   }
 
+  renderProcoreCard();
+  renderBar();
   await loadProjects();
   preselectFromUrl();
 }

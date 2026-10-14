@@ -18,9 +18,18 @@ import assert from 'node:assert/strict';
 process.env.PROCORE_CLIENT_ID = 'id';
 process.env.PROCORE_CLIENT_SECRET = 'secret';
 process.env.PROCORE_COMPANY_ID = '18895';
+process.env.PROCORE_REDIRECT_URI = 'https://app.example/api/procore/callback';
+process.env.PROCORE_SESSION_KEY = 'test-session-key-that-is-at-least-32-chars';
 
-const { procoreRequest } = await import('../dist/lib/procore.js');
-const { pushHandler } = await import('../dist/functions/push.js');
+
+// Every Procore call runs as a connected superintendent now; there is no
+// service-account token. These tests are about rate limits and write safety,
+// so they run as one.
+const { runAsProcoreUser } = await import('../dist/lib/procore-session.js');
+const TEST_SUPER = { accessToken: 'user-token', expiresAt: Date.now() + 3_600_000, owner: 'entra-oid', procoreUserId: 42, name: 'Test Super', login: 'super@example.com' };
+const asSuper = (fn) => (...args) => runAsProcoreUser(TEST_SUPER, () => fn(...args));
+const procoreRequest = asSuper((await import('../dist/lib/procore.js')).procoreRequest);
+const pushHandler = asSuper((await import('../dist/functions/push.js')).pushHandler);
 
 const realFetch = globalThis.fetch;
 

@@ -90,7 +90,13 @@ test.after(async () => {
  * Walk the real UI to the Create step with `ITEMS` items, every one with a
  * manager, then hand over. `onPush(body, n)` answers each /api/push call.
  */
-async function toCreateStep({ quotaReply, onPush }) {
+/** A super who has connected Procore, unless a test says otherwise. */
+const CONNECTED = () => ({
+  email: 'test@buffaloconstruction.com',
+  procore: { configured: true, connected: true, name: 'Test Super', expiresAt: Date.now() + 3_600_000 },
+});
+
+async function openApp({ quotaReply = quota(), onPush = () => ({ json: { results: [] } }), meReply = CONNECTED, extraRoutes = {} } = {}) {
   const { browser, port } = await harness();
   const page = await browser.newPage();
   const errors = [];
@@ -98,13 +104,15 @@ async function toCreateStep({ quotaReply, onPush }) {
   const pushes = [];
   const quotaCalls = [];
 
-  await page.route('**/api/**', async (route) => {
+  // On the context, not the page, so the Procore connect popup is routed too.
+  await page.context().route('**/api/**', async (route) => {
     const url = new URL(route.request().url());
     const send = (body, status = 200) =>
       route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
+    if (extraRoutes[url.pathname]) return extraRoutes[url.pathname](route);
     switch (url.pathname) {
       case '/api/me':
-        return send({ email: 'test@buffaloconstruction.com' });
+        return send(meReply());
       case '/api/projects':
         return send({ projects: [{ id: 1, name: 'Test Job' }], source: 'stub' });
       case '/api/probe':
@@ -129,6 +137,11 @@ async function toCreateStep({ quotaReply, onPush }) {
   });
 
   await page.goto(`http://127.0.0.1:${port}/index.html?project_id=1`, { waitUntil: 'networkidle' });
+  return { page, pushes, errors, quotaCalls, port };
+}
+
+async function toCreateStep(opts) {
+  const { page, pushes, errors, quotaCalls } = await openApp(opts);
   await page.waitForFunction(() => !document.getElementById('next-btn').disabled);
   await page.click('#next-btn'); // → upload
 
@@ -355,6 +368,93 @@ test('waiting out a short window costs no extra quota checks', async () => {
     await page.waitForFunction(() => /12 punch items created/.test(document.getElementById('results').textContent), null, { timeout: 30_000 });
     assert.ok(pushes.length >= 3, 'it paced across several windows');
     assert.ok(quotaCalls.length - before <= 1, `quota was asked ${quotaCalls.length - before} times during the push`);
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
+// ── Creating items as the super: the Procore connection ─────────────────────
+
+const NOT_CONNECTED = () => ({
+  email: 'test@buffaloconstruction.com',
+  procore: { configured: true, connected: false, name: null, expiresAt: null },
+});
+
+test('without a Procore connection, the super is asked to connect and cannot continue', async () => {
+  const { page, errors } = await openApp({ meReply: NOT_CONNECTED });
+  try {
+    await page.waitForSelector('#procore-connect');
+    assert.match(await page.textContent('#procore-card'), /Connect your Procore account/);
+    assert.ok(await page.isDisabled('#next-btn'), 'project chosen, but no Procore connection');
+    assert.match(await page.textContent('#readiness'), /Connect Procore above/);
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
+test('connecting happens in a popup and the open tab picks it up without reloading', async () => {
+  let connected = false;
+  const { page, errors } = await openApp({
+    meReply: () => (connected ? { ...CONNECTED(), procore: { ...CONNECTED().procore, name: 'Cory Zilisch' } } : NOT_CONNECTED()),
+    extraRoutes: {
+      // Stands in for Procore's login and our callback: the popup ends on the
+      // callback's page, which loads the real /procore-connected.js.
+      '/api/procore/connect': (route) => {
+        connected = true;
+        return route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body: '<!doctype html><body data-ok="true" data-message="Connected"><script src="/procore-connected.js"></script></body>',
+        });
+      },
+    },
+  });
+  try {
+    await page.evaluate(() => {
+      window.__marker = 'same tab';
+    });
+    const [popup] = await Promise.all([page.waitForEvent('popup'), page.click('#procore-connect')]);
+    await popup.waitForEvent('close');
+    await page.waitForFunction(() => /connected as/.test(document.getElementById('procore-card').textContent));
+    assert.match(await page.textContent('#procore-card'), /Cory Zilisch/);
+    assert.equal(await page.evaluate(() => window.__marker), 'same tab', 'the tab was not reloaded');
+    assert.ok(!(await page.isDisabled('#next-btn')));
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
+test('a connection that expires mid-push stops it and keeps the unsent items selected', async () => {
+  const { page, pushes, errors } = await toCreateStep({
+    quotaReply: quota(),
+    onPush: (body, n) =>
+      n === 1
+        ? { json: { ...created(body).json, createdAs: 'Test Super' } }
+        : {
+            json: {
+              results: body.items.map((it) => ({ clientId: it.clientId, ok: false, procoreConnect: true, error: 'expired' })),
+              procoreConnect: true,
+              quota: null,
+            },
+          },
+  });
+  try {
+    await page.click('#next-btn');
+    await page.waitForFunction(() => /connection expired/.test(document.getElementById('results').textContent));
+
+    assert.equal(pushes.length, 2, 'nothing was sent after the connection was lost');
+    const text = await page.textContent('#results');
+    assert.match(text, /5 punch items created/);
+    assert.match(text, /Created in Procore as Test Super/);
+    // 5 refused in batch two + 2 never attempted.
+    assert.match(text, /7 items were not created/);
+    assert.doesNotMatch(text, /rate limit/i, 'an expired login is not reported as a rate limit');
+    assert.ok(await page.isVisible('[data-act="procore-reconnect"]'));
+    assert.match(await page.textContent('#next-btn'), /Create 7 punch items/, 'the seven stay selected');
+    assert.ok(await page.isDisabled('#next-btn'), 'until the super reconnects');
     assert.deepEqual(errors, []);
   } finally {
     await page.close();

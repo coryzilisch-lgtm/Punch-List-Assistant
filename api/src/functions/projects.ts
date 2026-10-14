@@ -97,7 +97,7 @@ export async function projectsHandler(
   if (!procoreConfigured()) {
     return errorResponse(
       503,
-      'Procore is not configured on this deployment. PROCORE_CLIENT_ID, PROCORE_CLIENT_SECRET and PROCORE_COMPANY_ID must be set in the app settings.',
+      'Procore is not configured on this deployment. PROCORE_CLIENT_ID, PROCORE_CLIENT_SECRET, PROCORE_COMPANY_ID, PROCORE_REDIRECT_URI and PROCORE_SESSION_KEY must be set in the app settings.',
     );
   }
 
@@ -133,7 +133,7 @@ export async function projectsHandler(
       return errorResponse(
         status === 403 ? 403 : 502,
         status === 403
-          ? `The service account cannot see project ${projectId}. It may need adding to that project in Procore.`
+          ? `Your Procore account cannot see project ${projectId}. Ask a project admin in Procore to add you to it.`
           : `Could not look up project ${projectId}: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
@@ -161,7 +161,7 @@ export async function projectsHandler(
       return errorResponse(
         err.status === 403 ? 403 : 502,
         err.status === 403
-          ? 'Procore refused the request. The service account may not have access to this project or tool.'
+          ? 'Procore refused the request. Your Procore account may not have access to this project or tool.'
           : `Procore returned HTTP ${err.status}.`,
         { procore: err.fieldErrors() },
       );

@@ -11,3 +11,4 @@ import './functions/probe';
 import './functions/extract';
 import './functions/push';
 import './functions/quota';
+import './functions/procore-auth';

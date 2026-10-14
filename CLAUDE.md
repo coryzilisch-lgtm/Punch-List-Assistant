@@ -5,9 +5,10 @@
 
 ## What this is
 
-A superintendent picks a Procore project, uploads the punch list PDF the owner
-sent, reviews what was read off it, and presses create. The app creates the punch
-items in Procore as **Drafts** with their photos attached; the super sends them
+A superintendent connects their own Procore login, picks a project, uploads the
+punch list PDF the owner sent, reviews what was read off it, and presses create.
+The app creates the punch items in Procore **as that super**, as **Drafts** with
+their photos attached, so they sit in the super's own court; the super sends them
 from Procore. The work it replaces is retyping
 59 items by hand — an afternoon per list.
 
@@ -64,16 +65,17 @@ So:
 | The assignee key is `login_information_id` | **Not** `assignee_id`. The obvious name is the wrong one, accepted and filtered out. Locked down by a test in `api/test/punch-payload.test.mjs`. |
 | The photo file part is `punch_item[attachments][]` | **Not** `images[]` — `images` is an empty array even on items that have photos. `has_attachments` is the boolean to trust; `web_images` mirrors `attachments`. |
 | Ball-in-court is derived, never writable | A **Draft** sits with its **creator**; an **initiated** item with its **assignee**. Naming a punch item manager does not move it (item #274 proves it). |
-| The service account cannot act as a user | All four candidate impersonation headers returned 200 and Procore still saw the service account. Probed and confirmed. Per-user OAuth is the only remaining route — `docs/procore-oauth.md`. |
+| Items are created as the super, never a robot | User-level OAuth, built 2026-10-14 (see **Who items are created by**). **No service-account fallback**, by Cory's decision: an unconnected super cannot push. (The old service account could not act as a user: all four impersonation headers were probed and ignored.) |
 | Running the app inside Procore was decided against | Reasoning in `docs/SETUP.md`. The iframe and *acting as a user* are independent problems; do not conflate them. |
 | Procore has no validate-only mode for punch items | The only way to test a write is to create a real one. Hence: preview payloads, then push exactly one item. |
 | Two rate limits, one set of headers | Procore's rate-limiting docs (pasted by Cory, 2026-10-13): an **hourly** limit and a **10-second spike** limit. `X-Rate-Limit-*` reports whichever you will hit first: the spike limit (this tenant: 25) until the hourly one is close, then the hourly numbers. **Every request counts, failures included.** See **The Procore rate budget**. |
 
-The tenant: company `18895`, service account `abs-api-export-b171139a@procore.com`,
-which is **shared with the Safety Dashboard ingest** — so its hourly limit is
-shared too (the number is not confirmed: Procore's docs use 600 as their
-example, and 3,600 is only folklore here), and a push can be throttled partway by
-somebody else's nightly sync.
+The tenant: company `18895`. This app is its own Developer App, **BCI Punchlist
+Assistant**, with its own **3,600/hour** (Cory, 2026-10-14; per Procore's
+increase form the limit is per Developer App). The old service account
+`abs-api-export-b171139a@procore.com` belongs to the Safety Dashboard ingest and
+is no longer used here; until this app's own credentials were in place it shared
+that account's hourly limit, which is what the October 429s were.
 
 ---
 
@@ -123,6 +125,42 @@ are exempt. Final approver is still only a warning.
 A batch killed at 45s is also no longer shown as "rejected, still selected so
 you can resend": some of it may have been created. It is marked "may already be
 in Procore" and unticked, so a re-press cannot duplicate it.
+
+## Who items are created by — user-level OAuth, 2026-10-14
+
+Every Procore request runs on the **signed-in super's own token**. Items are
+created by them, a Draft sits in their court, Procore's own permissions apply,
+and the audit trail names who did the work.
+
+- **No fallback.** No connection, no push: `/api/push` refuses before any write,
+  and any Procore call without a session throws `ProcoreConnectRequired`, which
+  `guarded()` turns into a 401 with `procoreConnect: true`. That is distinct from
+  the Entra 401, and the dashboard offers "Connect Procore" for it.
+- **The token lives in one cookie, for one session.** `pla_procore` is AES-GCM
+  sealed with `PROCORE_SESSION_KEY`, HttpOnly, Secure, bound to the Entra
+  `userId`. A cookie in someone else's session does not open. **No refresh token
+  is kept**, so there is nothing long-lived at rest and no rotation race. Expiry
+  (~2h) means one click to reconnect.
+- **Connecting is a popup** (`/procore-connected.js` reports back to the open
+  tab), so a reconnect mid-review loses nothing. A push whose token expires
+  mid-batch stops: later items are never sent into the 401, and everything not
+  created stays selected.
+- ⚠️ **The callback is anonymous at the platform**, the one exception to the
+  Entra gate (`staticwebapp.config.json`). It arrives as a redirect from
+  procore.com, and whether the browser sends SWA's login cookie on that is not
+  this app's to decide. It proves itself with the sealed `state` cookie instead:
+  set by `/connect` for one signed-in user, encrypted, ten minutes, checked in
+  constant time. If SWA does pass a principal, it must match.
+- **Everything remembered is per super.** Cache entries, list-path verdicts and
+  failed write strategies are keyed by `actorKey()`, because Procore filters what
+  it returns by the caller's permissions: one super's project directory or 403 is
+  not a fact about anybody else.
+- **The redirect URI must match byte for byte** between `PROCORE_REDIRECT_URI`
+  and the app's OAuth Credentials page in Procore's developer portal.
+
+**Not yet seen against the live tenant:** Procore's token response and `/me`
+shape for a user-level app, and whether a super whose role cannot create punch
+items gets a clear 403 (the results screen shows Procore's own error).
 
 ## Who can open this
 
@@ -193,6 +231,7 @@ docs/procore-oauth.md           acting as the superintendent instead of the robo
 | `POST /api/push` | create items as **Drafts** (+ photos, assignees). Never sends. `dryRun` previews payloads |
 | `GET /api/probe?project_id=` | the connection check the app shows on step 1 |
 | `GET /api/quota` | Procore's rate limit left, and how many items that is room for. One request |
+| `GET /api/procore/connect` · `/callback` · `POST /disconnect` | The super's Procore login (user-level OAuth). The callback is the one anonymous route; see below |
 | `GET /api/inspect` | the read-only truth probe — see below |
 
 ### `/api/inspect` modes
@@ -354,8 +393,13 @@ here; Cory pasted the page on 2026-10-13):
   (10-second window). The `X-Rate-Limit-Limit/Remaining/Reset` headers report
   **whichever you are most likely to exceed first**: the spike limit, until you
   are close to the hourly one, then the hourly numbers. `Reset` is a Unix
-  timestamp in seconds. The tenant reported spike `25`; the hourly number has not
-  been seen yet (Procore's example is `600`; do not assume 3,600).
+  timestamp in seconds. This tenant: spike **25** (seen in the headers, 10-13),
+  hourly **3,600** (Cory, 10-14). Read the headers anyway; Procore says they can change.
+- **The limit belongs to a Developer App.** Procore's "API Rate Limit Increase
+  Request" form asks for the company ID *and* the application name and Developer
+  App URL, and calls it "your application's API rate limit". Increases come in
+  multiples of 600, and the review board judges the app's last **30 days** of
+  traffic: consistent use, backoff after 429s, and a low rate of non-429 4xx.
 - **Every request counts, including failures.** A 400, 403, 404 or 429 spends
   quota exactly like a create.
 - On a 429, pause until `Reset` and retry. Don't keep sending while over.
@@ -463,8 +507,9 @@ results screen does the same on a stop. The raw evidence is at
 The results screen adds up the import's own requests (`requests` on every push
 response) and, on a stop, names which limit it was and what this import had
 spent. On 10-13 a Sandbox push stopped at a long reset after **96 items, about
-200 requests**. Against a 3,600/hour quota that was not this app; the evidence
-above is how to confirm it next time.
+200 requests**. Against 3,600/hour that leaves ~3,400 spent by something else on
+the same Developer App in that hour, most likely the Safety Dashboard ingest.
+Confirm it in Procore's API Call Activity Report.
 
 **Where an import's requests go** (measured with a mocked Procore): project list
 0 (the Fabric mirror), selecting a project ~7 (cached 10 min), reading the PDF 0,
@@ -478,9 +523,12 @@ shows `echo.agrees` on every item of real imports, dropping the read-back would
 halve the cost. That is a decision for Cory, with that evidence in hand, not a
 default.
 
-⚠️ Whether a separate Procore app registration gets its own quota is **unknown**.
-The "company-wide" claim above is not a tenant answer. Now that the headers are
-read, compare what this app sees against the ingest's usage before deciding.
+**Giving this app its own Developer App is the fix for contention** (done with the
+user-level OAuth build, 2026-10-14), and needed no approval: per the increase form the limit is per app, so its own credentials
+would carry their own 3,600/hour, untouched by the ingest. (Inferred from the
+form's wording; confirm by watching the headers after the switch.) It means a new
+`PROCORE_CLIENT_ID`/`PROCORE_CLIENT_SECRET` in this app's settings only, not in
+Key Vault, plus granting the new app's service account the same project access.
 
 Covered by `api/test/quota.test.mjs` and, through the real UI,
 `tools/dashboard-test/push-quota.test.mjs`. Writing the browser test found that
@@ -492,9 +540,8 @@ screen. It is back in `renderResults()`.
 The read-backs are the safety property — Procore has answered 200 and stored
 nothing three times — and trading them for rate would reintroduce exactly the bug
 class this repo has already paid for. A 60-item list is ~120 requests:
-small against 3,600/hour, but a fifth of an hourly limit of 600 (Procore's own
-example; this tenant's number is not yet known). The thing to avoid is running
-one during the Safety Dashboard's nightly ingest.
+small against 3,600/hour, and the 228-item Darden list is ~460. The thing to
+avoid is sharing the hour with the Safety Dashboard ingest.
 
 ## Beta notice and branding
 
@@ -596,14 +643,6 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
   once; the control call read a location successfully in the same response, so
   nothing is wrong with them. Discovery now pages candidates directly instead of
   probing then re-fetching, which removes one request per list.
-- **The service account's display name is blank in Procore**, which is why every
-  imported item reads as "ABS abs-api-export-b171139a". Renaming it in Procore's
-  directory is a two-minute fix with no code — but that account is **shared with
-  the Safety Dashboard ingest**, so change it knowing that.
-- **Items are created by the integration, not the superintendent**, so a Draft
-  waits in a robot's court until the super sends it from Procore. Per-user OAuth is the route; the full design, the
-  refresh-token rotation race it has to survive, and the Procore-side app
-  registration are in `docs/procore-oauth.md`.
 - **Claude on Foundry** — swap three settings when the Marketplace agreement
   lands (`ANTHROPIC_FOUNDRY_RESOURCE`, `ANTHROPIC_FOUNDRY_API_KEY`,
   `PUNCH_EXTRACT_MODEL`); no code change.

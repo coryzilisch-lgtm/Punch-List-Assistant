@@ -1,3 +1,4 @@
+import { ProcoreConnectRequired } from '../lib/procore-session';
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
 import { errorResponse, guarded, json } from '../lib/http';
 import {
@@ -52,16 +53,23 @@ export async function probeHandler(
       name: 'Procore credentials',
       ok: false,
       detail:
-        'PROCORE_CLIENT_ID, PROCORE_CLIENT_SECRET and/or PROCORE_COMPANY_ID are missing from the app settings.',
+        'PROCORE_CLIENT_ID, PROCORE_CLIENT_SECRET, PROCORE_COMPANY_ID, PROCORE_REDIRECT_URI and/or PROCORE_SESSION_KEY are missing from the app settings.',
     });
     return json({ checks, ready: false });
   }
 
   // 1. Can we authenticate at all?
   try {
-    await procoreRequest('GET', '/rest/v1.0/me');
-    checks.push({ name: 'Procore credentials', ok: true, detail: `Authenticated against company ${companyId()}.` });
+    const me = await procoreRequest<{ name?: string; login?: string }>('GET', '/rest/v1.0/me');
+    checks.push({
+      name: 'Procore credentials',
+      ok: true,
+      detail: `Signed in to Procore as ${me?.name || me?.login || 'you'}, company ${companyId()}.`,
+    });
   } catch (err) {
+    // Not connected, or the login expired: that is the gate's to answer, so the
+    // dashboard offers "Reconnect Procore" instead of a failed check.
+    if (err instanceof ProcoreConnectRequired) throw err;
     checks.push({
       name: 'Procore credentials',
       ok: false,
@@ -95,7 +103,7 @@ export async function probeHandler(
       ok: !access.withheld,
       detail: access.withheld
         ? `Procore reports ${access.total} punch item(s) on this project but returned none. ` +
-          'That is a permission filter, not an empty list — the service account can see the tool ' +
+          'That is a permission filter, not an empty list: your Procore account can see the tool ' +
           'but not its contents.'
         : `Readable — project currently has ${access.total ?? 'an unknown number of'} punch item(s).`,
     });
@@ -105,7 +113,7 @@ export async function probeHandler(
       ok: false,
       detail: describe(
         err,
-        'Could not read the punch list. The service account likely needs the Punch List tool enabled on this project.',
+        'Could not read the punch list. Your Procore role likely needs the Punch List tool on this project.',
       ),
     });
   }

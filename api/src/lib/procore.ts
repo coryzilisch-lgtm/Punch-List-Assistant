@@ -1,10 +1,11 @@
 /**
  * Procore API client.
  *
- * Auth is OAuth 2.0 client-credentials (server-to-server, no user interaction),
- * the same grant the Safety Dashboard's Fabric notebooks use. Tokens last ~2h;
- * `getToken()` re-mints ~5 minutes before expiry and every request force-refreshes
- * once on a 401 before giving up.
+ * Auth is Procore's user-level OAuth (authorization code): every request runs on
+ * the signed-in superintendent's own token, held for the session in an encrypted
+ * cookie (see `procore-session.ts`). There is no service-account fallback. A
+ * request with no connected super throws `ProcoreConnectRequired`, and so does a
+ * 401 from Procore: a user token cannot be re-minted here, only reconnected.
  *
  * ── On the punch-item WRITE contract ────────────────────────────────────────
  * Procore's punch list is one of the most tenant-configurable tools in the
@@ -23,6 +24,7 @@
  */
 
 import { bust, cached as memoized, CONFIG_TTL_MS, LIST_TTL_MS } from './cache';
+import { actorKey, currentProcoreSession, ProcoreConnectRequired } from './procore-session';
 import {
   exhaustedUntil,
   noteHeaders,
@@ -39,7 +41,6 @@ import {
 const LOGIN_BASE = process.env.PROCORE_LOGIN_BASE_URL || 'https://login.procore.com';
 const API_BASE = process.env.PROCORE_API_BASE_URL || 'https://api.procore.com';
 
-const TOKEN_SKEW_MS = 5 * 60 * 1000; // re-mint 5 min early
 const MAX_RETRIES = 4;
 
 /**
@@ -92,21 +93,20 @@ function summarize(body: unknown): string {
   return s.length > 600 ? `${s.slice(0, 600)}…` : s;
 }
 
-// ── Token management ────────────────────────────────────────────────────────
+// ── Configuration and the user-level OAuth flow ────────────────────────────
 
-interface CachedToken {
-  value: string;
-  expiresAt: number;
-}
-
-let cached: CachedToken | null = null;
-let inFlight: Promise<string> | null = null;
-
+/**
+ * Everything the user-level OAuth flow needs. The redirect URI must match, byte
+ * for byte, the one registered on the app's OAuth Credentials page in Procore's
+ * developer portal; Procore refuses the exchange otherwise.
+ */
 export function procoreConfigured(): boolean {
   return Boolean(
     process.env.PROCORE_CLIENT_ID &&
       process.env.PROCORE_CLIENT_SECRET &&
-      process.env.PROCORE_COMPANY_ID,
+      process.env.PROCORE_COMPANY_ID &&
+      process.env.PROCORE_REDIRECT_URI &&
+      (process.env.PROCORE_SESSION_KEY || '').length >= 32,
   );
 }
 
@@ -116,45 +116,38 @@ export function companyId(): string {
   return id;
 }
 
-export async function getToken(force = false): Promise<string> {
-  if (!force && cached && Date.now() < cached.expiresAt - TOKEN_SKEW_MS) {
-    return cached.value;
-  }
-  // Collapse concurrent refreshes — a page-by-page extraction run can fire
-  // several requests at once and we do not want N token mints.
-  if (!force && inFlight) return inFlight;
+/** Where to send the super to authorize. Top-level navigation, not fetch. */
+export function authorizeUrl(state: string): string {
+  const url = new URL(`${LOGIN_BASE}/oauth/authorize`);
+  url.searchParams.set('response_type', 'code');
+  url.searchParams.set('client_id', process.env.PROCORE_CLIENT_ID || '');
+  url.searchParams.set('redirect_uri', process.env.PROCORE_REDIRECT_URI || '');
+  url.searchParams.set('state', state);
+  return url.toString();
+}
 
-  const clientId = process.env.PROCORE_CLIENT_ID;
-  const clientSecret = process.env.PROCORE_CLIENT_SECRET;
-  if (!clientId || !clientSecret) {
-    throw new Error('PROCORE_CLIENT_ID / PROCORE_CLIENT_SECRET are not set');
-  }
-
-  const mint = (async () => {
-    const res = await fetch(`${LOGIN_BASE}/oauth/token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        grant_type: 'client_credentials',
-        client_id: clientId,
-        client_secret: clientSecret,
-      }),
-    });
-    const body = await readBody(res);
-    if (!res.ok) throw new ProcoreError('POST', '/oauth/token', res.status, body);
-
-    const token = (body as { access_token?: string }).access_token;
-    const expiresIn = (body as { expires_in?: number }).expires_in ?? 7200;
-    if (!token) throw new Error('Procore token response had no access_token');
-
-    cached = { value: token, expiresAt: Date.now() + expiresIn * 1000 };
-    return token;
-  })().finally(() => {
-    inFlight = null;
+/**
+ * Trade the one-use code (valid ten minutes) for the super's access token. The
+ * refresh token Procore also returns is deliberately dropped: nothing stores it.
+ */
+export async function exchangeCode(code: string): Promise<{ accessToken: string; expiresIn: number }> {
+  const res = await fetch(`${LOGIN_BASE}/oauth/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      grant_type: 'authorization_code',
+      client_id: process.env.PROCORE_CLIENT_ID,
+      client_secret: process.env.PROCORE_CLIENT_SECRET,
+      code,
+      redirect_uri: process.env.PROCORE_REDIRECT_URI,
+    }),
   });
-
-  inFlight = mint;
-  return mint;
+  const body = await readBody(res);
+  if (!res.ok) throw new ProcoreError('POST', '/oauth/token', res.status, body);
+  const accessToken = (body as { access_token?: string }).access_token;
+  const expiresIn = Number((body as { expires_in?: number }).expires_in) || 7200;
+  if (!accessToken) throw new Error('Procore token response had no access_token');
+  return { accessToken, expiresIn };
 }
 
 async function readBody(res: Response): Promise<unknown> {
@@ -220,7 +213,6 @@ export async function procoreRequest<T = unknown>(
     if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
   }
 
-  let forceRefresh = false;
 
   // A write that failed with a 5xx or a dropped connection may still have been
   // performed — Procore can store the item and then fail to answer. Retrying it
@@ -246,8 +238,10 @@ export async function procoreRequest<T = unknown>(
       await sleep(wait + 250);
     }
 
-    const token = await getToken(forceRefresh);
-    forceRefresh = false;
+    // The super's own token, and nothing else: no service-account fallback.
+    const session = currentProcoreSession();
+    if (!session) throw new ProcoreConnectRequired('not-connected');
+    const token = session.accessToken;
 
     const headers: Record<string, string> = {
       Authorization: `Bearer ${token}`,
@@ -291,11 +285,11 @@ export async function procoreRequest<T = unknown>(
 
     const body = await readBody(res);
 
-    if (res.status === 401 && attempt < MAX_RETRIES) {
-      // Token died mid-run (long imports outlive a 2h token). Re-mint once
-      // and retry rather than surfacing this as a permissions problem.
-      forceRefresh = true;
-      continue;
+    if (res.status === 401) {
+      // The super's token expired or was revoked. It cannot be re-minted here
+      // (no refresh token is kept), so the super reconnects. Procore answers a
+      // 401 before doing anything, so nothing was written.
+      throw new ProcoreConnectRequired('expired');
     }
 
     if (res.status === 429) {
@@ -693,7 +687,9 @@ export async function resolveList<T extends NamedRef>(
   group: 'trades' | 'vendors',
   projectId: number,
 ): Promise<{ rows: T[]; resolution: ListResolution }> {
-  const key = `${group}:${projectId}`;
+  // Per super: a path that 403s on one person's permissions is not "missing"
+  // for everyone, and must not be remembered as if it were.
+  const key = `${actorKey()}|${group}:${projectId}`;
 
   // One deadline for the WHOLE chain, not one per candidate. Five candidates
   // with twelve seconds each is sixty seconds, and the Function is killed at
@@ -922,6 +918,9 @@ async function loadProjectPunchConfig(projectId: number): Promise<ProjectPunchCo
     try {
       return await fn();
     } catch (err) {
+      // An expired login is not an empty dropdown. Let it reach the gate, which
+      // asks the super to reconnect.
+      if (err instanceof ProcoreConnectRequired) throw err;
       // A rate limit is not a broken lookup, and saying "unavailable" about one
       // is the same mistake the send chain made: it reads as a fact about the
       // integration when it is a fact about the minute. The first live run of
@@ -981,6 +980,7 @@ async function loadProjectPunchConfig(projectId: number): Promise<ProjectPunchCo
           `(${resolution.tried.map((t) => `${t.label} → ${t.status ?? 'error'}`).join(', ')}).`,
       };
     } catch (err) {
+      if (err instanceof ProcoreConnectRequired) throw err;
       // Transient only — discovery rethrows those rather than recording a verdict.
       degraded = true;
       return {
@@ -1359,14 +1359,19 @@ interface WriteStrategy<A extends unknown[]> {
  */
 const memo: {
   assign: string | null;
-  assignFailure: string[] | null;
   attach: string | null;
-  attachFailure: string[] | null;
+  /**
+   * Keyed by `actorKey()`. A strategy that WORKED is a fact about Procore's
+   * contract and holds for everyone; one that FAILED may have failed on this
+   * super's permissions, and must not stop the next super from trying.
+   */
+  assignFailure: Map<string, string[]>;
+  attachFailure: Map<string, string[]>;
 } = {
   assign: null,
-  assignFailure: null,
   attach: null,
-  attachFailure: null,
+  assignFailure: new Map(),
+  attachFailure: new Map(),
 };
 
 function ordered<A extends unknown[]>(list: Array<WriteStrategy<A>>, known: string | null) {
@@ -1484,7 +1489,8 @@ async function ensurePhotos(
   observed: ObservedPunchItem | null,
 ): Promise<{ errors: string[]; observed: ObservedPunchItem | null }> {
   if (!photos.length || storedPhotos(observed) > 0) return { errors: [], observed };
-  if (memo.attachFailure) return { errors: memo.attachFailure, observed };
+  const knownAttachFailure = memo.attachFailure.get(actorKey());
+  if (knownAttachFailure) return { errors: knownAttachFailure, observed };
 
   const run = await runChain(
     ATTACH_STRATEGIES,
@@ -1500,7 +1506,7 @@ async function ensurePhotos(
     memo.attach = run.strategy;
     return { errors: [], observed: run.observed };
   }
-  if (!run.transient) memo.attachFailure = run.errors;
+  if (!run.transient) memo.attachFailure.set(actorKey(), run.errors);
   return { errors: run.errors, observed };
 }
 
@@ -1577,8 +1583,9 @@ export async function ensureAssignees(
   if (observed && observed.assignees.length > 0) {
     return { strategy: 'inline assignments on create', errors: [], observed };
   }
-  if (memo.assignFailure) {
-    return { strategy: null, errors: memo.assignFailure, observed };
+  const knownAssignFailure = memo.assignFailure.get(actorKey());
+  if (knownAssignFailure) {
+    return { strategy: null, errors: knownAssignFailure, observed };
   }
 
   const run = await runChain(
@@ -1595,7 +1602,7 @@ export async function ensureAssignees(
     memo.assign = run.strategy;
     return { strategy: run.strategy, errors: [], observed: run.observed };
   }
-  if (!run.transient) memo.assignFailure = run.errors;
+  if (!run.transient) memo.assignFailure.set(actorKey(), run.errors);
   return { strategy: null, errors: run.errors, observed };
 }
 
