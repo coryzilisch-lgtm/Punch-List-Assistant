@@ -60,7 +60,10 @@ function serve() {
 
 /** Enough of the API for the real page to boot without reaching Procore. */
 const API = {
-  '/api/me': { email: 'test@buffaloconstruction.com' },
+  '/api/me': {
+    email: 'test@buffaloconstruction.com',
+    procore: { configured: true, connected: true, name: 'Test Super', expiresAt: Date.now() + 3_600_000 },
+  },
   '/api/projects': { projects: [], source: 'stub' },
 };
 

@@ -1,4 +1,5 @@
 import type { HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
+import { ProcoreConnectRequired, runAsProcoreUser, sessionFromCookie } from './procore-session';
 
 /**
  * Shared HTTP helpers. Every response is JSON and no-store: this app is a
@@ -92,7 +93,8 @@ export function guarded(
     // Note this also 401s a local `func start`, which has no SWA principal to
     // inject. That is deliberate — an env flag to bypass an auth check is how
     // auth checks get bypassed in production.
-    if (!getPrincipal(request)) {
+    const principal = getPrincipal(request);
+    if (!principal) {
       context.warn(`${name} refused an unauthenticated request`);
       return errorResponse(
         401,
@@ -101,9 +103,19 @@ export function guarded(
       );
     }
 
+    // The super's Procore session, if they connected one in this browser and it
+    // belongs to this Entra identity. Every Procore call in the handler runs as
+    // them; with none, the first Procore call throws ProcoreConnectRequired.
+    const session = sessionFromCookie(request.headers.get('cookie'), principal.userId, Date.now());
+
     try {
-      return await handler(request, context);
+      return await runAsProcoreUser(session, () => handler(request, context));
     } catch (err) {
+      if (err instanceof ProcoreConnectRequired) {
+        // Distinct from the Entra 401 above: the dashboard offers "Connect
+        // Procore" for this one, and the sign-in page for that one.
+        return errorResponse(401, err.message, { procoreConnect: true, reason: err.reason });
+      }
       const message = err instanceof Error ? err.message : String(err);
       const stack = err instanceof Error ? err.stack : undefined;
       context.error(`${name} threw: ${message}\n${stack ?? ''}`);

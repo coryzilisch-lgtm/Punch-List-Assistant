@@ -1,6 +1,24 @@
 # Pushing to Procore as the superintendent, not as the integration
 
-Research note, September 2026. Nothing here is built yet.
+> **✅ Built, 2026-10-14**, in a simpler shape than this research note planned:
+>
+> - A new Developer App, **BCI Punchlist Assistant**, with a **Data Connector,
+>   User Level Authentication** component. Standard authorization code, no
+>   iframe, so the Entra gate is unchanged. Its own app, so its own hourly limit.
+> - **No service-account fallback** (Cory's call): an unconnected super cannot
+>   push. Items are always created by a person.
+> - **No refresh token stored anywhere.** The access token lives for one session
+>   (~2h) in an AES-GCM sealed, HttpOnly cookie bound to the Entra user. No
+>   storage account, no rotation race. Reconnect is one click, in a popup, so a
+>   mid-review expiry loses nothing.
+> - The callback is **anonymous at the platform** and proves itself with the
+>   sealed `state` cookie instead, because it arrives cross-site from
+>   procore.com and SWA's login cookie may not be sent on that redirect.
+>
+> Code: `api/src/lib/procore-session.ts`, `api/src/functions/procore-auth.ts`.
+> Tests: `api/test/procore-auth.test.mjs`, and the connect/expiry cases in
+> `tools/dashboard-test/push-quota.test.mjs`. The rest of this note is the
+> original research, kept for the reasoning.
 
 ## Why this keeps coming up
 

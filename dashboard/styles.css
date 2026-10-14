@@ -610,3 +610,7 @@ details.byid code {
   padding: 1px 5px;
   font-size: 12px;
 }
+
+/* Procore connection: a quiet one-liner once connected, a link-styled action. */
+.procore-line { font-size: 14px; }
+.btn-link { background: none; border: 0; padding: 0; color: inherit; text-decoration: underline; cursor: pointer; font: inherit; }

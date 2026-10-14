@@ -32,6 +32,18 @@
       "statusCode": 404
     },
     {
+      "route": "/api/procore/callback",
+      "allowedRoles": [
+        "anonymous"
+      ]
+    },
+    {
+      "route": "/procore-connected.js",
+      "allowedRoles": [
+        "anonymous"
+      ]
+    },
+    {
       "route": "/api/*",
       "allowedRoles": [
         "authenticated"

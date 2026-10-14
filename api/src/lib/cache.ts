@@ -23,6 +23,18 @@
  * is a copy of something Procore can be asked for again.
  */
 
+import { actorKey } from './procore-session';
+
+/**
+ * Every key is scoped to the super it was fetched as. Since requests run on each
+ * super's own Procore token, what comes back is filtered by THEIR permissions;
+ * sharing a cached project directory or vendor list across people would hand
+ * one super data Procore withheld from them.
+ */
+function scoped(key: string): string {
+  return `${actorKey()}|${key}`;
+}
+
 interface Entry<T> {
   /** Present from the moment work starts, so concurrent callers can join it. */
   promise: Promise<T>;
@@ -38,7 +50,8 @@ export const CONFIG_TTL_MS = 10 * 60_000;
 /** Short: this one exists to stop two endpoints in one page load from both paying. */
 export const LIST_TTL_MS = 60_000;
 
-export function cached<T>(key: string, ttlMs: number, load: () => Promise<T>): Promise<T> {
+export function cached<T>(rawKey: string, ttlMs: number, load: () => Promise<T>): Promise<T> {
+  const key = scoped(rawKey);
   const existing = entries.get(key) as Entry<T> | undefined;
 
   if (existing) {
@@ -66,7 +79,8 @@ export function cached<T>(key: string, ttlMs: number, load: () => Promise<T>): P
 }
 
 /** Drop an entry — used after a write makes the cached copy wrong. */
-export function bust(prefix: string): void {
+export function bust(rawPrefix: string): void {
+  const prefix = scoped(rawPrefix);
   for (const key of entries.keys()) {
     if (key === prefix || key.startsWith(`${prefix}:`)) entries.delete(key);
   }

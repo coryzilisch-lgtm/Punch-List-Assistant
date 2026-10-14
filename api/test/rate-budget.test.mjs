@@ -95,7 +95,11 @@ test('bust does not clear a key that only shares a word', async () => {
   assert.equal(refetched, false);
 });
 
-import { paginateWithBudget } from '../dist/lib/procore.js';
+import { paginateWithBudget as rawPaginate } from '../dist/lib/procore.js';
+import { runAsProcoreUser } from '../dist/lib/procore-session.js';
+// Procore calls run as a connected super; these tests are about pagination.
+const TEST_SUPER = { accessToken: 'user-token', expiresAt: Date.now() + 3_600_000, owner: 'entra-oid', procoreUserId: 42, name: 'Test Super', login: null };
+const paginateWithBudget = (...args) => runAsProcoreUser(TEST_SUPER, () => rawPaginate(...args));
 
 process.env.PROCORE_CLIENT_ID ||= 'x';
 process.env.PROCORE_CLIENT_SECRET ||= 'x';

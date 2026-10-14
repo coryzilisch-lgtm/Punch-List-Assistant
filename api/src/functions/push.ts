@@ -10,6 +10,7 @@ import {
   PunchItemInput,
   PunchPhoto,
 } from '../lib/procore';
+import { currentProcoreSession, ProcoreConnectRequired } from '../lib/procore-session';
 import { exhaustedUntil, pushCapacity, currentQuota, quotaReport, WAIT_IN_FUNCTION_MS } from '../lib/quota';
 
 /**
@@ -90,6 +91,8 @@ interface PushResult {
   rateLimited?: boolean;
   /** When the quota resets, epoch ms, on a rate-limited result. */
   resetAt?: number | null;
+  /** Not sent: the super's Procore connection is missing or expired. Never written. */
+  procoreConnect?: boolean;
   /** Field-level messages straight from Procore, when it gave any. */
   fieldErrors?: string[];
   /** Did the create's own response say what the read-back said? See compareEcho(). */
@@ -174,8 +177,14 @@ export async function pushHandler(
   if (!dryRun && !procoreConfigured()) {
     return errorResponse(
       503,
-      'Procore is not configured on this deployment. PROCORE_CLIENT_ID, PROCORE_CLIENT_SECRET and PROCORE_COMPANY_ID must be set in the app settings.',
+      'Procore is not configured on this deployment. PROCORE_CLIENT_ID, PROCORE_CLIENT_SECRET, PROCORE_COMPANY_ID, PROCORE_REDIRECT_URI and PROCORE_SESSION_KEY must be set in the app settings.',
     );
+  }
+
+  // Items are created AS the super, never as a service account. With no Procore
+  // connection, refuse before anything is written.
+  if (!dryRun && !currentProcoreSession()) {
+    throw new ProcoreConnectRequired('not-connected');
   }
 
   const actor = userEmail(request) || 'unknown';
@@ -183,8 +192,21 @@ export async function pushHandler(
   // Approximate if two pushes share a warm instance at the same moment.
   resetProcoreRequestCount();
   const results: PushResult[] = [];
+  // Set when the super's token expires mid-batch: every later item is skipped
+  // rather than sent into the same 401, which would spend quota on refusals.
+  let connectLost = false;
 
   for (const raw of body.items) {
+    if (connectLost) {
+      results.push({
+        clientId: raw.clientId,
+        ok: false,
+        procoreConnect: true,
+        error: 'Not sent: your Procore connection expired. Reconnect, then press Create again.',
+      });
+      continue;
+    }
+
     // Once Procore has said the window is spent, every later item in this batch
     // would only draw a 429. Stop, and say plainly that they were never sent.
     // A window resetting within seconds is not a stop: procoreRequest waits it
@@ -275,6 +297,12 @@ export async function pushHandler(
           `echo=${echo.agrees === null ? '?' : echo.agrees ? 'agrees' : `differs:${echo.differs.join('|')}`}`,
       );
     } catch (err) {
+      if (err instanceof ProcoreConnectRequired) {
+        // Procore answers a 401 before doing anything: this item was not written.
+        connectLost = true;
+        results.push({ clientId: raw.clientId, ok: false, procoreConnect: true, error: err.message });
+        continue;
+      }
       if (err instanceof ProcoreError) {
         results.push({
           clientId: raw.clientId,
@@ -302,6 +330,9 @@ export async function pushHandler(
     created,
     failed: results.length - created,
     results,
+    // Whose account created these, so "created by the integration" is never a surprise.
+    createdAs: currentProcoreSession()?.name ?? null,
+    procoreConnect: connectLost || undefined,
     requests: procoreRequestCount(),
     quota: quotaReport(Date.now()),
   });

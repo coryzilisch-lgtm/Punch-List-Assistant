@@ -200,9 +200,11 @@ then **Save**.
 |---|---|
 | `AAD_CLIENT_ID` | Application (client) ID from step 3 |
 | `AAD_CLIENT_SECRET` | The secret **Value** from step 3 |
-| `PROCORE_CLIENT_ID` | Key Vault `procore-client-id` |
-| `PROCORE_CLIENT_SECRET` | Key Vault `procore-client-secret` |
+| `PROCORE_CLIENT_ID` | **Production** client ID of the **BCI Punchlist Assistant** Developer App (OAuth Credentials, top section; not Sandbox) |
+| `PROCORE_CLIENT_SECRET` | Its Production client secret. **Not** Key Vault: that pair is the Safety Dashboard's |
 | `PROCORE_COMPANY_ID` | `18895` |
+| `PROCORE_REDIRECT_URI` | `https://nice-grass-0ac50c20f.6.azurestaticapps.net/api/procore/callback`, byte for byte the same as registered on the app's OAuth Credentials page |
+| `PROCORE_SESSION_KEY` | A random string of 32+ characters (e.g. `openssl rand -base64 48`). Encrypts the super's Procore session cookie. Changing it signs every super out of Procore, nothing worse |
 | `ANTHROPIC_API_KEY` | The key you tested with in step 0 |
 
 **Optional but recommended — read the project list from Fabric.** Listing
