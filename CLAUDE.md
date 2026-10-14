@@ -71,9 +71,9 @@ So:
 
 The tenant: company `18895`, service account `abs-api-export-b171139a@procore.com`,
 which is **shared with the Safety Dashboard ingest** — so its hourly limit is
-shared too (the number is not confirmed: Procore's docs use 600 as their
-example, and 3,600 is only folklore here), and a push can be throttled partway by
-somebody else's nightly sync.
+shared too: **3,600/hour** (Cory, 2026-10-14). Procore's increase form makes the
+limit **per Developer App**, so the sharing comes from sharing one app's
+credentials, and a push can be throttled partway by the ingest.
 
 ---
 
@@ -354,8 +354,13 @@ here; Cory pasted the page on 2026-10-13):
   (10-second window). The `X-Rate-Limit-Limit/Remaining/Reset` headers report
   **whichever you are most likely to exceed first**: the spike limit, until you
   are close to the hourly one, then the hourly numbers. `Reset` is a Unix
-  timestamp in seconds. The tenant reported spike `25`; the hourly number has not
-  been seen yet (Procore's example is `600`; do not assume 3,600).
+  timestamp in seconds. This tenant: spike **25** (seen in the headers, 10-13),
+  hourly **3,600** (Cory, 10-14). Read the headers anyway; Procore says they can change.
+- **The limit belongs to a Developer App.** Procore's "API Rate Limit Increase
+  Request" form asks for the company ID *and* the application name and Developer
+  App URL, and calls it "your application's API rate limit". Increases come in
+  multiples of 600, and the review board judges the app's last **30 days** of
+  traffic: consistent use, backoff after 429s, and a low rate of non-429 4xx.
 - **Every request counts, including failures.** A 400, 403, 404 or 429 spends
   quota exactly like a create.
 - On a 429, pause until `Reset` and retry. Don't keep sending while over.
@@ -463,8 +468,9 @@ results screen does the same on a stop. The raw evidence is at
 The results screen adds up the import's own requests (`requests` on every push
 response) and, on a stop, names which limit it was and what this import had
 spent. On 10-13 a Sandbox push stopped at a long reset after **96 items, about
-200 requests**. Against a 3,600/hour quota that was not this app; the evidence
-above is how to confirm it next time.
+200 requests**. Against 3,600/hour that leaves ~3,400 spent by something else on
+the same Developer App in that hour, most likely the Safety Dashboard ingest.
+Confirm it in Procore's API Call Activity Report.
 
 **Where an import's requests go** (measured with a mocked Procore): project list
 0 (the Fabric mirror), selecting a project ~7 (cached 10 min), reading the PDF 0,
@@ -478,9 +484,12 @@ shows `echo.agrees` on every item of real imports, dropping the read-back would
 halve the cost. That is a decision for Cory, with that evidence in hand, not a
 default.
 
-⚠️ Whether a separate Procore app registration gets its own quota is **unknown**.
-The "company-wide" claim above is not a tenant answer. Now that the headers are
-read, compare what this app sees against the ingest's usage before deciding.
+**Giving this app its own Developer App is the fix for contention**, and needs no
+approval: per the increase form the limit is per app, so its own credentials
+would carry their own 3,600/hour, untouched by the ingest. (Inferred from the
+form's wording; confirm by watching the headers after the switch.) It means a new
+`PROCORE_CLIENT_ID`/`PROCORE_CLIENT_SECRET` in this app's settings only, not in
+Key Vault, plus granting the new app's service account the same project access.
 
 Covered by `api/test/quota.test.mjs` and, through the real UI,
 `tools/dashboard-test/push-quota.test.mjs`. Writing the browser test found that
@@ -492,9 +501,8 @@ screen. It is back in `renderResults()`.
 The read-backs are the safety property — Procore has answered 200 and stored
 nothing three times — and trading them for rate would reintroduce exactly the bug
 class this repo has already paid for. A 60-item list is ~120 requests:
-small against 3,600/hour, but a fifth of an hourly limit of 600 (Procore's own
-example; this tenant's number is not yet known). The thing to avoid is running
-one during the Safety Dashboard's nightly ingest.
+small against 3,600/hour, and the 228-item Darden list is ~460. The thing to
+avoid is sharing the hour with the Safety Dashboard ingest.
 
 ## Beta notice and branding
 
