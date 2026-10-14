@@ -6,6 +6,7 @@ import {
   listProjects,
   ProcoreError,
   procoreConfigured,
+  procoreNotConfiguredMessage,
   ProcoreProject,
 } from '../lib/procore';
 import { fabricConfigured, fabricSyncedAt, listProjectsFromFabric } from '../lib/fabric';
@@ -97,7 +98,7 @@ export async function projectsHandler(
   if (!procoreConfigured()) {
     return errorResponse(
       503,
-      'Procore is not configured on this deployment. PROCORE_CLIENT_ID, PROCORE_CLIENT_SECRET, PROCORE_COMPANY_ID, PROCORE_REDIRECT_URI and PROCORE_SESSION_KEY must be set in the app settings.',
+      procoreNotConfiguredMessage(),
     );
   }
 

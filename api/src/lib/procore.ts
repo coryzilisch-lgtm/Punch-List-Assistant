@@ -101,13 +101,41 @@ function summarize(body: unknown): string {
  * developer portal; Procore refuses the exchange otherwise.
  */
 export function procoreConfigured(): boolean {
-  return Boolean(
-    process.env.PROCORE_CLIENT_ID &&
-      process.env.PROCORE_CLIENT_SECRET &&
-      process.env.PROCORE_COMPANY_ID &&
-      process.env.PROCORE_REDIRECT_URI &&
-      (process.env.PROCORE_SESSION_KEY || '').length >= 32,
-  );
+  return procoreSettingProblems().length === 0;
+}
+
+/**
+ * Which Procore settings are missing or unusable, by NAME, never value. "Not
+ * configured" alone sent Cory hunting through five settings for the wrong one
+ * (2026-10-14). Values are trimmed first: a pasted trailing space is invisible
+ * in the Azure portal and breaks a redirect URI exactly.
+ */
+/** "Not configured", naming exactly what to fix. */
+export function procoreNotConfiguredMessage(): string {
+  return `Procore is not configured on this deployment: ${procoreSettingProblems().join('; ')}.`;
+}
+
+export function procoreSettingProblems(): string[] {
+  const value = (name: string) => (process.env[name] || '').trim();
+  const problems: string[] = [];
+  for (const name of ['PROCORE_CLIENT_ID', 'PROCORE_CLIENT_SECRET', 'PROCORE_COMPANY_ID', 'PROCORE_REDIRECT_URI']) {
+    if (!value(name)) problems.push(`${name} is not set`);
+  }
+  if (value('PROCORE_COMPANY_ID') && !/^\d+$/.test(value('PROCORE_COMPANY_ID'))) {
+    problems.push('PROCORE_COMPANY_ID must be a number (18895)');
+  }
+  const redirect = value('PROCORE_REDIRECT_URI');
+  if (redirect && !/^https:\/\/[^/]+\/api\/procore\/callback$/.test(redirect)) {
+    problems.push('PROCORE_REDIRECT_URI must be https://<this site>/api/procore/callback, with no trailing slash');
+  }
+  const key = value('PROCORE_SESSION_KEY');
+  if (!key) problems.push('PROCORE_SESSION_KEY is not set');
+  else if (key.length < 32) problems.push(`PROCORE_SESSION_KEY is ${key.length} characters; it needs at least 32`);
+  for (const name of ['PROCORE_CLIENT_ID', 'PROCORE_CLIENT_SECRET', 'PROCORE_REDIRECT_URI', 'PROCORE_SESSION_KEY']) {
+    const raw = process.env[name] || '';
+    if (raw && raw !== raw.trim()) problems.push(`${name} has a space at the start or end`);
+  }
+  return problems;
 }
 
 export function companyId(): string {

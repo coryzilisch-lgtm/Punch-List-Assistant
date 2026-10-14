@@ -1,6 +1,6 @@
 import { app, HttpRequest, HttpResponseInit } from '@azure/functions';
 import { errorResponse, guarded, json } from '../lib/http';
-import { procoreConfigured, procoreRequest, ProcoreError } from '../lib/procore';
+import { procoreConfigured, procoreNotConfiguredMessage, procoreRequest, ProcoreError } from '../lib/procore';
 import { quotaReport } from '../lib/quota';
 
 /**
@@ -13,7 +13,7 @@ import { quotaReport } from '../lib/quota';
  * answer too: the quota is spent, and the report says until when.
  */
 export async function quotaHandler(_request: HttpRequest): Promise<HttpResponseInit> {
-  if (!procoreConfigured()) return errorResponse(503, 'Procore is not configured on this deployment.');
+  if (!procoreConfigured()) return errorResponse(503, procoreNotConfiguredMessage());
   try {
     await procoreRequest('GET', '/rest/v1.0/me');
   } catch (err) {

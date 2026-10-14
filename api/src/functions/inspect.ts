@@ -8,6 +8,7 @@ import {
   listPunchItems,
   ProcoreError,
   procoreConfigured,
+  procoreNotConfiguredMessage,
   procoreRequest,
   procoreRequestCount,
 } from '../lib/procore';
@@ -340,7 +341,7 @@ export async function inspectHandler(
   context: InvocationContext,
 ): Promise<HttpResponseInit> {
   if (!procoreConfigured()) {
-    return errorResponse(503, 'Procore is not configured on this deployment.');
+    return errorResponse(503, procoreNotConfiguredMessage());
   }
 
   // Acting as another user is a company-level question, so it needs no project.

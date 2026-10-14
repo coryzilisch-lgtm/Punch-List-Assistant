@@ -250,7 +250,14 @@ function renderProcoreCard(problem = null) {
   if (!card) return;
   const p = S.procore;
   if (p && !p.configured) {
-    card.innerHTML = note('error', '<strong>Procore is not configured on this deployment.</strong> Tell Cory.');
+    const problems = p.settingProblems || [];
+    card.innerHTML = note(
+      'error',
+      '<strong>Procore is not configured on this deployment.</strong> ' +
+        (problems.length
+          ? `Fix in the Static Web App's <strong>Production</strong> environment variables: ${problems.map(esc).join('; ')}.`
+          : 'Tell Cory.'),
+    );
     return;
   }
   if (procoreConnected()) {

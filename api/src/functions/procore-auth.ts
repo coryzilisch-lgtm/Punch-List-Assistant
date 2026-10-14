@@ -1,7 +1,7 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
 import type { Cookie } from '@azure/functions';
 import { errorResponse, getPrincipal, guarded, json } from '../lib/http';
-import { authorizeUrl, exchangeCode, procoreConfigured, ProcoreError, procoreRequest } from '../lib/procore';
+import { authorizeUrl, exchangeCode, procoreConfigured, procoreNotConfiguredMessage, ProcoreError, procoreRequest } from '../lib/procore';
 import {
   MAX_COOKIE_BYTES,
   newState,
@@ -34,7 +34,7 @@ import {
 const cookieBase = { path: '/api', httpOnly: true, secure: true, sameSite: 'Lax' as const };
 
 export async function connectHandler(request: HttpRequest): Promise<HttpResponseInit> {
-  if (!procoreConfigured()) return errorResponse(503, 'Procore is not configured on this deployment.');
+  if (!procoreConfigured()) return errorResponse(503, procoreNotConfiguredMessage());
   const owner = getPrincipal(request)!.userId;
   const { state, sealed } = newState(owner);
   return {
@@ -67,7 +67,7 @@ export async function callbackHandler(request: HttpRequest, context: InvocationC
   if (principal && principal.userId !== owner) {
     return done(false, 'This Procore sign-in was started by a different Buffalo account. Close this window and try again.');
   }
-  if (!procoreConfigured()) return done(false, 'Procore is not configured on this deployment.');
+  if (!procoreConfigured()) return done(false, procoreNotConfiguredMessage());
   const code = request.query.get('code');
   if (!code) return done(false, 'Procore sent no authorization code. Close this window and try again.');
 

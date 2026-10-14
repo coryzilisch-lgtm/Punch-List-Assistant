@@ -1,6 +1,6 @@
 import { app, HttpRequest, HttpResponseInit } from '@azure/functions';
 import { getPrincipal, json } from '../lib/http';
-import { procoreConfigured } from '../lib/procore';
+import { procoreConfigured, procoreSettingProblems } from '../lib/procore';
 import { sessionFromCookie } from '../lib/procore-session';
 
 /**
@@ -20,6 +20,8 @@ export async function meHandler(request: HttpRequest): Promise<HttpResponseInit>
     identityProvider: principal.identityProvider,
     procore: {
       configured: procoreConfigured(),
+      // Setting NAMES only, never values: what to fix in the Azure portal.
+      settingProblems: procoreSettingProblems(),
       connected: Boolean(session),
       name: session?.name ?? null,
       login: session?.login ?? null,
