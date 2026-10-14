@@ -460,3 +460,95 @@ test('a connection that expires mid-push stops it and keeps the unsent items sel
     await page.close();
   }
 });
+
+// ── Procore's login severs the popup from the tab (2026-10-14) ───────────────
+//
+// Procore's login page sends a Cross-Origin-Opener-Policy, so when the popup
+// comes back to our origin its window.opener is null. The first version relied
+// on window.opener: Cory signed in, the tab never heard, and the app loaded
+// inside the popup instead. These reproduce the severing by nulling the opener
+// before the callback's real script runs.
+
+function connectingApp(callbackHtml) {
+  let connected = false;
+  return {
+    get connected() {
+      return connected;
+    },
+    opts: {
+      meReply: () => (connected ? { ...CONNECTED(), procore: { ...CONNECTED().procore, name: 'Cory Zilisch' } } : NOT_CONNECTED()),
+      extraRoutes: {
+        '/api/procore/connect': (route) => {
+          connected = true; // the callback set the session cookie
+          return route.fulfill({ status: 200, contentType: 'text/html', body: callbackHtml });
+        },
+      },
+    },
+  };
+}
+
+const SEVERED_CALLBACK =
+  '<!doctype html><body data-ok="true" data-message="Connected">' +
+  '<script>window.opener = null;</script><script src="/procore-connected.js"></script></body>';
+
+test('a popup severed from its opener still connects the original tab, and closes', async () => {
+  const flow = connectingApp(SEVERED_CALLBACK);
+  const { page, errors } = await openApp(flow.opts);
+  try {
+    const [popup] = await Promise.all([page.waitForEvent('popup'), page.click('#procore-connect')]);
+    await popup.waitForEvent('close', { timeout: 10_000 });
+    await page.waitForFunction(() => /connected as/.test(document.getElementById('procore-card').textContent));
+    assert.match(await page.textContent('#procore-card'), /Cory Zilisch/);
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
+test('even with every message lost, returning to the tab finds the connection', async () => {
+  // A callback page with no script at all: nothing is posted anywhere.
+  const flow = connectingApp('<!doctype html><body data-ok="true"><p>Connected</p></body>');
+  const { page, errors } = await openApp(flow.opts);
+  try {
+    const [popup] = await Promise.all([page.waitForEvent('popup'), page.click('#procore-connect')]);
+    await popup.waitForLoadState();
+    await popup.close();
+    await page.bringToFront();
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+    await page.waitForFunction(() => /connected as/.test(document.getElementById('procore-card').textContent));
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
+test('opened at a different address from the Procore callback, the page says where to go instead', async () => {
+  // Cory opened punchass.buffaloconstruction.com while Procore returned to the
+  // azurestaticapps.net name: the state cookie and the session landed on the
+  // other site, and connecting could not work.
+  const { page, errors } = await openApp({
+    meReply: () => ({ ...NOT_CONNECTED(), procore: { ...NOT_CONNECTED().procore, callbackHost: 'punchass.example' } }),
+  });
+  try {
+    await page.waitForFunction(() => /Open this app at punchass\.example/.test(document.getElementById('procore-card').textContent));
+    assert.equal(await page.$('#procore-connect'), null, 'no Connect button that cannot work');
+    assert.match(await page.getAttribute('#procore-card a', 'href'), /^https:\/\/punchass\.example\/index\.html/);
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
+test('opened at the callback address, Connect is offered as normal', async () => {
+  const { port } = await harness();
+  const { page, errors } = await openApp({
+    meReply: () => ({ ...NOT_CONNECTED(), procore: { ...NOT_CONNECTED().procore, callbackHost: `127.0.0.1:${port}` } }),
+  });
+  try {
+    await page.waitForSelector('#procore-connect');
+    assert.doesNotMatch(await page.textContent('#procore-card'), /Open this app at/);
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});

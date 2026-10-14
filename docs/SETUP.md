@@ -70,7 +70,7 @@ Do this first because it needs a company admin.
 
 1. In Procore's developer portal, the **BCI Punchlist Assistant** app needs a
    **Data Connector** component with **User Level Authentication**, its
-   Redirect URI set to `https://<swa-host>/api/procore/callback`, and a version
+   Redirect URI set to `https://punchass.buffaloconstruction.com/api/procore/callback` (the address supers open, not the `azurestaticapps.net` name), and a version
    promoted to Production.
 2. A company admin installs it in company 18895: **Company Admin → App
    Management → Install Custom App**, with the version ID.
@@ -210,7 +210,7 @@ then **Save**.
 | `PROCORE_CLIENT_ID` | **Production** client ID of the **BCI Punchlist Assistant** Developer App (OAuth Credentials, top section; not Sandbox) |
 | `PROCORE_CLIENT_SECRET` | Its Production client secret. **Not** Key Vault: that pair is the Safety Dashboard's |
 | `PROCORE_COMPANY_ID` | `18895` |
-| `PROCORE_REDIRECT_URI` | `https://nice-grass-0ac50c20f.6.azurestaticapps.net/api/procore/callback`, byte for byte the same as registered on the app's OAuth Credentials page |
+| `PROCORE_REDIRECT_URI` | `https://punchass.buffaloconstruction.com/api/procore/callback`: the address supers actually open, byte for byte the same as registered on the app's OAuth Credentials page. **Not** the `azurestaticapps.net` name (see CLAUDE.md) |
 | `PROCORE_SESSION_KEY` | A random string of 32+ characters (e.g. `openssl rand -base64 48`). Encrypts the super's Procore session cookie. Changing it signs every super out of Procore, nothing worse |
 | `ANTHROPIC_API_KEY` | The key you tested with in step 0 |
 
