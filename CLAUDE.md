@@ -25,8 +25,10 @@ POST /api/push      creates punch items as Drafts, attaches photos — never sen
 Procore punch list
 ```
 
-Deployed to Azure Static Web Apps on push to `main`:
-**nice-grass-0ac50c20f.6.azurestaticapps.net**. Entra sign-in gates the whole app —
+Deployed to Azure Static Web Apps on push to `main`, served at
+**punchass.buffaloconstruction.com** (also reachable as
+nice-grass-0ac50c20f.6.azurestaticapps.net; use the first, which is where Procore's
+sign-in returns). Entra sign-in gates the whole app —
 see **Who can open this** below, including the reason that sentence was false for
 the app's whole life until 2026-09-14.
 
@@ -157,6 +159,19 @@ and the audit trail names who did the work.
   not a fact about anybody else.
 - **The redirect URI must match byte for byte** between `PROCORE_REDIRECT_URI`
   and the app's OAuth Credentials page in Procore's developer portal.
+- 🛑 **It must be on the domain supers actually open:
+  `punchass.buffaloconstruction.com`**, not the `nice-grass-…azurestaticapps.net`
+  name. Both serve the app, but they are different sites to a browser: on
+  2026-10-14 the callback pointed at the azurestaticapps name while Cory used
+  punchass, so the state cookie and the session landed on the other site and
+  connecting could not work. `/api/me` now reports `callbackHost`, and the
+  step 1 card refuses to offer Connect from any other address and links to
+  the right one.
+- ⚠️ **Procore's login severs the popup from the tab** (Cross-Origin-Opener-
+  Policy), so `window.opener` is null by the time the callback page loads. The
+  result goes out on `BroadcastChannel` and `localStorage` instead, and the tab
+  re-checks `/api/me` when it regains focus. The first version relied on the
+  opener, and its fallback loaded the whole app inside the popup.
 
 **Not yet seen against the live tenant:** Procore's token response and `/me`
 shape for a user-level app, and whether a super whose role cannot create punch

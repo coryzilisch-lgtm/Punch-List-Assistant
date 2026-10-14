@@ -6,6 +6,7 @@ import {
   getProjectPunchConfig,
   ProcoreError,
   procoreConfigured,
+  procoreNotConfiguredMessage,
   procoreRequest,
   procoreRequestCount,
   punchItemAccess,
@@ -53,7 +54,7 @@ export async function probeHandler(
       name: 'Procore credentials',
       ok: false,
       detail:
-        'PROCORE_CLIENT_ID, PROCORE_CLIENT_SECRET, PROCORE_COMPANY_ID, PROCORE_REDIRECT_URI and/or PROCORE_SESSION_KEY are missing from the app settings.',
+        procoreNotConfiguredMessage(),
     });
     return json({ checks, ready: false });
   }

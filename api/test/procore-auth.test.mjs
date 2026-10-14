@@ -239,3 +239,30 @@ test('an expired login during the project config load asks to reconnect, not "em
     (err) => err.name === 'ProcoreConnectRequired',
   );
 });
+
+// ── "Not configured" names what to fix ───────────────────────────────────────
+
+test('a misconfigured deployment names each problem setting, and never a value', async () => {
+  const { procoreSettingProblems, procoreConfigured } = await import('../dist/lib/procore.js');
+  const saved = { ...process.env };
+  try {
+    assert.deepEqual(procoreSettingProblems(), [], 'the test settings are complete');
+    assert.equal(procoreConfigured(), true);
+
+    process.env.PROCORE_SESSION_KEY = 'short-secret-value';
+    process.env.PROCORE_REDIRECT_URI = 'https://app.example/api/procore/callback/';
+    process.env.PROCORE_CLIENT_SECRET = 'the-secret ';
+    delete process.env.PROCORE_CLIENT_ID;
+    const problems = procoreSettingProblems();
+
+    assert.ok(problems.includes('PROCORE_CLIENT_ID is not set'));
+    assert.ok(problems.includes('PROCORE_SESSION_KEY is 18 characters; it needs at least 32'));
+    assert.ok(problems.some((p) => p.startsWith('PROCORE_REDIRECT_URI must be')), 'a trailing slash breaks the exact match');
+    assert.ok(problems.includes('PROCORE_CLIENT_SECRET has a space at the start or end'));
+    assert.equal(procoreConfigured(), false);
+    const text = problems.join(' ');
+    for (const secret of ['short-secret-value', 'the-secret']) assert.ok(!text.includes(secret), `leaked ${secret}`);
+  } finally {
+    process.env = saved;
+  }
+});

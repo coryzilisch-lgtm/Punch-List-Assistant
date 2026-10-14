@@ -64,15 +64,22 @@ right.
 
 ---
 
-## Step 1 — Start the Procore permission request
+## Step 1 — The Procore app, and who can create items
 
-Do this first because it may need someone else, and it is the single most likely
-thing to block the last step.
+Do this first because it needs a company admin.
 
-The Procore service account (`abs-api-export-b171139a@procore.com`) needs the
-**Punch List** tool at a permission level that can **create** items on the
-projects you will import into. Read access is not enough, and it is granted per
-permission template, so a project the account can read may still refuse a write.
+1. In Procore's developer portal, the **BCI Punchlist Assistant** app needs a
+   **Data Connector** component with **User Level Authentication**, its
+   Redirect URI set to `https://punchass.buffaloconstruction.com/api/procore/callback` (the address supers open, not the `azurestaticapps.net` name), and a version
+   promoted to Production.
+2. A company admin installs it in company 18895: **Company Admin → App
+   Management → Install Custom App**, with the version ID.
+
+There is **no service account to grant permissions to**. Items are created as
+each superintendent, on their own login, so what matters is each super's own
+Procore role: the **Punch List** tool at a level that can **create** items on
+the projects they import into. Read access is not enough, and it is granted per
+permission template, so a project a super can read may still refuse a write.
 
 There is no way to test this without writing — Procore has no validate-only mode
 for punch items. Step 6 sends exactly one item as the test.
@@ -203,7 +210,7 @@ then **Save**.
 | `PROCORE_CLIENT_ID` | **Production** client ID of the **BCI Punchlist Assistant** Developer App (OAuth Credentials, top section; not Sandbox) |
 | `PROCORE_CLIENT_SECRET` | Its Production client secret. **Not** Key Vault: that pair is the Safety Dashboard's |
 | `PROCORE_COMPANY_ID` | `18895` |
-| `PROCORE_REDIRECT_URI` | `https://nice-grass-0ac50c20f.6.azurestaticapps.net/api/procore/callback`, byte for byte the same as registered on the app's OAuth Credentials page |
+| `PROCORE_REDIRECT_URI` | `https://punchass.buffaloconstruction.com/api/procore/callback`: the address supers actually open, byte for byte the same as registered on the app's OAuth Credentials page. **Not** the `azurestaticapps.net` name (see CLAUDE.md) |
 | `PROCORE_SESSION_KEY` | A random string of 32+ characters (e.g. `openssl rand -base64 48`). Encrypts the super's Procore session cookie. Changing it signs every super out of Procore, nothing worse |
 | `ANTHROPIC_API_KEY` | The key you tested with in step 0 |
 

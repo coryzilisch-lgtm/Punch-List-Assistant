@@ -1,6 +1,6 @@
 import { app, HttpRequest, HttpResponseInit } from '@azure/functions';
 import { getPrincipal, json } from '../lib/http';
-import { procoreConfigured } from '../lib/procore';
+import { procoreConfigured, procoreSettingProblems } from '../lib/procore';
 import { sessionFromCookie } from '../lib/procore-session';
 
 /**
@@ -20,12 +20,26 @@ export async function meHandler(request: HttpRequest): Promise<HttpResponseInit>
     identityProvider: principal.identityProvider,
     procore: {
       configured: procoreConfigured(),
+      // Setting NAMES only, never values: what to fix in the Azure portal.
+      settingProblems: procoreSettingProblems(),
+      // Where Procore sends the super back after sign-in. The dashboard compares
+      // it with the address it is open on: a mismatch means the sign-in cookie
+      // and the session land on a different site and connecting cannot work.
+      callbackHost: callbackHost(),
       connected: Boolean(session),
       name: session?.name ?? null,
       login: session?.login ?? null,
       expiresAt: session?.expiresAt ?? null,
     },
   });
+}
+
+function callbackHost(): string | null {
+  try {
+    return new URL((process.env.PROCORE_REDIRECT_URI || '').trim()).host || null;
+  } catch {
+    return null;
+  }
 }
 
 app.http('me', {

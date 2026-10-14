@@ -250,7 +250,28 @@ function renderProcoreCard(problem = null) {
   if (!card) return;
   const p = S.procore;
   if (p && !p.configured) {
-    card.innerHTML = note('error', '<strong>Procore is not configured on this deployment.</strong> Tell Cory.');
+    const problems = p.settingProblems || [];
+    card.innerHTML = note(
+      'error',
+      '<strong>Procore is not configured on this deployment.</strong> ' +
+        (problems.length
+          ? `Fix in the Static Web App's <strong>Production</strong> environment variables: ${problems.map(esc).join('; ')}.`
+          : 'Tell Cory.'),
+    );
+    return;
+  }
+  // Procore sends the super back to ONE address. Opened anywhere else (the
+  // azurestaticapps.net name instead of punchass.buffaloconstruction.com, say),
+  // the sign-in check and the session land on a different site from this tab,
+  // and connecting cannot work. Say so before they try (2026-10-14).
+  if (p?.callbackHost && p.callbackHost !== location.host) {
+    const there = `https://${p.callbackHost}${location.pathname}${location.search}`;
+    card.innerHTML = note(
+      'warn',
+      `<strong>Open this app at ${esc(p.callbackHost)} to connect Procore.</strong> ` +
+        `Procore sends you back to that address after sign-in, and this page is open at ${esc(location.host)}. ` +
+        `<a href="${esc(there)}">Go to ${esc(p.callbackHost)}</a>`,
+    );
     return;
   }
   if (procoreConnected()) {
@@ -272,12 +293,23 @@ function renderProcoreCard(problem = null) {
 
 function connectProcore() {
   const popup = window.open('/api/procore/connect', 'procore-connect', 'width=520,height=720');
-  if (popup) return;
+  if (popup) {
+    // Procore's login page severs the popup from this tab, so its result may
+    // never arrive as a message. Re-check on focus while this is pending.
+    S.connectPending = true;
+    return;
+  }
   // Pop-up blocked. A full-page redirect would throw away anything reviewed, so
   // only take it when there is nothing to lose.
   if (S.items.length) {
     renderProcoreCard('Your browser blocked the Procore sign-in window. Allow pop-ups for this site, then press Connect Procore again.');
   } else {
+    try {
+      // Tells the callback page to come back here rather than try to close.
+      localStorage.setItem('procore-connect-mode', 'page');
+    } catch {
+      // Without storage it shows "close this window"; a reload still connects.
+    }
     location.href = '/api/procore/connect';
   }
 }
@@ -305,13 +337,23 @@ async function refreshProcore() {
   renderBar();
 }
 
-/** The popup's last page reports here, on this origin only. */
-window.addEventListener('message', async (e) => {
-  if (e.origin !== location.origin || e.data?.type !== 'procore-connect') return;
-  if (!e.data.ok) {
-    renderProcoreCard(e.data.message || 'Procore did not connect.');
+/**
+ * The popup's result, from whichever channel delivers it first. Each carries a
+ * timestamp, so the same result arriving three ways is handled once.
+ */
+let lastConnectResultAt = 0;
+async function onConnectResult(data) {
+  if (data?.type !== 'procore-connect' || !data.at || data.at <= lastConnectResultAt) return;
+  lastConnectResultAt = data.at;
+  S.connectPending = false;
+  if (!data.ok) {
+    renderProcoreCard(data.message || 'Procore did not connect.');
     return;
   }
+  await afterConnected();
+}
+
+async function afterConnected() {
   S.connectStop = false;
   await refreshProcore();
   if (S.step === 'send') {
@@ -319,6 +361,32 @@ window.addEventListener('message', async (e) => {
     renderResults();
   } else if (S.step === 'project' && S.project && !S.config) {
     selectProject(S.project.id);
+  }
+}
+
+window.addEventListener('message', (e) => {
+  if (e.origin === location.origin) onConnectResult(e.data);
+});
+try {
+  new BroadcastChannel('procore-connect').onmessage = (e) => onConnectResult(e.data);
+} catch {
+  // Not supported: the storage event and the focus re-check still work.
+}
+window.addEventListener('storage', (e) => {
+  if (e.key !== 'procore-connect-result' || !e.newValue) return;
+  try {
+    onConnectResult(JSON.parse(e.newValue));
+  } catch {
+    // Not ours, or malformed.
+  }
+});
+// The safety net: whatever happened to the messages, the cookie is the truth.
+window.addEventListener('focus', async () => {
+  if (!S.connectPending) return;
+  await refreshProcore();
+  if (procoreConnected()) {
+    S.connectPending = false;
+    await afterConnected();
   }
 });
 

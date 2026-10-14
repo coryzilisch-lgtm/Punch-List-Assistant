@@ -5,6 +5,7 @@ import {
   createPunchItem,
   ProcoreError,
   procoreConfigured,
+  procoreNotConfiguredMessage,
   procoreRequestCount,
   resetProcoreRequestCount,
   PunchItemInput,
@@ -177,7 +178,7 @@ export async function pushHandler(
   if (!dryRun && !procoreConfigured()) {
     return errorResponse(
       503,
-      'Procore is not configured on this deployment. PROCORE_CLIENT_ID, PROCORE_CLIENT_SECRET, PROCORE_COMPANY_ID, PROCORE_REDIRECT_URI and PROCORE_SESSION_KEY must be set in the app settings.',
+      procoreNotConfiguredMessage(),
     );
   }
 
