@@ -203,7 +203,10 @@ and the audit trail names who did the work.
   sealed with `PROCORE_SESSION_KEY`, HttpOnly, Secure, bound to the Entra
   `userId`. A cookie in someone else's session does not open. **No refresh token
   is kept**, so there is nothing long-lived at rest and no rotation race. Expiry
-  (~2h) means one click to reconnect.
+  (~2h) means one click to reconnect. 🛑 **A permanent link was built and
+  removed by Cory's decision (2026-10-14)**: a refresh token per super, sealed in
+  Azure Table Storage. It is in the git history (`a458001`) if the decision
+  changes; do not rebuild it without one.
 - **Connecting is a popup** (`/procore-connected.js` reports back to the open
   tab), so a reconnect mid-review loses nothing. A push whose token expires
   mid-batch stops: later items are never sent into the 401, and everything not
