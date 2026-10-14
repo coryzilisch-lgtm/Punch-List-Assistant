@@ -33,6 +33,9 @@ export async function meHandler(request: HttpRequest): Promise<HttpResponseInit>
       // punch item manager and final approver.
       procoreUserId: session?.procoreUserId ?? null,
       expiresAt: session?.expiresAt ?? null,
+      // For links into Procore's own pages (the punch list settings gate).
+      // An id, not a secret.
+      companyId: /^\d+$/.test((process.env.PROCORE_COMPANY_ID || '').trim()) ? Number(process.env.PROCORE_COMPANY_ID!.trim()) : null,
     },
   });
 }

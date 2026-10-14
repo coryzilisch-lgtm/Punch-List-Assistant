@@ -143,8 +143,17 @@ async function openApp({ quotaReply = quota(), onPush = () => ({ json: { results
   return { page, pushes, errors, quotaCalls, port };
 }
 
+/** Confirm the project's distribution emails are off, as a super must before the first import. */
+async function passDistGate(page) {
+  await page.waitForSelector('#dist-gate-check');
+  // click, not check(): ticking it replaces the card with its "confirmed" state.
+  await page.click('#dist-gate-check');
+  await page.waitForSelector('#dist-gate-undo');
+}
+
 async function toCreateStep(opts) {
   const { page, pushes, errors, quotaCalls } = await openApp(opts);
+  await passDistGate(page);
   await page.waitForFunction(() => !document.getElementById('next-btn').disabled);
   await page.click('#next-btn'); // → upload
 
@@ -422,6 +431,7 @@ test('connecting happens in a popup and the open tab picks it up without reloadi
     await page.waitForFunction(() => /connected as/.test(document.getElementById('procore-card').textContent));
     assert.match(await page.textContent('#procore-card'), /Cory Zilisch/);
     assert.equal(await page.evaluate(() => window.__marker), 'same tab', 'the tab was not reloaded');
+    await passDistGate(page);
     assert.ok(!(await page.isDisabled('#next-btn')));
     assert.deepEqual(errors, []);
   } finally {
@@ -563,6 +573,7 @@ test('opened at the callback address, Connect is offered as normal', async () =>
 async function toReview(opts) {
   const ctx = await openApp(opts);
   const { page } = ctx;
+  await passDistGate(page);
   await page.waitForFunction(() => !document.getElementById('next-btn').disabled);
   await page.click('#next-btn'); // → upload
   await page.setInputFiles('#file-input', { name: 'list.pdf', mimeType: 'application/pdf', buffer: onePagePdf() });
@@ -712,6 +723,47 @@ test('an item with people on its distribution list stops the push after one item
     assert.match(text, /11 items were not sent/);
     assert.doesNotMatch(text, /rate limit/i, 'a safety stop is not reported as a rate limit');
     assert.match(await page.textContent('#next-btn'), /Create 11 punch items/, 'the rest stay selected');
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
+// ── The distribution list gate (2026-10-14) ─────────────────────────────────
+//
+// Procore emails a project's whole distribution list on Item Created, a
+// per-project setting with no API. Before a project's first import the super is
+// shown how to turn it off, and cannot continue until they confirm.
+
+test('a project cannot be imported into until its distribution emails are confirmed off', async () => {
+  const { page, errors } = await openApp({
+    meReply: () => ({ ...CONNECTED(), procore: { ...CONNECTED().procore, companyId: 18895 } }),
+  });
+  try {
+    await page.waitForSelector('#dist-gate-check');
+    const gate = await page.textContent('#dist-gate');
+    assert.match(gate, /turn off distribution emails on this project/i);
+    assert.match(gate, /Item Created and Item Initiated on\s+Test Job/);
+    assert.match(gate, /gear icon/);
+    assert.equal(
+      await page.getAttribute('#dist-gate a', 'href'),
+      'https://app.procore.com/webclients/host/companies/18895/projects/1/tools/punchlist/settings/general',
+    );
+    assert.ok(await page.isDisabled('#next-btn'), 'connected and project chosen, but not confirmed');
+    assert.match(await page.textContent('#bar-summary'), /Turn off distribution emails/);
+
+    await passDistGate(page);
+    await page.waitForFunction(() => !document.getElementById('next-btn').disabled);
+    assert.match(await page.textContent('#dist-gate'), /confirmed off for this project/);
+
+    // Remembered for this project in this browser: a reload does not ask again.
+    await page.reload({ waitUntil: 'networkidle' });
+    await page.waitForFunction(() => /confirmed off/.test(document.getElementById('dist-gate').textContent));
+    await page.waitForFunction(() => !document.getElementById('next-btn').disabled);
+
+    // And it can be shown again.
+    await page.click('#dist-gate-undo');
+    assert.ok(await page.isDisabled('#next-btn'));
     assert.deepEqual(errors, []);
   } finally {
     await page.close();

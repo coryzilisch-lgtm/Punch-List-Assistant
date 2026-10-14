@@ -197,12 +197,14 @@ function renderBar() {
 
   if (S.step === 'project') {
     next.textContent = 'Continue';
-    next.disabled = !S.project || !procoreConnected();
+    next.disabled = !S.project || !procoreConnected() || !distGateOk();
     summary.textContent = !procoreConnected()
       ? 'Connect Procore to begin'
-      : S.project
-        ? S.project.name
-        : 'Choose a project to begin';
+      : !S.project
+        ? 'Choose a project to begin'
+        : !distGateOk()
+          ? 'Turn off distribution emails on this project first'
+          : S.project.name;
   } else if (S.step === 'upload') {
     const done = S.pageStatus.filter((s) => s === 'done' || s === 'skip').length;
     const total = S.pageStatus.length;
@@ -251,6 +253,98 @@ function renderBar() {
 // fallback to a service account. Connecting happens in a popup so that a
 // reconnect mid-review, when the ~2 hour token runs out, loses nothing.
 
+// ── The distribution list gate ──────────────────────────────────────────────
+//
+// Procore's Punch List settings email the project's "Distribution Group" on
+// Item Created and Item Initiated, and that group is the project's Default
+// Distribution List. That is how subs got hundreds of emails. The setting is
+// per project, cannot be turned off company-wide, and has no API this app can
+// read or change. So before a project's first import, the super is shown how to
+// turn it off and must confirm they have.
+//
+// The confirmation is remembered in this browser only. Losing it (another
+// browser, cleared storage) asks again, which is the safe direction. It cannot
+// prove the setting is off; the first-item safety stop is the check on that.
+
+function distGateKey(projectId) {
+  return `pla:dist-gate:${projectId}`;
+}
+
+function distGateConfirmed(projectId = S.project?.id) {
+  if (!projectId) return false;
+  try {
+    return Boolean(localStorage.getItem(distGateKey(projectId)));
+  } catch {
+    return false;
+  }
+}
+
+function confirmDistGate(projectId, yes) {
+  try {
+    if (yes) localStorage.setItem(distGateKey(projectId), new Date().toISOString());
+    else localStorage.removeItem(distGateKey(projectId));
+  } catch {
+    // No storage: the confirmation lasts for this page only.
+  }
+  S.distGateSession = yes ? projectId : null;
+}
+
+function distGateOk() {
+  return Boolean(S.project) && (distGateConfirmed() || S.distGateSession === S.project.id);
+}
+
+function settingsUrl() {
+  const company = S.procore?.companyId;
+  return company && S.project
+    ? `https://app.procore.com/webclients/host/companies/${company}/projects/${S.project.id}/tools/punchlist/settings/general`
+    : null;
+}
+
+function renderDistGate() {
+  const card = $('dist-gate');
+  if (!card) return;
+  if (!S.project) {
+    card.style.display = 'none';
+    return;
+  }
+  card.style.display = 'block';
+  const ok = distGateOk();
+  const url = settingsUrl();
+  card.classList.toggle('done', ok);
+  card.innerHTML = ok
+    ? '<div class="gate-done">✓ Distribution emails confirmed off for this project. ' +
+      '<button type="button" class="btn-link" id="dist-gate-undo">Show the steps again</button></div>'
+    : `<h2>Before you import: turn off distribution emails on this project</h2>
+      <p class="gate-lede"><strong>Procore emails this project's whole distribution list every time a punch item
+      is created.</strong> That is how subs got hundreds of emails from one import. It is a setting on each
+      project, it cannot be turned off company-wide, and this app cannot change it for you.</p>
+      <ol class="gate-steps">
+        <li>In Procore, open <strong>${esc(S.project.name)}</strong> and go to <strong>Project Tools → Punch List</strong>.</li>
+        <li>Click the <strong>gear icon</strong> <span class="gate-gear" aria-hidden="true">⚙</span> just to the left of the
+          <strong>Punch List</strong> title. That opens <strong>Punch List Settings</strong> on the <strong>General</strong> tab.</li>
+        <li>Scroll down to <strong>Email Notifications</strong>.</li>
+        <li>Find the <strong>Distribution Group</strong> column, the last one on the right.</li>
+        <li>Untick <strong>Item Created</strong> and <strong>Item Initiated</strong> in that column.
+          We recommend unticking the whole column: it also emails the list on every comment and due date change.</li>
+        <li>Click <strong>Save Changes</strong>, the orange button at the bottom right. It stays greyed out until you change something.</li>
+        <li>Come back to this tab and tick the box below.</li>
+      </ol>
+      ${url ? `<p class="gate-shortcut">Shortcut: <a href="${esc(url)}" target="_blank" rel="noopener">open this project's Punch List Settings in Procore</a> (skips steps 1 and 2).</p>` : ''}
+      <label class="gate-confirm"><input type="checkbox" id="dist-gate-check" />
+        I have unticked <strong>Distribution Group</strong> for Item Created and Item Initiated on
+        <strong>${esc(S.project.name)}</strong> and saved.</label>`;
+  $('dist-gate-check')?.addEventListener('change', (e) => {
+    confirmDistGate(S.project.id, e.target.checked);
+    renderDistGate();
+    renderBar();
+  });
+  $('dist-gate-undo')?.addEventListener('click', () => {
+    confirmDistGate(S.project.id, false);
+    renderDistGate();
+    renderBar();
+  });
+}
+
 function procoreConnected() {
   return Boolean(S.procore?.connected && (!S.procore.expiresAt || S.procore.expiresAt > Date.now() + 60_000));
 }
@@ -273,6 +367,8 @@ function procoreWho() {
 }
 
 function renderProcoreCard(problem = null) {
+  // The gate's link into Procore needs the company id that /api/me carries.
+  renderDistGate();
   const card = $('procore-card');
   if (!card) return;
   const p = S.procore;
@@ -613,6 +709,7 @@ function clearProject() {
   S.project = null;
   S.config = null;
   $('readiness-card').style.display = 'none';
+  renderDistGate();
   openCombo(false);
   renderBar();
   $('project-search').focus();
@@ -679,6 +776,7 @@ async function selectProject(id) {
   S.config = null;
   // A person picked from another project's directory is not an answer here.
   resetRoles();
+  renderDistGate();
   renderBar();
   if (!S.project) {
     $('readiness-card').style.display = 'none';
