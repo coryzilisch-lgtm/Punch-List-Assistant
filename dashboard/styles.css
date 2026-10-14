@@ -643,3 +643,9 @@ details.byid code {
 .resume-now { border: 2px solid var(--buf-orange); text-align: center; }
 .resume-now .resume-big { font-size: 22px; font-weight: 700; color: var(--buf-navy); }
 .btn-big { font-size: 16px; padding: 12px 22px; }
+
+/* Push progress: elapsed time and pause countdowns */
+.progress-line { display: flex; justify-content: space-between; gap: 12px; font-size: 14px; margin-top: 6px; }
+.progress-line strong, .progress-pause strong { font-variant-numeric: tabular-nums; }
+.progress-pause { margin-top: 4px; font-size: 14px; color: var(--buf-warning); }
+.progress-pause.muted { color: var(--buf-muted); }

@@ -565,13 +565,65 @@ function resetIsSoon(q) {
 /** Hold the push until Procore's window resets, showing the countdown. */
 async function waitForReset(resetAt, done, total) {
   const until = Math.max(resetAt || 0, Date.now() + 1000) + 1000;
-  while (Date.now() < until) {
-    const secs = Math.ceil((until - Date.now()) / 1000);
-    $('send-progress').innerHTML =
-      `<div class="progress-track"><div class="progress-fill" style="width:${(done / total) * 100}%"></div></div>` +
-      `<div class="muted">${done} of ${total} processed · waiting for Procore's rate limit, carrying on in ${secs}s…</div>`;
-    await new Promise((r) => setTimeout(r, Math.min(1000, until - Date.now())));
-  }
+  await pauseUntil(until, 'limit', done, total);
+}
+
+/** "4:07", or "1:02:07" past an hour. */
+function clock(ms) {
+  const total = Math.max(0, Math.ceil(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = String(total % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${s}` : `${m}:${s}`;
+}
+
+/**
+ * The push's progress line: how far, how long it has run, and, while it is
+ * paused, how long until it carries on. Redrawn every second while a push runs
+ * (Cory, 2026-10-14: "give a time elapsed, and a time until resumption").
+ */
+const P = { start: 0, done: 0, total: 0, pausedUntil: 0, why: null, ticker: null };
+
+function renderProgress() {
+  const el = $('send-progress');
+  if (!el || !P.start) return;
+  const pct = P.total ? (P.done / P.total) * 100 : 0;
+  const paused = P.pausedUntil > Date.now();
+  const pause = !paused
+    ? ''
+    : P.why === 'limit'
+      ? `<div class="progress-pause">Paused for Procore's rate limit · resumes in <strong>${clock(P.pausedUntil - Date.now())}</strong></div>`
+      : `<div class="progress-pause muted">Pacing to stay under Procore's limit of 25 requests per 10 seconds · next batch in <strong>${clock(P.pausedUntil - Date.now())}</strong></div>`;
+  el.innerHTML =
+    `<div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>` +
+    `<div class="progress-line"><span>${P.done} of ${P.total} processed</span>` +
+    `<span>Elapsed <strong id="push-elapsed">${clock(Date.now() - P.start)}</strong></span></div>` +
+    pause;
+}
+
+function startProgress(total) {
+  Object.assign(P, { start: Date.now(), done: 0, total, pausedUntil: 0, why: null });
+  clearInterval(P.ticker);
+  P.ticker = setInterval(renderProgress, 1000);
+  renderProgress();
+}
+
+function stopProgress() {
+  clearInterval(P.ticker);
+  P.ticker = null;
+  const took = P.start ? Date.now() - P.start : 0;
+  P.start = 0;
+  $('send-progress').innerHTML = '';
+  return took;
+}
+
+/** Wait until `until`, showing why and for how long. */
+async function pauseUntil(until, why, done, total) {
+  Object.assign(P, { done, total, pausedUntil: until, why });
+  renderProgress();
+  while (Date.now() < until) await new Promise((r) => setTimeout(r, Math.min(1000, until - Date.now())));
+  P.pausedUntil = 0;
+  renderProgress();
 }
 
 /** "2:40 PM" for an epoch-ms reset time; the super needs a clock time, not seconds. */
@@ -1891,6 +1943,8 @@ async function doPush(dryRun) {
   renderBar();
   S.results = [];
   S.quotaStop = null;
+  S.pushTook = null;
+  if (!dryRun) startProgress(selected.length);
   S.connectStop = false;
   S.connectNotAttempted = 0;
   S.safetyStop = null;
@@ -1947,10 +2001,10 @@ async function doPush(dryRun) {
     const size = dryRun ? BATCH : done === 0 ? 1 : BATCH;
     const batch = queue.splice(0, dryRun ? size : Math.min(size, allowance));
 
-    $('send-progress').innerHTML =
-      `<div class="progress-track"><div class="progress-fill" style="width:${
-        (done / selected.length) * 100
-      }%"></div></div><div class="muted">${done} of ${selected.length} processed…</div>`;
+    if (!dryRun) {
+      Object.assign(P, { done, total: selected.length });
+      renderProgress();
+    }
 
     let stopped = false;
     const batchStart = Date.now();
@@ -2061,13 +2115,7 @@ async function doPush(dryRun) {
     // the push stopped, though Create worked again seconds later.
     if (!dryRun && queue.length && batchRequests) {
       const gap = batchRequests * PACE_MS_PER_REQUEST - (Date.now() - batchStart);
-      if (gap > 0) {
-        $('send-progress').insertAdjacentHTML(
-          'beforeend',
-          `<div class="muted">Pacing to stay under Procore's limit of 25 requests per 10 seconds…</div>`,
-        );
-        await new Promise((r) => setTimeout(r, gap));
-      }
+      if (gap > 0) await pauseUntil(Date.now() + gap, 'pace', done, selected.length);
     }
   }
 
@@ -2081,7 +2129,8 @@ async function doPush(dryRun) {
     S.quotaStop = { resetAt: stopAt, notAttempted: queue.length };
   }
 
-  $('send-progress').innerHTML = '';
+  if (dryRun) $('send-progress').innerHTML = '';
+  else S.pushTook = stopProgress();
   S.sending = false;
 
   if (dryRun) {
@@ -2169,9 +2218,6 @@ async function persistUnfinished() {
   });
 }
 
-function minutesUntil(ms) {
-  return Math.max(0, Math.ceil((ms - Date.now()) / 60_000));
-}
 
 /** Step 1: offer any import this person left unfinished in this browser. */
 async function renderResumeCard() {
@@ -2272,7 +2318,7 @@ function renderResumeNow() {
     `<p>${
       ready
         ? "Procore's limit has reset. Pick up where it stopped:"
-        : `Procore's limit resets about <strong>${esc(clockTime(resetAt))}</strong> (in about ${minutesUntil(resetAt)} min).`
+        : `Procore's limit resets about <strong>${esc(clockTime(resetAt))}</strong>, in <strong id="resume-countdown">${clock(resetAt - Date.now())}</strong>.`
     }</p>` +
     `<button type="button" class="btn-primary btn-big" id="resume-push" ${ready && procoreConnected() ? '' : 'disabled'}>` +
     `${ready ? `Resume: create the ${left} remaining` : `Resume unlocks at ${esc(clockTime(resetAt))}`}</button>` +
@@ -2283,7 +2329,16 @@ function renderResumeNow() {
     }</p>`;
   $('resume-push')?.addEventListener('click', () => doPush(false));
   clearInterval(resumeTicker);
-  if (!ready) resumeTicker = setInterval(() => (document.contains(box) ? renderResumeNow() : clearInterval(resumeTicker)), 15_000);
+  // Tick only the countdown text each second; redraw the box (and so the
+  // button) once, when the reset arrives.
+  if (!ready) {
+    resumeTicker = setInterval(() => {
+      if (!document.contains(box)) return clearInterval(resumeTicker);
+      if (Date.now() >= resetAt) return renderResumeNow();
+      const c = $('resume-countdown');
+      if (c) c.textContent = clock(resetAt - Date.now());
+    }, 1_000);
+  }
 }
 
 function renderResults() {
@@ -2355,6 +2410,9 @@ function renderResults() {
   }
   if (created.length && S.createdAs?.trim()) {
     html += note('info', `Created in Procore as <strong>${esc(S.createdAs)}</strong>. They are Drafts in your court.`);
+  }
+  if (S.pushTook && !S.sending) {
+    html += note('info', `This push ran for <strong>${clock(S.pushTook)}</strong>.`);
   }
   if (created.length && S.procoreRequests) {
     html += note(

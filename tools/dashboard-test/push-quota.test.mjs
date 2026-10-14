@@ -865,3 +865,58 @@ test('a 429 with no reset time is waited out as the spike window, not a stop', a
     await page.close();
   }
 });
+
+// ── Elapsed time and pause countdowns (2026-10-14) ───────────────────────────
+
+test('a push shows its elapsed time, and a pause counts down in minutes:seconds', async () => {
+  let n = 0;
+  const { page, errors } = await toCreateStep({
+    quotaReply: quota({ limit: null, remaining: null, resetAt: null, capacity: null }),
+    onPush: (body) => {
+      n += 1;
+      if (n !== 2) return created(body, n * 100);
+      // A spike-window 429 with a reset 4 seconds out: paused, then carries on.
+      const resetAt = Date.now() + 4_000;
+      return {
+        json: {
+          results: body.items.map((it) => ({ clientId: it.clientId, ok: false, rateLimited: true, resetAt, error: 'HTTP 429' })),
+          quota: null,
+        },
+      };
+    },
+  });
+  try {
+    await page.click('#next-btn');
+    await page.waitForFunction(() => /Paused for Procore's rate limit · resumes in \d+:\d\d/.test(document.getElementById('send-progress').textContent));
+    assert.match(await page.textContent('#send-progress'), /Elapsed \d+:\d\d/);
+    await page.waitForFunction(() => /12 punch items created/.test(document.getElementById('results').textContent), null, { timeout: 30_000 });
+    assert.match(await page.textContent('#results'), /This push ran for \d+:\d\d/);
+    assert.equal((await page.textContent('#send-progress')).trim(), '', 'the clock stops with the push');
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
+test('the resume box counts down to the reset in minutes:seconds', async () => {
+  const resetAt = Date.now() + 30 * 60_000;
+  let n = 0;
+  const { page, errors } = await toCreateStep({
+    quotaReply: quota({ limit: null, remaining: null, resetAt: null, capacity: null }),
+    onPush: (body) => {
+      n += 1;
+      if (n === 1) return created(body);
+      return { json: { results: body.items.map((it) => ({ clientId: it.clientId, ok: false, rateLimited: true, resetAt, error: 'HTTP 429' })), quota: null } };
+    },
+  });
+  try {
+    await page.click('#next-btn');
+    await page.waitForSelector('#resume-countdown');
+    const first = await page.textContent('#resume-countdown');
+    assert.match(first, /^(29|30):\d\d$/);
+    await page.waitForFunction((f) => document.getElementById('resume-countdown')?.textContent !== f, first, { timeout: 3_000 });
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});

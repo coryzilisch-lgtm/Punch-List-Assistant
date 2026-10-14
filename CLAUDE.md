@@ -586,6 +586,13 @@ batch's reported `requests`, because batches can land on different instances.
 A 228-item list (~500 requests) takes roughly four minutes. Both are tested,
 and both new tests were confirmed failing against the old code.
 
+**The clock (Cory, 2026-10-14).** While a push runs, the progress line shows
+**Elapsed m:ss**, redrawn every second, and any pause says why and counts down
+in **m:ss**: "Paused for Procore's rate limit · resumes in 0:09", or "Pacing …
+next batch in 0:03". The results say how long the push ran, and the resume box
+counts down to the reset. One renderer (`renderProgress()`, state `P`) drives
+all of it; `pauseUntil()` is the only way the push waits.
+
 ### Resuming a stopped import — browser storage, 2026-10-14
 
 Cory chose **this browser** over a server store: no Azure resource, and owners'
