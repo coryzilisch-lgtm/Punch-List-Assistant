@@ -32,6 +32,18 @@ sign-in returns). Entra sign-in gates the whole app —
 see **Who can open this** below, including the reason that sentence was false for
 the app's whole life until 2026-09-14.
 
+
+## Azure Application Gateway WAF (Oct 2026)
+
+IT fronts this app with an Application Gateway WAF (OWASP DRS 2.1), tuned from an inventory
+of what the app sends: `docs/waf-exclusions.md`. **A change to a route, method, query parameter,
+custom header, cookie, content type, upload, request body shape or a non-browser caller is a WAF
+change.** Read `.claude/skills/waf-compatibility/SKILL.md` before making one, update the
+inventory in the same PR, and put a `WAF impact:` line in the PR description. A request the WAF
+rejects is a 403 from the gateway with no Function log: the app never sees it. The write-up
+covering all five apps is https://claude.ai/artifact/Q6EaFGC4UZ5CtvxjKJdzMA.
+
+
 ---
 
 ## 🛑 The rule that overrides everything else
