@@ -14,6 +14,51 @@ import { loadPdf, processPage } from './pdf-pipeline.js';
 import { byLastName } from './name-sort.js';
 import { deleteImport, loadImports, saveImport } from './saved-imports.js';
 
+/* Guest accounts are refused by the API on every route (Nov 2026): a 403 with
+   { error: 'guest' }. Turn the first one into a full-page notice with a sign-out
+   button instead of a page of failed loads. window.fetch is wrapped once so every
+   call site is covered without touching it. Entra's "Assignment required" is the
+   first line; this is the second, and the only thing that ends a guest session
+   that already has an SWA cookie. */
+(function () {
+  var walled = false, realFetch = window.fetch;
+  function wall(message) {
+    if (walled) return;
+    walled = true;
+    var el = document.createElement('div');
+    el.id = 'guest-wall';
+    el.setAttribute('role', 'alert');
+    el.style.cssText = 'position:fixed;inset:0;z-index:30000;display:flex;align-items:center;justify-content:center;padding:24px;background:#00253D;color:#fff;font-family:Montserrat,system-ui,sans-serif;text-align:center';
+    var card = document.createElement('div');
+    card.style.cssText = 'max-width:520px';
+    var h = document.createElement('div');
+    h.style.cssText = 'font-size:28px;font-weight:800;line-height:1.1;margin:0 0 14px;text-transform:uppercase';
+    h.textContent = "This one's for the Herd";
+    var p = document.createElement('p');
+    p.style.cssText = 'font-size:16px;line-height:1.5;margin:0 0 10px;color:rgba(255,255,255,.9)';
+    p.textContent = message || 'The Punch List Assistant is for Buffalo employees. Guest accounts can\'t use it.';
+    var sub = document.createElement('p');
+    sub.style.cssText = 'font-size:13.5px;line-height:1.5;margin:0;color:rgba(255,255,255,.65)';
+    sub.textContent = "You're signed in with a guest account. If you work at Buffalo, sign out and sign back in with your Buffalo Microsoft account.";
+    var a = document.createElement('a');
+    a.href = '/.auth/logout?post_logout_redirect_uri=/';
+    a.textContent = 'Sign out';
+    a.style.cssText = 'display:inline-block;margin-top:20px;font-weight:700;font-size:14px;background:#FF5F00;color:#fff;text-decoration:none;border-radius:3px;padding:12px 26px';
+    card.appendChild(h); card.appendChild(p); card.appendChild(sub); card.appendChild(a);
+    el.appendChild(card);
+    document.body.appendChild(el);
+    document.body.style.overflow = 'hidden';
+  }
+  window.fetch = function () {
+    return realFetch.apply(this, arguments).then(function (r) {
+      if (!walled && r && r.status === 403) {
+        try { r.clone().json().then(function (b) { if (b && b.error === 'guest') wall(b.message); }).catch(function () {}); } catch (e) {}
+      }
+      return r;
+    });
+  };
+})();
+
 const STEPS = ['project', 'upload', 'review', 'send'];
 
 const S = {

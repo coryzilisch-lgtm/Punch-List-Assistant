@@ -290,6 +290,20 @@ A local `func start` has no SWA principal to inject, so it 401s. That is
 deliberate: an environment flag that bypasses an auth check is how auth checks
 get bypassed in production.
 
+3. **Guest accounts are refused on every route (Nov 2026).** `api/src/lib/guest-gate.ts`,
+   registered as a `preInvocation` hook at the top of `api/src/index.ts`, before `guarded()`
+   ever runs. A principal is a guest when a name claim carries `#EXT#`, an `idp` claim names
+   another tenant, `acct` is `1`, **or Microsoft Graph says the account's `userType` is
+   `Guest`** (app-only token on `AZURE_CLIENT_ID`; needs `User.Read.All` on that registration,
+   otherwise the lookup fails, is logged as `guest gate: Graph lookup failed`, and the claims
+   decide). Cached an hour per oid. The answer is `403 { error: 'guest' }`; `app.js` wraps
+   `window.fetch` once (top of the file) and turns the first one into a full-page notice with
+   Sign out. One warning per refusal in the Function log with the claim TYPES, never values.
+   Why in code and not only Entra: "Assignment required" is checked at sign-in only, and an
+   SWA session cookie outlives it (IT's guest session on The Range survived the setting). Set
+   the Entra side too (Enterprise applications → this app → Properties → Assignment required
+   → Users and groups: an employee group). `api/test/guest-gate.test.mjs` covers it.
+
 ## Repo layout
 
 ```
