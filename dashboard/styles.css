@@ -138,7 +138,7 @@ header .who { font-size: 12px; color: #cbd5e0; }
 .step.active .n { background: var(--buf-orange); }
 .step.done .n { background: var(--buf-success); }
 
-main { max-width: 1400px; margin: 0 auto; padding: 22px 20px 80px; }
+main { max-width: 1400px; margin: 0 auto; padding: 22px 20px 140px; }
 
 .panel { display: none; }
 .panel.active { display: block; }
@@ -394,25 +394,59 @@ pre.payload {
 .lightbox img { max-width: 100%; max-height: 100%; border-radius: var(--radius-md); }
 
 /* ── Sticky action bar ──────────────────────────────────────────────────── */
+/*
+ * The Back / Continue bar. It used to be a thin strip with 13px buttons in the
+ * bottom-right corner, and supers missed it (Nov 2026). It is now a tall bar
+ * with an orange edge, the status text on the left and two big buttons on the
+ * right: Back as a solid white outline, Continue as a large orange block with
+ * an arrow. On a phone the buttons take the full width.
+ */
 
 .actionbar {
   position: fixed;
   bottom: 0; left: 0; right: 0;
   background: var(--buf-navy);
-  padding: 12px 20px;
+  border-top: 4px solid var(--buf-orange);
+  box-shadow: 0 -6px 18px rgba(0, 0, 0, 0.25);
+  padding: 16px 24px;
   display: flex;
-  gap: 12px;
+  gap: 14px;
   align-items: center;
   flex-wrap: wrap;
   z-index: 10;
 }
 .actionbar .spacer { flex: 1; }
-.actionbar .summary { color: #fff; font-size: 13px; }
+.actionbar .summary { color: #fff; font-size: 15px; }
 .actionbar .summary b { color: var(--buf-orange); }
+
+.actionbar button {
+  font-size: 17px;
+  padding: 16px 30px;
+  min-height: 56px;
+  border-radius: var(--radius-md);
+}
+.actionbar .btn-ghost { color: #fff; border-color: #fff; }
+.actionbar .btn-ghost:not(:disabled):hover { background: #fff; color: var(--buf-navy); }
+.actionbar .btn-primary {
+  font-size: 19px;
+  padding: 16px 40px;
+  min-width: 240px;
+  box-shadow: 0 2px 0 rgba(0, 0, 0, 0.35);
+}
+/* The arrow is drawn by CSS, not text, so the button's label stays exactly
+   what app.js set and the tests match it. No arrow while it cannot be pressed. */
+.actionbar .btn-primary:not(:disabled)::after { content: " \2192"; }
+.actionbar button:disabled { opacity: 0.55; }
 
 @media (max-width: 820px) {
   .item { grid-template-columns: 30px 1fr; }
   .item .photos { grid-column: 1 / -1; }
+
+  .actionbar { padding: 14px 16px; gap: 10px; }
+  .actionbar .spacer { display: none; }
+  .actionbar .summary { flex: 1 1 100%; order: -1; font-size: 14px; }
+  .actionbar button { flex: 1 1 auto; padding-left: 16px; padding-right: 16px; }
+  .actionbar .btn-primary { flex: 2 1 auto; min-width: 0; }
 }
 
 /* ── Project combobox ───────────────────────────────────────────────────── */
