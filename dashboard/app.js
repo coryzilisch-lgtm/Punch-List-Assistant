@@ -82,6 +82,8 @@ const S = {
   connectStop: false,
   me: null,
   projects: [],
+  projectsLoaded: false,
+  projectsLoading: false,
   project: null,
   config: null,
   fileName: null,
@@ -531,11 +533,17 @@ async function onConnectResult(data) {
 async function afterConnected() {
   S.connectStop = false;
   await refreshProcore();
+  if (!S.projectsLoaded) {
+    // The list was asked for when the page opened, before there was a connection,
+    // and failed. Ask again now; without this the super had to refresh the page.
+    await loadProjects();
+    preselectFromUrl();
+  } else if (S.step === 'project' && S.project && !S.config) {
+    selectProject(S.project.id);
+  }
   if (S.step === 'send') {
     renderSendSummary();
     renderResults();
-  } else if (S.step === 'project' && S.project && !S.config) {
-    selectProject(S.project.id);
   }
 }
 
@@ -689,9 +697,16 @@ function unmanagedCount() {
 // ── Step 1: project ─────────────────────────────────────────────────────────
 
 async function loadProjects() {
+  // Called when the page opens and again once Procore is connected: the list can
+  // need the super's own token, which does not exist yet on a first visit.
+  if (S.projectsLoading) return;
+  S.projectsLoading = true;
+  $('project-error').innerHTML = '';
+  if (!S.projectsLoaded) $('project-load').style.display = 'block';
   try {
     const data = await api('/api/projects');
     S.projects = data.projects || [];
+    S.projectsLoaded = true;
     // Say where the list came from. A nightly mirror is fine for picking a job,
     // but a project created this morning will not be in it — and silently
     // missing is indistinguishable from "not in Procore".
@@ -718,10 +733,11 @@ async function loadProjects() {
     $('project-search').placeholder = `Start typing — ${S.projects.length} projects`;
   } catch (err) {
     $('project-load').style.display = 'none';
-    $('project-error').innerHTML = note(
-      'error',
-      `<strong>Couldn't load projects.</strong> ${esc(err.message)}`,
-    );
+    $('project-error').innerHTML = err.procoreConnect
+      ? note('info', '<strong>Connect Procore to see your projects.</strong> Use the Connect button above. The list loads by itself once you are connected.')
+      : note('error', `<strong>Couldn't load projects.</strong> ${esc(err.message)}`);
+  } finally {
+    S.projectsLoading = false;
   }
 }
 
@@ -2770,7 +2786,7 @@ async function init() {
  */
 function preselectFromUrl() {
   const id = Number(new URLSearchParams(location.search).get('project_id'));
-  if (!Number.isFinite(id) || id <= 0) return;
+  if (S.project || !Number.isFinite(id) || id <= 0) return;
   if (!S.projects.some((p) => p.id === id)) return;
   chooseProject(id);
 }
