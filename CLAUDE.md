@@ -704,6 +704,36 @@ class this repo has already paid for. A 60-item list is ~120 requests:
 small against 3,600/hour, and the 228-item Darden list is ~460. The thing to
 avoid is sharing the hour with the Safety Dashboard ingest.
 
+## The Sandbox shortcut and the visual layer — Nov 2026
+
+**"Use the Sandbox" on step 1** selects project **603781**, the Sandbox Test Project
+(`SANDBOX_PROJECT_ID` in `app.js`). It is a shortcut for choosing a project and
+nothing more: it goes through `selectProject()`, so the distribution-email gate, the
+first-item safety stop and the manager/approver questions all still apply. If the
+mirror lists the project it makes no request; otherwise it uses the same
+`/api/projects/{id}` lookup as "Can't find it?". While it is selected a navy strip
+with caution-tape edge sits under the Beta notice on every step. 🛑 **The Sandbox is
+a real project in the live tenant**, so the strip says to keep assignees to Buffalo
+staff: an Initiated item emails whoever is assigned. Do not describe it as "safe"
+or add a path that skips the gate. Tested in `tools/dashboard-test/sandbox.test.mjs`.
+
+**Flair rules** (all in the last block of `styles.css`, from the Buffalo brand
+system): orange marks what matters, one featured gradient per screen (the hero on
+step 1), and a watermark on navy is **white at 5-8%**, never faded orange. The white
+buffalo is `buffalo-orange.png` drawn through a CSS mask at its own 240:165 ratio, so
+there is no second asset and it cannot be squished. **BN Kragen is not embedded**
+(the OTF is not in this repo); headlines use Montserrat 800, the brand fallback.
+Set `--font-display` to switch.
+
+**The win banner** on the results screen appears only when nothing needs a second
+look: no stop, no failure, every created item read back with its photos, assignee
+and nobody on its distribution list. Anything else gets the plain note and the
+per-item flags, so a celebration never sits above something the super must act on.
+
+There is no cache-busting on `styles.css`, so a browser can pair a new page with an
+old stylesheet. New elements must read correctly unstyled (the Sandbox strip is a
+plain `<p>`). No routes, headers or request bodies changed: **WAF impact: none.**
+
 ## Beta notice and branding
 
 A **Beta** strip sits between the header and the step rail, on every screen. It

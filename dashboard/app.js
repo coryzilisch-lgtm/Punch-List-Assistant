@@ -61,6 +61,11 @@ import { deleteImport, loadImports, saveImport } from './saved-imports.js';
 
 const STEPS = ['project', 'upload', 'review', 'send'];
 
+// The Sandbox Test Project in Buffalo's Procore. Choosing it is the same act as
+// choosing any project (same gate, same first-item safety stop); this id only
+// powers the shortcut button and the strip that says where items are going.
+const SANDBOX_PROJECT_ID = 603781;
+
 const S = {
   step: 'project',
   /** Procore rate-limit report from /api/quota or the last push batch; null when unknown. */
@@ -819,9 +824,55 @@ function clearProject() {
   S.config = null;
   $('readiness-card').style.display = 'none';
   renderDistGate();
+  renderSandbox();
   openCombo(false);
   renderBar();
   $('project-search').focus();
+}
+
+// ── The Sandbox ─────────────────────────────────────────────────────────────
+//
+// "Just trying it out" has a place to go. The button is a shortcut for choosing
+// the Sandbox Test Project, nothing more: it does not skip the distribution-email
+// gate, the first-item safety stop or the manager and approver questions, because
+// the Sandbox is a real project in the live tenant. The company list there can
+// include real subs, and an Initiated item emails its assignees, so the strip
+// says to keep assignees to Buffalo staff.
+
+function isSandbox(project = S.project) {
+  return Boolean(project) && project.id === SANDBOX_PROJECT_ID;
+}
+
+function renderSandbox() {
+  const strip = $('sandbox-strip');
+  if (!strip) return;
+  strip.hidden = !isSandbox();
+  if (isSandbox()) $('sandbox-name').textContent = S.project.name;
+}
+
+async function useSandbox() {
+  const btn = $('sandbox-btn');
+  const out = $('sandbox-result');
+  btn.disabled = true;
+  out.innerHTML = '';
+  try {
+    // In the mirror already: no request needed. Otherwise ask Procore by id, the
+    // same lookup "Can't find it?" uses, and fold the answer into the list.
+    let project = S.projects.find((p) => p.id === SANDBOX_PROJECT_ID);
+    if (!project) {
+      out.innerHTML = '<div class="muted">Opening the Sandbox…</div>';
+      ({ project } = await api(`/api/projects/${SANDBOX_PROJECT_ID}`));
+      if (!S.projects.some((p) => p.id === project.id)) S.projects.push(project);
+      out.innerHTML = '';
+    }
+    $('project-search').value = project.name;
+    $('project-clear').hidden = false;
+    await selectProject(project.id);
+  } catch (err) {
+    out.innerHTML = note('error', `<strong>Couldn't open the Sandbox.</strong> ${esc(err.message)}`);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 /**
@@ -886,6 +937,7 @@ async function selectProject(id) {
   // A person picked from another project's directory is not an answer here.
   resetRoles();
   renderDistGate();
+  renderSandbox();
   renderBar();
   if (!S.project) {
     $('readiness-card').style.display = 'none';
@@ -2393,8 +2445,33 @@ function renderResults() {
   const unconnected = S.results.filter((r) => !r.ok && r.procoreConnect);
   const failed = S.results.filter((r) => !r.ok && !r.uncertain && !r.rateLimited && !r.procoreConnect);
 
+  // A win is shown only when nothing needs the super's eye: no stop, no failure,
+  // and every created item read back whole (photos, assignee, nobody on its
+  // distribution list). Anything else gets the plain note and the flags below it.
+  const itemClean = (r) => {
+    const item = S.items.find((i) => String(i.id) === r.clientId);
+    return (
+      (r.photosAttached ?? 0) >= (item?.photos.length || 0) &&
+      !(r.observed?.distributionMembers || []).length &&
+      !(item?.assigneeId && !(r.observed?.ballInCourt || []).length) &&
+      !r.assignErrors?.length
+    );
+  };
+  const clean =
+    created.length > 0 &&
+    !S.sending &&
+    !uncertain.length && !limited.length && !unconnected.length && !failed.length &&
+    !S.safetyStop && !S.quotaStop && !S.connectStop &&
+    created.every(itemClean);
+
   let html = '';
-  if (created.length) {
+  if (clean) {
+    const n = created.length;
+    html += `<div class="win"><div class="eyebrow">Building Better</div>` +
+      `<div class="big">${n} punch item${n === 1 ? '' : 's'} created in Procore</div>` +
+      `<p>Nice work, Herd. Every item was read back from Procore after it was written.` +
+      `${isSandbox() ? ' These went into the Sandbox, not a live job.' : ''}</p></div>`;
+  } else if (created.length) {
     html += note(
       'ok',
       `<strong>${created.length} punch item${created.length === 1 ? '' : 's'} created in Procore.</strong>`,
@@ -2579,6 +2656,7 @@ function wire() {
     if (li) { e.preventDefault(); chooseProject(li.dataset.id); }
   });
   $('project-clear').addEventListener('click', clearProject);
+  $('sandbox-btn').addEventListener('click', useSandbox);
   $('project-id-go').addEventListener('click', lookupProjectById);
   $('project-id').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); lookupProjectById(); }

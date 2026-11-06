@@ -920,3 +920,42 @@ test('the resume box counts down to the reset in minutes:seconds', async () => {
     await page.close();
   }
 });
+
+test('a clean push gets the win banner; a push with a flag on any item does not', async () => {
+  // The banner is a claim that nothing needs a second look, so it must not sit
+  // above a result the super has to act on (someone on a distribution list).
+  const clean = await toCreateStep({ onPush: (body) => created(body) });
+  try {
+    await clean.page.click('#next-btn');
+    await clean.page.waitForSelector('#results .win', { timeout: 30_000 });
+    assert.match(await clean.page.textContent('#results .win'), /12 punch items created in Procore/);
+    assert.match(await clean.page.textContent('#results .win'), /Nice work, Herd/);
+    assert.deepEqual(clean.errors, []);
+  } finally {
+    await clean.page.close();
+  }
+
+  const flagged = await toCreateStep({
+    onPush: (body) => ({
+      json: {
+        results: body.items.map((it, i) => ({
+          clientId: it.clientId,
+          ok: true,
+          punchItemId: 300 + i,
+          // One item reads back with a person on its distribution list.
+          observed: { isDraft: false, distributionMembers: i === 0 ? ['Sub Foreman'] : [] },
+        })),
+        quota: null,
+      },
+    }),
+  });
+  try {
+    await flagged.page.click('#next-btn');
+    await flagged.page.waitForFunction(() => /punch items? created in Procore/.test(document.getElementById('results').textContent), null, { timeout: 30_000 });
+    assert.equal(await flagged.page.locator('#results .win').count(), 0, 'no celebration over a flagged item');
+    assert.match(await flagged.page.textContent('#results'), /On its distribution list: Sub Foreman/);
+    assert.deepEqual(flagged.errors, []);
+  } finally {
+    await flagged.page.close();
+  }
+});

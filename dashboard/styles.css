@@ -427,6 +427,8 @@ pre.payload {
 }
 .actionbar .btn-ghost { color: #fff; border-color: #fff; }
 .actionbar .btn-ghost:not(:disabled):hover { background: #fff; color: var(--buf-navy); }
+.actionbar .btn-secondary { background: transparent; color: #fff; border-color: rgba(255, 255, 255, 0.55); }
+.actionbar .btn-secondary:not(:disabled):hover { background: rgba(255, 255, 255, 0.14); }
 .actionbar .btn-primary {
   font-size: 19px;
   padding: 16px 40px;
@@ -683,3 +685,177 @@ details.byid code {
 .progress-line strong, .progress-pause strong { font-variant-numeric: tabular-nums; }
 .progress-pause { margin-top: 4px; font-size: 14px; color: var(--buf-warning); }
 .progress-pause.muted { color: var(--buf-muted); }
+
+/* ── Flair (Nov 2026) ───────────────────────────────────────────────────── */
+/*
+ * Brand rules this block keeps (buffalo-brand skill): orange marks what matters,
+ * depth comes from navy layers, a watermark on navy is WHITE at 5-8% (never a
+ * faded orange: it turns brown), the buffalo faces left and is never squished,
+ * and one featured gradient per screen. Here that gradient is the hero on step 1.
+ *
+ * Nothing in here decides behaviour. There is no cache-busting on this file, so a
+ * browser can pair a new index.html with an old styles.css: every new element is
+ * plain markup that still reads correctly with no styling at all.
+ *
+ * BN Kragen is not embedded (the font file is not in this repo), so headlines use
+ * Montserrat 800, the brand's stated fallback. Embed the OTF and put it first in
+ * --font-display to switch every headline over.
+ */
+
+:root { --font-display: var(--font); }
+
+@keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@keyframes ring { 0% { box-shadow: 0 0 0 0 rgba(255, 95, 0, 0.55); } 100% { box-shadow: 0 0 0 10px rgba(255, 95, 0, 0); } }
+@keyframes bob { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
+
+/* A white buffalo, drawn from the orange master through a mask so there is no
+   second asset to ship. Same 240:165 ratio as the file, so it cannot distort. */
+.hero::after, .win::after {
+  content: "";
+  position: absolute;
+  right: -2%;
+  bottom: -14%;
+  height: 135%;
+  aspect-ratio: 240 / 165;
+  background: #fff;
+  opacity: 0.07;
+  -webkit-mask: url(./buffalo-orange.png) right bottom / contain no-repeat;
+  mask: url(./buffalo-orange.png) right bottom / contain no-repeat;
+  pointer-events: none;
+}
+
+header { border-bottom: 3px solid var(--buf-orange); }
+
+.eyebrow {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--buf-orange);
+}
+
+/* The hero: step 1 only, the one featured gradient on that screen. */
+.hero {
+  position: relative;
+  overflow: hidden;
+  margin-bottom: 18px;
+  padding: 30px 32px 26px;
+  border-radius: var(--radius-lg);
+  border-top: 4px solid var(--buf-orange);
+  color: #fff;
+  background: radial-gradient(ellipse 80% 130% at 82% 35%, #003456 0%, #001a2c 58%, #000f1a 100%);
+}
+.hero > * { position: relative; z-index: 1; }
+.hero h2 {
+  margin: 6px 0 8px;
+  font-family: var(--font-display);
+  font-size: clamp(26px, 4.2vw, 40px);
+  font-weight: 800;
+  line-height: 1.08;
+}
+.hero h2 span { color: var(--buf-orange); }
+.hero p { margin: 0 0 18px; max-width: 54ch; font-size: 15px; color: #cacdcf; }
+.hero-points { list-style: none; margin: 0; padding: 16px 0 0; display: flex; gap: 10px 28px; flex-wrap: wrap; border-top: 1px solid rgba(255, 255, 255, 0.22); }
+.hero-points li { display: flex; align-items: center; gap: 9px; font-size: 13px; font-weight: 600; }
+.hero-points svg, .dz-icon { fill: none; stroke: var(--buf-orange); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.hero-points svg { width: 22px; height: 22px; flex: none; }
+
+/* Cards: a whisper of depth, and an orange top edge on each step's main card only. */
+.card { box-shadow: 0 1px 2px rgba(0, 37, 61, 0.06); }
+.card.main { border-top: 3px solid var(--buf-orange); }
+
+.panel.active { animation: rise 0.25s ease-out; }
+
+/* The step rail: a finished step gets a tick, and the step you just reached pulses twice. */
+.step.done .n { font-size: 0; }
+.step.done .n::before { content: "\2713"; font-size: 12px; }
+.step.active .n { animation: ring 0.9s ease-out 2; }
+
+/* Press feedback and a focus ring that can be seen on a phone in sunlight. */
+button:not(:disabled):active { transform: translateY(1px); }
+button:focus-visible, .dropzone:focus-visible { outline: 3px solid rgba(255, 95, 0, 0.6); outline-offset: 2px; }
+
+.item { transition: box-shadow 0.15s; }
+.item:hover { box-shadow: 0 2px 10px rgba(0, 37, 61, 0.1); }
+
+/* Dropzone */
+.dropzone { transition: border-color 0.15s, background 0.15s; }
+.dropzone:hover, .dropzone:focus-visible { border-color: var(--buf-orange); background: #fff3ec; }
+.dz-icon { display: block; width: 52px; height: 52px; margin: 0 auto 12px; }
+.dropzone:hover .dz-icon { animation: bob 0.9s ease-in-out infinite; }
+
+/* The Sandbox: the offer on step 1, and the strip that follows you once it is chosen. */
+.sandbox-offer {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-top: 18px;
+  padding: 14px 16px;
+  border: 2px dashed var(--buf-border);
+  border-radius: var(--radius-md);
+  background: var(--buf-card-bg);
+}
+.sandbox-offer .copy { flex: 1 1 260px; }
+.sandbox-offer strong { display: block; font-size: 14px; }
+#sandbox-result:not(:empty) { margin-top: 10px; }
+
+.sandbox-strip {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 20px 15px;
+  background: var(--buf-navy);
+  color: #fff;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.sandbox-strip[hidden] { display: none; }
+.sandbox-strip p { margin: 0; }
+.sandbox-tag {
+  flex: none;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--buf-orange);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+/* Caution tape: orange and navy only. */
+.sandbox-strip::after {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  height: 5px;
+  background: repeating-linear-gradient(135deg, var(--buf-orange) 0 10px, var(--buf-navy) 10px 20px);
+}
+
+/* The win banner on the results screen, shown only when every item came back clean. */
+.win {
+  position: relative;
+  overflow: hidden;
+  margin-bottom: 14px;
+  padding: 22px 26px;
+  border-radius: var(--radius-md);
+  border-left: 5px solid var(--buf-orange);
+  background: var(--buf-navy);
+  color: #fff;
+  animation: rise 0.35s ease-out;
+}
+.win > * { position: relative; z-index: 1; }
+.win .big { margin-top: 4px; font-size: 24px; font-weight: 800; line-height: 1.15; text-transform: uppercase; letter-spacing: 0.02em; }
+.win p { margin: 6px 0 0; font-size: 14px; color: #cacdcf; }
+
+@media (max-width: 820px) {
+  .hero { padding: 22px 20px 20px; }
+  .win { padding: 18px 20px; }
+  .win .big { font-size: 20px; }
+  .sandbox-strip { align-items: flex-start; padding: 10px 16px 15px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .panel.active, .win, .step.active .n, .dropzone:hover .dz-icon { animation: none; }
+}
